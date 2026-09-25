@@ -91,6 +91,8 @@ fn register_space(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         return match (op >> 4) & 0xF {
             0b0001 if (op >> 21) & 3 == 0b11 => clz(out, scope, a, op),
             0b0001 | 0b0011 => branch_exchange(out, scope, a, op),
+            0b0101 => saturating(out, scope, a, op),
+            kind if kind & 0b1001 == 0b1000 => halfword_multiply(out, scope, a, op),
             _ => interpret(out, scope, a, op),
         };
     }
@@ -403,6 +405,56 @@ fn multiply_long(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     };
     let flags = if kind != 0b010 && op & (1 << 20) != 0 { " ctx->n = r >> 63; ctx->z = r == 0;" } else { "" };
     emit!(out, "    {{ uint64_t r = {value}; ctx->r[{lo}] = (uint32_t)r; ctx->r[{hi}] = (uint32_t)(r >> 32);{flags} }}");
+    true
+}
+
+/// smlaxy, smlawy, smulwy, smlalxy and smulxy. the 32 bit accumulates
+/// wrap and set q when they overflow.
+fn halfword_multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    let rd = (op >> 16) & 0xF;
+    let rn = (op >> 12) & 0xF;
+    let kind = (op >> 21) & 3;
+    if rd == 15 || (kind == 0b10 && rn == 15) {
+        return interpret(out, scope, a, op);
+    }
+    let (x, y) = ((op >> 5) & 1, (op >> 6) & 1);
+    let m = reg(scope, op & 0xF, a + 8);
+    let s = reg(scope, (op >> 8) & 0xF, a + 8);
+    let n = reg(scope, rn, a + 8);
+    match kind {
+        0b00 => emit!(out, "    ctx->r[{rd}] = accumulate(ctx, HALF({m}, {x}) * HALF({s}, {y}) + (int32_t){n});"),
+        0b01 => {
+            let product = format!("((int64_t)(int32_t){m} * HALF({s}, {y})) >> 16");
+            if x != 0 {
+                emit!(out, "    ctx->r[{rd}] = (uint32_t)({product});");
+            } else {
+                emit!(out, "    ctx->r[{rd}] = accumulate(ctx, ({product}) + (int32_t){n});");
+            }
+        }
+        0b10 => emit!(
+            out,
+            "    {{ uint64_t r = ((uint64_t)ctx->r[{rd}] << 32 | ctx->r[{rn}]) + (uint64_t)(HALF({m}, {x}) * HALF({s}, {y})); ctx->r[{rn}] = (uint32_t)r; ctx->r[{rd}] = (uint32_t)(r >> 32); }}"
+        ),
+        _ => emit!(out, "    ctx->r[{rd}] = (uint32_t)(HALF({m}, {x}) * HALF({s}, {y}));"),
+    }
+    true
+}
+
+/// qadd, qsub, qdadd and qdsub.
+fn saturating(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    let rd = (op >> 12) & 0xF;
+    if rd == 15 {
+        return interpret(out, scope, a, op);
+    }
+    let m = reg(scope, op & 0xF, a + 8);
+    let n = reg(scope, (op >> 16) & 0xF, a + 8);
+    let value = match (op >> 21) & 3 {
+        0b00 => format!("saturate(ctx, (int64_t)(int32_t){m} + (int32_t){n})"),
+        0b01 => format!("saturate(ctx, (int64_t)(int32_t){m} - (int32_t){n})"),
+        0b10 => format!("saturate(ctx, (int64_t)(int32_t){m} + (int32_t)saturate(ctx, (int64_t)(int32_t){n} * 2))"),
+        _ => format!("saturate(ctx, (int64_t)(int32_t){m} - (int32_t)saturate(ctx, (int64_t)(int32_t){n} * 2))"),
+    };
+    emit!(out, "    ctx->r[{rd}] = {value};");
     true
 }
 

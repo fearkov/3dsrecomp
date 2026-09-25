@@ -144,6 +144,22 @@ static inline uint32_t ror32(uint32_t value, uint32_t amount) {
     return amount ? (value >> amount) | (value << (32 - amount)) : value;
 }
 
+/* saturates to 32 bits, setting q when it has to. */
+static inline uint32_t saturate(Context *ctx, int64_t value) {
+    if (value > INT32_MAX) { ctx->q = 1; return 0x7FFFFFFFu; }
+    if (value < INT32_MIN) { ctx->q = 1; return 0x80000000u; }
+    return (uint32_t)(int32_t)value;
+}
+
+/* keeps the low 32 bits of a sum, setting q when that loses some. */
+static inline uint32_t accumulate(Context *ctx, int64_t value) {
+    if (value != (int32_t)value) ctx->q = 1;
+    return (uint32_t)value;
+}
+
+/* the bottom or top halfword, signed. */
+#define HALF(value, top) ((int64_t)(int16_t)((top) ? (value) >> 16 : (value)))
+
 /* shifts by a register, the amount is its bottom byte. */
 static inline uint32_t shift_lsl(uint32_t value, uint32_t amount, uint8_t *carry) {
     amount &= 0xFF;

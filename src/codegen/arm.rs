@@ -44,14 +44,12 @@ pub fn lower(out: &mut String, scope: &Scope, address: u32, op: u32) -> bool {
 fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     match (op >> 25) & 7 {
         0b000 => register_space(out, scope, a, op),
-        0b001 => {
-            // msr with an immediate lives in the compare opcodes without s
-            if (op >> 23) & 3 == 0b10 && op & (1 << 20) == 0 {
-                interpret(out, scope, a, op)
-            } else {
-                data_processing(out, scope, a, op)
-            }
+        // msr with an immediate lives in the compare opcodes without s, and
+        // with no fields to write it is nop and the other hints
+        0b001 if (op >> 23) & 3 == 0b10 && op & (1 << 20) == 0 => {
+            if op & (1 << 21) != 0 && (op >> 16) & 0xF == 0 { true } else { interpret(out, scope, a, op) }
         }
+        0b001 => data_processing(out, scope, a, op),
         0b010 => single_transfer(out, scope, a, op),
         0b011 if op & 0x10 != 0 => media(out, scope, a, op),
         0b011 => single_transfer(out, scope, a, op),

@@ -1,11 +1,11 @@
-//! finding the code in an image. functions are found from the entry point by
-//! following calls and branches, and from words elsewhere in the image that
-//! point into the code, which is where vtables and callbacks live.
+//! finding the code in a program. functions are found from the entry points
+//! by following calls and branches, and from words elsewhere that point into
+//! the code, which is where vtables and callbacks live.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::arm::{self, Flow, Instruction};
-use crate::image::{Image, Segment};
+use crate::image::Segment;
 use crate::thumb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -14,8 +14,11 @@ pub enum Source {
     Call,
     /// a code address stored in a literal pool or in the data segments.
     Pointer,
-    /// a symbol the image exports to its modules.
+    /// a symbol the program exports to other modules.
     Export,
+    /// a code address a module's relocations store, in its vtables, jump
+    /// tables and literal pools.
+    Relocation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,20 +86,34 @@ impl Analysis {
     }
 }
 
+/// a piece of code to analyze and what is known about it up front.
+pub struct Program {
+    pub text: Segment,
+    /// addresses that may start functions and how each is known, odd for
+    /// Thumb.
+    pub seeds: Vec<(u32, Source)>,
+    /// the words in the code that hold addresses, when relocations say
+    /// exactly which ones they are. without them any literal that lands in
+    /// the code is taken for a pointer.
+    pub slots: Option<BTreeSet<u32>>,
+}
+
 struct Discovery<'a> {
     text: &'a Segment,
+    slots: Option<&'a BTreeSet<u32>>,
     analysis: Analysis,
     queue: VecDeque<(u32, Mode, Source)>,
     /// pointers found in data, followed only once nothing surer is left.
     guesses: VecDeque<(u32, Mode, Source)>,
 }
 
-pub fn analyze(image: &Image, exports: &[u32]) -> Analysis {
+pub fn analyze(program: &Program) -> Analysis {
     let mut discovery = Discovery {
-        text: &image.text,
+        text: &program.text,
+        slots: program.slots.as_ref(),
         analysis: Analysis {
             functions: BTreeMap::new(),
-            map: vec![Byte::Unknown; image.text.bytes.len()],
+            map: vec![Byte::Unknown; program.text.bytes.len()],
             indirect_sites: 0,
             jump_tables: 0,
             svc_sites: 0,
@@ -105,17 +122,8 @@ pub fn analyze(image: &Image, exports: &[u32]) -> Analysis {
         queue: VecDeque::new(),
         guesses: VecDeque::new(),
     };
-    discovery.queue.push_back((image.entry, Mode::Arm, Source::Entry));
-    for &export in exports {
-        discovery.code_pointer(export, Source::Export);
-    }
-    discovery.run();
-
-    // then whatever the data segments point at
-    for segment in [&image.rodata, &image.data] {
-        for (_, value) in segment.words() {
-            discovery.code_pointer(value, Source::Pointer);
-        }
+    for &(address, source) in &program.seeds {
+        discovery.code_pointer(address, source);
     }
     discovery.run();
     discovery.analysis
@@ -146,6 +154,11 @@ impl Discovery<'_> {
 
     fn byte(&self, address: u32) -> Byte {
         self.analysis.map[(address - self.text.base) as usize]
+    }
+
+    /// whether the word at address may hold a code address.
+    fn may_point(&self, address: u32) -> bool {
+        self.slots.is_none_or(|slots| slots.contains(&address))
     }
 
     /// a value that may be the address of a function, odd for Thumb.
@@ -240,7 +253,7 @@ impl Discovery<'_> {
                     }
                     Flow::LoadPcLiteral { literal } => {
                         self.mark(literal, 4, Byte::Literal);
-                        if let Some(target) = self.text.read32(literal) {
+                        if let Some(target) = self.text.read32(literal).filter(|_| self.may_point(literal)) {
                             self.code_pointer(target, Source::Pointer);
                         }
                         if !conditional {
@@ -252,7 +265,7 @@ impl Discovery<'_> {
                         // left alone
                         if self.text.contains(literal) && self.byte(literal) != Byte::Code {
                             self.mark(literal, size, Byte::Literal);
-                            if size == 4 {
+                            if size == 4 && self.may_point(literal) {
                                 if let Some(value) = self.text.read32(literal) {
                                     self.code_pointer(value, Source::Pointer);
                                 }
@@ -303,7 +316,7 @@ impl Discovery<'_> {
         for i in 0..entries.unwrap_or(256) {
             let slot = table + i as u32 * 4;
             let Some(target) = self.text.read32(slot) else { break };
-            if !self.text.contains(target & !1) {
+            if !self.text.contains(target & !1) || !self.may_point(slot) {
                 break;
             }
             self.mark(slot, 4, Byte::Literal);
@@ -323,17 +336,14 @@ mod tests {
     const BASE: u32 = 0x0010_0000;
 
     fn analyze_words(words: &[u32]) -> Analysis {
-        analyze(&image(words), &[])
+        analyze(&program(words))
     }
 
-    fn image(words: &[u32]) -> Image {
-        let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let empty = |base| Segment { base, bytes: Vec::new() };
-        Image {
-            entry: BASE,
-            text: Segment { base: BASE, bytes },
-            rodata: empty(0x0020_0000),
-            data: empty(0x0030_0000),
+    fn program(words: &[u32]) -> Program {
+        Program {
+            text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
+            seeds: vec![(BASE, Source::Entry)],
+            slots: None,
         }
     }
 
@@ -402,11 +412,25 @@ mod tests {
     }
 
     #[test]
-    fn pointers_in_data_become_functions() {
-        let mut image = image(&[0xE12F_FF1E, 0x4770_4770, 0xE12F_FF1E]);
-        image.rodata.bytes = [BASE + 8, BASE + 5].iter().flat_map(|w| w.to_le_bytes()).collect();
-        let analysis = analyze(&image, &[]);
+    fn pointer_seeds_become_functions() {
+        let mut program = program(&[0xE12F_FF1E, 0x4770_4770, 0xE12F_FF1E]);
+        program.seeds.extend([(BASE + 8, Source::Pointer), (BASE + 5, Source::Pointer)]);
+        let analysis = analyze(&program);
         assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Pointer);
         assert_eq!(analysis.functions[&(BASE + 4)].mode, Mode::Thumb);
+    }
+
+    #[test]
+    fn with_slots_only_relocated_literals_are_pointers() {
+        let words = [
+            0xE59F_0000, // ldr r0, [pc] (literal at 0x100008)
+            0xE12F_FF1E, // bx lr
+            BASE + 0xC,  // looks like a code address
+            0xE12F_FF1E, // bx lr
+        ];
+        assert!(analyze_words(&words).functions.contains_key(&(BASE + 0xC)));
+        let mut program = program(&words);
+        program.slots = Some(BTreeSet::new());
+        assert!(!analyze(&program).functions.contains_key(&(BASE + 0xC)));
     }
 }

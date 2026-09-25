@@ -3,6 +3,8 @@
 
 use zakuro_fs::{FsError, Title};
 
+use crate::discover::{Program, Source};
+
 const PAGE_SIZE: usize = 0x1000;
 
 pub struct Segment {
@@ -23,6 +25,11 @@ impl Segment {
         let offset = address.checked_sub(self.base)? as usize;
         let bytes = self.bytes.get(offset..offset + 4)?;
         Some(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    pub fn write32(&mut self, address: u32, value: u32) {
+        let offset = (address - self.base) as usize;
+        self.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
     pub fn read16(&self, address: u32) -> Option<u16> {
@@ -70,5 +77,47 @@ impl Image {
             rodata: segment(header.rodata, rodata_offset),
             data: segment(header.data, data_offset),
         })
+    }
+
+    /// the executable as discovery sees it, starting from the entry point
+    /// and the exports. nothing says where it keeps pointers, so any word in
+    /// the data segments that lands in the code is taken for one.
+    pub fn into_program(self, exports: &[u32]) -> Program {
+        let entry = std::iter::once((self.entry, Source::Entry));
+        let exports = exports.iter().map(|&address| (address, Source::Export));
+        let pointers = [&self.rodata, &self.data]
+            .into_iter()
+            .flat_map(Segment::words)
+            .filter(|&(_, value)| self.text.contains(value & !1))
+            .map(|(_, value)| (value, Source::Pointer));
+        let seeds = entry.chain(exports).chain(pointers).collect();
+        Program { text: self.text, seeds, slots: None }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{self, Mode};
+
+    const BASE: u32 = 0x0010_0000;
+
+    fn segment(base: u32, words: &[u32]) -> Segment {
+        Segment { base, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() }
+    }
+
+    #[test]
+    fn pointers_in_data_become_functions() {
+        let image = Image {
+            entry: BASE,
+            text: segment(BASE, &[0xE12F_FF1E, 0x4770_4770, 0xE12F_FF1E]),
+            rodata: segment(0x0020_0000, &[BASE + 8, 12345]),
+            data: segment(0x0030_0000, &[BASE + 5]),
+        };
+        let program = image.into_program(&[]);
+        assert_eq!(program.seeds.len(), 3);
+        let analysis = discover::analyze(&program);
+        assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Pointer);
+        assert_eq!(analysis.functions[&(BASE + 4)].mode, Mode::Thumb);
     }
 }

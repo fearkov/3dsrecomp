@@ -3,10 +3,11 @@
 #ifndef RECOMP_H
 #define RECOMP_H
 
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 2
+#define RECOMP_ABI 3
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
@@ -47,6 +48,10 @@ struct Context {
        handle the access. */
     uint8_t *const *read_pages;
     uint8_t *const *write_pages;
+    /* the VFP registers, s0 to s31 with dN in s2N and s2N+1, and fpscr,
+       which the interpreter works on too. */
+    uint32_t *vfp;
+    uint32_t *fpscr;
     const Host *host;
     void *user;
 };
@@ -171,6 +176,61 @@ static inline uint32_t shift_ror(uint32_t value, uint32_t amount, uint8_t *carry
     if (amount == 0) { *carry = value >> 31; return value; }
     *carry = (value >> (amount - 1)) & 1;
     return ror32(value, amount);
+}
+
+#define FPSCR_FZ (1u << 24)
+/* the short vector length, anything but zero is left to the interpreter. */
+#define FPSCR_LEN (7u << 16)
+
+static inline float vfp_s(Context *ctx, int r) {
+    float value;
+    memcpy(&value, &ctx->vfp[r], 4);
+    return value;
+}
+
+static inline double vfp_d(Context *ctx, int d) {
+    uint64_t bits = ctx->vfp[2 * d] | (uint64_t)ctx->vfp[2 * d + 1] << 32;
+    double value;
+    memcpy(&value, &bits, 8);
+    return value;
+}
+
+/* stores a result, flushing a subnormal to zero when the guest asked. */
+static inline void vfp_set_s(Context *ctx, int r, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    if ((*ctx->fpscr & FPSCR_FZ) && !(bits & 0x7F800000u) && (bits & 0x007FFFFFu)) bits &= 0x80000000u;
+    ctx->vfp[r] = bits;
+}
+
+static inline void vfp_set_d(Context *ctx, int d, double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, 8);
+    if ((*ctx->fpscr & FPSCR_FZ) && !(bits & 0x7FF0000000000000ull) && (bits & 0x000FFFFFFFFFFFFFull))
+        bits &= 0x8000000000000000ull;
+    ctx->vfp[2 * d] = (uint32_t)bits;
+    ctx->vfp[2 * d + 1] = (uint32_t)(bits >> 32);
+}
+
+/* the comparison result in fpscr's top bits, the nzcv encoding. */
+static inline void vfp_compare(Context *ctx, double a, double b) {
+    uint32_t flags = (a != a || b != b) ? 0x3 : a == b ? 0x6 : a < b ? 0x8 : 0x2;
+    *ctx->fpscr = (*ctx->fpscr & 0x0FFFFFFFu) | flags << 28;
+}
+
+/* conversions to integers, rounding toward zero and saturating. */
+static inline uint32_t vfp_to_s32(double value) {
+    if (value != value) return 0;
+    if (value >= 2147483647.0) return 0x7FFFFFFFu;
+    if (value <= -2147483648.0) return 0x80000000u;
+    return (uint32_t)(int32_t)value;
+}
+
+static inline uint32_t vfp_to_u32(double value) {
+    if (value != value) return 0;
+    if (value >= 4294967295.0) return 0xFFFFFFFFu;
+    if (value <= 0.0) return 0;
+    return (uint32_t)value;
 }
 
 #define RECOMP_DEPTH_LIMIT 2048

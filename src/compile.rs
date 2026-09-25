@@ -5,7 +5,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const FLAGS: &[&str] = &["-O2", "-fPIC", "-fvisibility=hidden", "-w"];
+/// floating point has to round exactly the way the interpreter does, so
+/// nothing may be fused into a multiply-add.
+const FLAGS: &[&str] = &["-O2", "-fPIC", "-fvisibility=hidden", "-ffp-contract=off", "-fno-math-errno", "-w"];
 
 /// compiles sources, file names inside dir, and links them into library.
 pub fn compile(dir: &Path, sources: &[String], library: &Path) -> Result<(), String> {

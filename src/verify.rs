@@ -443,6 +443,8 @@ pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report
             depth: 0,
             read_pages: b.memory.read_pages.as_ptr(),
             write_pages: b.memory.write_pages.as_ptr(),
+            vfp: b.cpu.vfp.regs.as_mut_ptr(),
+            fpscr: &mut b.cpu.vfp.fpscr,
             host: &HOST,
             user: &mut b as *mut Run as *mut c_void,
         };

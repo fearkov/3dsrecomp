@@ -6,7 +6,7 @@ use std::path::Path;
 
 pub type Code = unsafe extern "C" fn(*mut Context);
 
-pub const ABI: u32 = 2;
+pub const ABI: u32 = 3;
 
 pub const EXIT_SVC: u32 = 1;
 pub const EXIT_BUDGET: u32 = 2;
@@ -40,6 +40,8 @@ pub struct Context {
     pub depth: u32,
     pub read_pages: *const *mut u8,
     pub write_pages: *const *mut u8,
+    pub vfp: *mut u32,
+    pub fpscr: *mut u32,
     pub host: *const Host,
     pub user: *mut c_void,
 }

@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use super::{Scope, call, jump};
+use super::{Scope, call, jump, vfp};
 
 macro_rules! emit {
     ($out:expr, $($arg:tt)*) => {
@@ -58,12 +58,15 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             let target = (a + 8).wrapping_add(sign_extend_24(op & 0x00FF_FFFF) << 2);
             if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
+        0b110 => vfp::load_store(out, scope, a, op),
         0b111 if op & (1 << 24) != 0 => {
             emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), op & 0x00FF_FFFF);
             false
         }
-        // coprocessor and VFP
-        _ => interpret(out, scope, a, op),
+        0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),
+        // cp15
+        0b111 if op & 0x10 != 0 => interpret(out, scope, a, op),
+        _ => vfp::data_processing(out, scope, a, op),
     }
 }
 

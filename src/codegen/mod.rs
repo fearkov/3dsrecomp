@@ -7,6 +7,7 @@
 
 mod arm;
 mod thumb;
+mod vfp;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;

@@ -468,6 +468,13 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         for register in 0..32 {
             cpu.vfp.regs[register] = ((random.next() % 20_000) as f32 / 100.0 - 100.0).to_bits();
         }
+        // half the runs start on short vectors of some length and stride,
+        // with flush to zero on or off
+        if random.next().is_multiple_of(2) {
+            let stride = if random.next().is_multiple_of(2) { 3 << 20 } else { 0 };
+            let flush = if random.next().is_multiple_of(2) { 1 << 24 } else { 0 };
+            cpu.vfp.fpscr = (random.next() % 8) << 16 | stride | flush;
+        }
         cpu.cp15.thread_id_ro = TLS;
         a.cpu = cpu.clone();
         b.cpu = cpu.clone();

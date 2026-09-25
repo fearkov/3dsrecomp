@@ -158,12 +158,17 @@ impl Module {
         let mut text = image::Segment { base: segment.offset, bytes: bytes.get(range)?.to_vec() };
 
         let mut seeds: Vec<_> = self.code_exports().into_iter().map(|address| (address, Source::Export)).collect();
-        let mut slots = BTreeSet::new();
+        // every word in the code that a relocation or an import fills in is
+        // data, whatever it points at
+        let (start, end) = (text.base, text.end());
+        let slot = |relocation: &Relocation| {
+            self.resolve(relocation.target).filter(|&t| relocation.is_absolute() && t >= start && t + 4 <= end)
+        };
+        let mut slots: BTreeSet<u32> = self.relocations.iter().chain(&self.imports).filter_map(slot).collect();
         for relocation in self.relocations.iter().filter(|r| self.is_code(r.segment)) {
             let address = self.segments[relocation.segment as usize].offset + relocation.addend;
             seeds.push((address, Source::Relocation));
-            let target = self.resolve(relocation.target).filter(|&t| text.contains(t) && t + 4 <= text.end());
-            if let Some(target) = target.filter(|_| relocation.is_absolute()) {
+            if let Some(target) = slot(relocation) {
                 text.write32(target, address);
                 slots.insert(target);
             }

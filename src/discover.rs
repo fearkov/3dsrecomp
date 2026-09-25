@@ -126,6 +126,10 @@ pub fn analyze(program: &Program) -> Analysis {
         queue: VecDeque::new(),
         guesses: VecDeque::new(),
     };
+    // where relocations say the code holds data, it cannot be code
+    for &slot in program.slots.iter().flatten() {
+        discovery.mark(slot, 4, Byte::Literal);
+    }
     for &(address, source) in &program.seeds {
         discovery.code_pointer(address, source);
     }

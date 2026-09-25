@@ -20,6 +20,10 @@ const TLS: u32 = 0x1FF8_2000;
 /// instructions a run may take before it counts as stuck.
 const LIMIT: i32 = 200_000;
 
+/// where the harness loads the module it checks.
+pub const MODULE_BASE: u32 = 0x0A00_0000;
+
+#[derive(Clone)]
 pub struct Region {
     pub base: u32,
     pub bytes: Vec<u8>,
@@ -189,7 +193,8 @@ unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
         let exit = run.cpu.step(&mut run.memory);
         store(&run.cpu, ctx);
         run.fallbacks += 1;
-        if exit.is_some() || ctx.r[15] != address.wrapping_add(4) || ctx.thumb != 0 {
+        let step = if ctx.thumb != 0 { 2 } else { 4 };
+        if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
             run.pending = exit;
             ctx.exit = 3;
         }
@@ -337,7 +342,7 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
 
 /// the title's memory, its segments where it expects them plus a stack, a
 /// heap and thread local storage full of made up data.
-pub fn memory(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss: u32) -> Memory {
+pub fn regions(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss: u32) -> Vec<Region> {
     let mut random = Random(0x9E37_79B9_7F4A_7C15);
     let mut heap = vec![0u8; HEAP_SIZE as usize];
     for word in heap.chunks_mut(4) {
@@ -346,16 +351,17 @@ pub fn memory(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss:
     }
     let mut data_bytes = data.1.to_vec();
     data_bytes.resize(data_bytes.len() + bss as usize, 0);
-    Memory::new(vec![
+    vec![
         Region { base: text.0, bytes: text.1.to_vec(), writable: false },
         Region { base: rodata.0, bytes: rodata.1.to_vec(), writable: false },
         Region { base: data.0, bytes: data_bytes, writable: true },
         Region { base: HEAP, bytes: heap, writable: true },
         Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true },
         Region { base: TLS, bytes: vec![0; PAGE_SIZE], writable: true },
-    ])
+    ]
 }
 
+#[derive(Default)]
 pub struct Report {
     /// instructions run as recompiled code, through the fallback and in
     /// the interpreter alone.
@@ -370,6 +376,20 @@ pub struct Report {
     pub mismatched: usize,
 }
 
+impl Report {
+    pub fn add(&mut self, other: &Report) {
+        self.native += other.native;
+        self.fallbacks += other.fallbacks;
+        self.interpreted += other.interpreted;
+        self.tested += other.tested;
+        self.returned += other.returned;
+        self.svc += other.svc;
+        self.stuck += other.stuck;
+        self.other += other.other;
+        self.mismatched += other.mismatched;
+    }
+}
+
 /// runs each function both ways, printing the first few mismatches. the
 /// functions are entries with bit 0 set for Thumb.
 pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
@@ -377,8 +397,7 @@ pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report
         || Run { memory: pristine.duplicate(), cpu: Cpu::new(), library, pending: None, interpreted: 0, fallbacks: 0 };
     let mut a = fresh();
     let mut b = fresh();
-    let mut report =
-        Report { native: 0, fallbacks: 0, interpreted: 0, tested: 0, returned: 0, svc: 0, stuck: 0, other: 0, mismatched: 0 };
+    let mut report = Report::default();
 
     for &function in functions {
         a.memory.copy_from(pristine);

@@ -20,9 +20,9 @@ fn sign_extend_24(value: u32) -> u32 {
     (((value << 8) as i32) >> 8) as u32
 }
 
-/// reading a register, where r15 is the constant the pipeline gives it.
-fn reg(register: u32, pc: u32) -> String {
-    if register == 15 { format!("0x{pc:08X}u") } else { format!("ctx->r[{register}]") }
+/// reading a register, where r15 is the address the pipeline gives it.
+fn reg(scope: &Scope, register: u32, pc: u32) -> String {
+    if register == 15 { scope.at(pc) } else { format!("ctx->r[{register}]") }
 }
 
 /// writes the C for the instruction at address, returning whether execution
@@ -43,66 +43,66 @@ pub fn lower(out: &mut String, scope: &Scope, address: u32, op: u32) -> bool {
 
 fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     match (op >> 25) & 7 {
-        0b000 => register_space(out, a, op),
+        0b000 => register_space(out, scope, a, op),
         0b001 => {
             // msr with an immediate lives in the compare opcodes without s
             if (op >> 23) & 3 == 0b10 && op & (1 << 20) == 0 {
-                interpret(out, a, op)
+                interpret(out, scope, a, op)
             } else {
-                data_processing(out, a, op)
+                data_processing(out, scope, a, op)
             }
         }
-        0b010 => single_transfer(out, a, op),
-        0b011 if op & 0x10 != 0 => media(out, a, op),
-        0b011 => single_transfer(out, a, op),
-        0b100 => block_transfer(out, a, op),
+        0b010 => single_transfer(out, scope, a, op),
+        0b011 if op & 0x10 != 0 => media(out, scope, a, op),
+        0b011 => single_transfer(out, scope, a, op),
+        0b100 => block_transfer(out, scope, a, op),
         0b101 => {
             let target = (a + 8).wrapping_add(sign_extend_24(op & 0x00FF_FFFF) << 2);
             if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
         0b111 if op & (1 << 24) != 0 => {
-            emit!(out, "    SVC(0x{:08X}u, 0x{:X}u);", a + 4, op & 0x00FF_FFFF);
+            emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), op & 0x00FF_FFFF);
             false
         }
         // coprocessor and VFP
-        _ => interpret(out, a, op),
+        _ => interpret(out, scope, a, op),
     }
 }
 
 /// the register data processing space, with the multiplies, extra loads
 /// and stores and miscellaneous instructions in its holes.
-fn register_space(out: &mut String, a: u32, op: u32) -> bool {
+fn register_space(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     if op & 0x90 == 0x90 {
         if (op >> 5) & 3 != 0 {
-            return extra_transfer(out, a, op);
+            return extra_transfer(out, scope, a, op);
         }
         if op & (1 << 24) != 0 {
             // swap and the exclusives
-            return interpret(out, a, op);
+            return interpret(out, scope, a, op);
         }
         return match (op >> 21) & 7 {
-            0b000 | 0b001 => multiply(out, a, op),
-            0b010 | 0b100..=0b111 => multiply_long(out, a, op),
-            _ => interpret(out, a, op),
+            0b000 | 0b001 => multiply(out, scope, a, op),
+            0b010 | 0b100..=0b111 => multiply_long(out, scope, a, op),
+            _ => interpret(out, scope, a, op),
         };
     }
     if (op >> 23) & 3 == 0b10 && op & (1 << 20) == 0 {
         return match (op >> 4) & 0xF {
-            0b0001 if (op >> 21) & 3 == 0b11 => clz(out, a, op),
-            0b0001 | 0b0011 => branch_exchange(out, a, op),
-            _ => interpret(out, a, op),
+            0b0001 if (op >> 21) & 3 == 0b11 => clz(out, scope, a, op),
+            0b0001 | 0b0011 => branch_exchange(out, scope, a, op),
+            _ => interpret(out, scope, a, op),
         };
     }
-    data_processing(out, a, op)
+    data_processing(out, scope, a, op)
 }
 
-fn interpret(out: &mut String, a: u32, op: u32) -> bool {
-    emit!(out, "    INTERPRET(0x{a:08X}u, 0x{op:08X}u);");
+fn interpret(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    emit!(out, "    INTERPRET({}, 0x{op:08X}u);", scope.at(a));
     true
 }
 
 /// the shifter operand as b, and its carry as sc when the flags need it.
-fn shifter_operand(out: &mut String, a: u32, op: u32, carry: bool) {
+fn shifter_operand(out: &mut String, scope: &Scope, a: u32, op: u32, carry: bool) {
     if op & (1 << 25) != 0 {
         let rotate = ((op >> 8) & 0xF) * 2;
         let value = (op & 0xFF).rotate_right(rotate);
@@ -122,11 +122,11 @@ fn shifter_operand(out: &mut String, a: u32, op: u32, carry: bool) {
         let rs = (op >> 8) & 0xF;
         let shift = ["shift_lsl", "shift_lsr", "shift_asr", "shift_ror"][kind as usize];
         emit!(out, "    uint8_t sc = ctx->c;");
-        emit!(out, "    uint32_t b = {shift}({}, {}, &sc);", reg(rm, a + 12), reg(rs, a + 12));
+        emit!(out, "    uint32_t b = {shift}({}, {}, &sc);", reg(scope, rm, a + 12), reg(scope, rs, a + 12));
         return;
     }
     let amount = (op >> 7) & 0x1F;
-    emit!(out, "    uint32_t m = {};", reg(rm, a + 8));
+    emit!(out, "    uint32_t m = {};", reg(scope, rm, a + 8));
     let (value, carry_out) = match (kind, amount) {
         (0, 0) => ("m".to_owned(), "ctx->c".to_owned()),
         (0, n) => (format!("m << {n}"), format!("(m >> {}) & 1", 32 - n)),
@@ -144,7 +144,7 @@ fn shifter_operand(out: &mut String, a: u32, op: u32, carry: bool) {
     }
 }
 
-fn data_processing(out: &mut String, a: u32, op: u32) -> bool {
+fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let opcode = (op >> 21) & 0xF;
     let set_flags = op & (1 << 20) != 0;
     let rn = (op >> 16) & 0xF;
@@ -152,15 +152,15 @@ fn data_processing(out: &mut String, a: u32, op: u32) -> bool {
     let compare = (8..=11).contains(&opcode);
     if set_flags && rd == 15 && !compare {
         // an exception return, which also restores cpsr
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
     let register_shift = op & (1 << 25) == 0 && op & (1 << 4) != 0;
     let logical = matches!(opcode, 0 | 1 | 8 | 9 | 12..=15);
 
     emit!(out, "    {{");
-    shifter_operand(out, a, op, set_flags && logical);
+    shifter_operand(out, scope, a, op, set_flags && logical);
     if !matches!(opcode, 13 | 15) {
-        emit!(out, "    uint32_t a = {};", reg(rn, if register_shift { a + 12 } else { a + 8 }));
+        emit!(out, "    uint32_t a = {};", reg(scope, rn, if register_shift { a + 12 } else { a + 8 }));
     }
     if matches!(opcode, 5..=7) {
         emit!(out, "    uint8_t ci = ctx->c;");
@@ -211,7 +211,7 @@ fn data_processing(out: &mut String, a: u32, op: u32) -> bool {
 }
 
 /// ldr, str, ldrb and strb.
-fn single_transfer(out: &mut String, a: u32, op: u32) -> bool {
+fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let rd = (op >> 12) & 0xF;
     let pre = op & (1 << 24) != 0;
@@ -219,10 +219,10 @@ fn single_transfer(out: &mut String, a: u32, op: u32) -> bool {
     let load = op & (1 << 20) != 0;
     let writeback = !pre || op & (1 << 21) != 0;
     if writeback && rn == 15 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
     let offset = if op & (1 << 25) != 0 {
-        let m = reg(op & 0xF, a + 8);
+        let m = reg(scope, op & 0xF, a + 8);
         match ((op >> 5) & 3, (op >> 7) & 0x1F) {
             (0, n) => format!("({m} << {n})"),
             (1, 0) => "0".to_owned(),
@@ -237,7 +237,7 @@ fn single_transfer(out: &mut String, a: u32, op: u32) -> bool {
     };
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
-    emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(rn, a + 8));
+    emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(scope, rn, a + 8));
     if load {
         let read = if byte { "mem_read8" } else { "mem_read32" };
         emit!(out, "    uint32_t v = {read}(ctx, {address});");
@@ -253,7 +253,7 @@ fn single_transfer(out: &mut String, a: u32, op: u32) -> bool {
         emit!(out, "    ctx->r[{rd}] = v; }}");
     } else {
         // storing r15 stores the address plus 12
-        let value = if rd == 15 { format!("0x{:08X}u", a + 12) } else { format!("ctx->r[{rd}]") };
+        let value = if rd == 15 { scope.at(a + 12) } else { format!("ctx->r[{rd}]") };
         if byte {
             emit!(out, "    mem_write8(ctx, {address}, (uint8_t){value});");
         } else {
@@ -268,7 +268,7 @@ fn single_transfer(out: &mut String, a: u32, op: u32) -> bool {
 }
 
 /// ldrh, strh, ldrsb, ldrsh, ldrd and strd.
-fn extra_transfer(out: &mut String, a: u32, op: u32) -> bool {
+fn extra_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let rd = (op >> 12) & 0xF;
     let pre = op & (1 << 24) != 0;
@@ -277,21 +277,21 @@ fn extra_transfer(out: &mut String, a: u32, op: u32) -> bool {
     let kind = (op >> 5) & 3;
     let pair = kind >= 2 && !load;
     if (writeback && rn == 15) || (load && rd == 15) || (pair && (rd & 1 != 0 || rd == 14)) {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
     let offset = if op & (1 << 22) != 0 {
         format!("0x{:X}u", ((op >> 4) & 0xF0) | (op & 0xF))
     } else {
-        reg(op & 0xF, a + 8)
+        reg(scope, op & 0xF, a + 8)
     };
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
     let back = if writeback { format!(" ctx->r[{rn}] = oa;") } else { String::new() };
-    emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(rn, a + 8));
+    emit!(out, "    {{ uint32_t base = {}, oa = base {sign} {offset};", reg(scope, rn, a + 8));
     match (kind, load) {
         (1, true) => emit!(out, "    uint32_t v = mem_read16(ctx, {address});{back} ctx->r[{rd}] = v; }}"),
         (1, false) => {
-            emit!(out, "    mem_write16(ctx, {address}, (uint16_t){});{back} }}", reg(rd, a + 8))
+            emit!(out, "    mem_write16(ctx, {address}, (uint16_t){});{back} }}", reg(scope, rd, a + 8))
         }
         (2, true) => emit!(
             out,
@@ -316,7 +316,7 @@ fn extra_transfer(out: &mut String, a: u32, op: u32) -> bool {
 }
 
 /// ldm and stm.
-fn block_transfer(out: &mut String, a: u32, op: u32) -> bool {
+fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let pre = op & (1 << 24) != 0;
     let up = op & (1 << 23) != 0;
@@ -326,7 +326,7 @@ fn block_transfer(out: &mut String, a: u32, op: u32) -> bool {
     // the user bank forms, empty lists and r15 as the base are rare enough
     // to leave alone
     if op & (1 << 22) != 0 || list == 0 || rn == 15 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
     let span = list.count_ones() * 4;
     let (lowest, last) = match (up, pre) {
@@ -352,7 +352,7 @@ fn block_transfer(out: &mut String, a: u32, op: u32) -> bool {
     } else {
         for &register in &registers {
             let value = if register == 15 {
-                format!("0x{:08X}u", a + 12)
+                scope.at(a + 12)
             } else if register == rn && writeback && list & ((1 << rn) - 1) != 0 {
                 // the base when it is not the lowest register stores its new value
                 "fin".to_owned()
@@ -370,27 +370,27 @@ fn block_transfer(out: &mut String, a: u32, op: u32) -> bool {
 }
 
 /// mul and mla.
-fn multiply(out: &mut String, a: u32, op: u32) -> bool {
+fn multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 16) & 0xF;
     if rd == 15 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
-    let product = format!("{} * {}", reg(op & 0xF, a + 8), reg((op >> 8) & 0xF, a + 8));
-    let sum = if op & (1 << 21) != 0 { format!(" + {}", reg((op >> 12) & 0xF, a + 8)) } else { String::new() };
+    let product = format!("{} * {}", reg(scope, op & 0xF, a + 8), reg(scope, (op >> 8) & 0xF, a + 8));
+    let sum = if op & (1 << 21) != 0 { format!(" + {}", reg(scope, (op >> 12) & 0xF, a + 8)) } else { String::new() };
     let flags = if op & (1 << 20) != 0 { " ctx->n = r >> 31; ctx->z = r == 0;" } else { "" };
     emit!(out, "    {{ uint32_t r = {product}{sum}; ctx->r[{rd}] = r;{flags} }}");
     true
 }
 
 /// umull, umlal, smull, smlal and umaal.
-fn multiply_long(out: &mut String, a: u32, op: u32) -> bool {
+fn multiply_long(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let hi = (op >> 16) & 0xF;
     let lo = (op >> 12) & 0xF;
     if hi == 15 || lo == 15 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
-    let m = reg(op & 0xF, a + 8);
-    let s = reg((op >> 8) & 0xF, a + 8);
+    let m = reg(scope, op & 0xF, a + 8);
+    let s = reg(scope, (op >> 8) & 0xF, a + 8);
     let kind = (op >> 21) & 7;
     let pair = format!("((uint64_t)ctx->r[{hi}] << 32 | ctx->r[{lo}])");
     let value = match kind {
@@ -405,46 +405,47 @@ fn multiply_long(out: &mut String, a: u32, op: u32) -> bool {
     true
 }
 
-fn clz(out: &mut String, a: u32, op: u32) -> bool {
+fn clz(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     if rd == 15 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
-    emit!(out, "    {{ uint32_t m = {}; ctx->r[{rd}] = m ? __builtin_clz(m) : 32; }}", reg(op & 0xF, a + 8));
+    emit!(out, "    {{ uint32_t m = {}; ctx->r[{rd}] = m ? __builtin_clz(m) : 32; }}", reg(scope, op & 0xF, a + 8));
     true
 }
 
 /// bx and blx through a register.
-fn branch_exchange(out: &mut String, a: u32, op: u32) -> bool {
+fn branch_exchange(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rm = op & 0xF;
     if (op >> 4) & 0xF == 0b0011 {
         let next = a + 4;
         emit!(
             out,
-            "    {{ uint32_t v = {}; ctx->r[14] = 0x{next:08X}u; ctx->thumb = v & 1; ctx->r[15] = v & (ctx->thumb ? ~1u : ~3u); }}",
-            reg(rm, a + 8)
+            "    {{ uint32_t v = {}; ctx->r[14] = {}; ctx->thumb = v & 1; ctx->r[15] = v & (ctx->thumb ? ~1u : ~3u); }}",
+            reg(scope, rm, a + 8),
+            scope.at(next)
         );
         emit!(out, "    CALL(recomp_call);");
-        emit!(out, "    RETURNED(0x{next:08X}u);");
+        emit!(out, "    RETURNED({});", scope.at(next));
         return true;
     }
     if rm == 14 {
         emit!(out, "    RETURN_TO(ctx->r[14]);");
     } else {
-        emit!(out, "    JUMP_TO({});", reg(rm, a + 8));
+        emit!(out, "    JUMP_TO({});", reg(scope, rm, a + 8));
     }
     false
 }
 
 /// the sign and zero extensions and the byte reversals.
-fn media(out: &mut String, a: u32, op: u32) -> bool {
+fn media(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let op1 = (op >> 20) & 0x1F;
     let op2 = (op >> 5) & 7;
     let rd = (op >> 12) & 0xF;
     if rd == 15 || op1 >> 3 != 0b01 {
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
-    let m = reg(op & 0xF, a + 8);
+    let m = reg(scope, op & 0xF, a + 8);
     let value = match (op1, op2) {
         (_, 0b011) => {
             let rotate = ((op >> 10) & 3) * 8;
@@ -455,7 +456,7 @@ fn media(out: &mut String, a: u32, op: u32) -> bool {
                 0b110 => format!("({x} & 0xFF)"),
                 0b111 => format!("({x} & 0xFFFF)"),
                 // the packed halfword forms
-                _ => return interpret(out, a, op),
+                _ => return interpret(out, scope, a, op),
             };
             let rn = (op >> 16) & 0xF;
             if rn == 15 { extended } else { format!("ctx->r[{rn}] + {extended}") }
@@ -463,7 +464,7 @@ fn media(out: &mut String, a: u32, op: u32) -> bool {
         (0b01011, 0b001) => format!("__builtin_bswap32({m})"),
         (0b01011, 0b101) => format!("((({m}) & 0x00FF00FFu) << 8) | ((({m}) & 0xFF00FF00u) >> 8)"),
         (0b01111, 0b101) => format!("(uint32_t)(int32_t)(int16_t)(((({m}) & 0xFF) << 8) | ((({m}) >> 8) & 0xFF))"),
-        _ => return interpret(out, a, op),
+        _ => return interpret(out, scope, a, op),
     };
     emit!(out, "    ctx->r[{rd}] = {value};");
     true
@@ -478,11 +479,11 @@ fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     }
     if op & 0xFFF0_00F0 == 0xF570_0010 {
         // clrex, the reservation lives with the interpreter
-        return interpret(out, a, op);
+        return interpret(out, scope, a, op);
     }
     if matches!((op >> 25) & 7, 0b010 | 0b011) {
         // pld and the barriers do nothing here
         return true;
     }
-    interpret(out, a, op)
+    interpret(out, scope, a, op)
 }

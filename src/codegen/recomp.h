@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 1
+#define RECOMP_ABI 2
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
@@ -55,6 +55,17 @@ typedef struct Entry {
     uint32_t address;
     Code code;
 } Entry;
+
+/* a module's code, whose entries are offsets from where it gets loaded. */
+typedef struct Module {
+    const char *name;
+    /* where the host loaded it, which the code reads. */
+    uint32_t *base;
+    /* the end of its code, as an offset. */
+    uint32_t size;
+    uint32_t count;
+    const Entry *entries;
+} Module;
 
 #define RECOMP_EXPORT __attribute__((visibility("default")))
 #define LIKELY(x) __builtin_expect(!!(x), 1)

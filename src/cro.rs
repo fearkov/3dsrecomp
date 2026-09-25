@@ -13,6 +13,7 @@ pub struct Segment {
 }
 
 pub struct Module {
+    pub name: String,
     pub segments: Vec<Segment>,
     /// exported symbols by name, as segment tags.
     pub exports: Vec<(String, u32)>,
@@ -83,6 +84,7 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
         })
         .collect();
     Some(Module {
+        name: cstring(bytes, field(bytes, 0xC0)? as usize),
         segments,
         exports,
         indexed_exports,
@@ -90,8 +92,9 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
     })
 }
 
-/// the segment type holding code.
+/// the segment types holding code and holding zeros.
 const CODE: u32 = 0;
+const BSS: u32 = 3;
 
 impl Module {
     /// the addresses of the exported symbols that sit in code.
@@ -109,6 +112,26 @@ impl Module {
         let segment = self.segments.get((tag & 0xF) as usize)?;
         let offset = tag >> 4;
         (offset < segment.size).then(|| segment.offset + offset)
+    }
+
+    /// the module as it looks loaded at base, its bss after the file and
+    /// its relocations applied, for running it without a loader.
+    pub fn image(&self, bytes: &[u8], base: u32) -> Vec<u8> {
+        let bss = (bytes.len() as u32).next_multiple_of(0x1000);
+        let bss_size: u32 = self.segments.iter().filter(|s| s.kind == BSS).map(|s| s.size).sum();
+        let mut image = bytes.to_vec();
+        image.resize((bss + bss_size) as usize, 0);
+        let offset = |segment: &Segment| if segment.kind == BSS { bss } else { segment.offset };
+        for relocation in self.relocations.iter().filter(|r| r.is_absolute()) {
+            let Some(target) = self.segments.get((relocation.target & 0xF) as usize) else { continue };
+            let Some(symbol) = self.segments.get(relocation.segment as usize) else { continue };
+            let at = (offset(target) + (relocation.target >> 4)) as usize;
+            let value = base + offset(symbol) + relocation.addend;
+            if let Some(slot) = image.get_mut(at..at + 4) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        image
     }
 
     fn is_code(&self, segment: u32) -> bool {

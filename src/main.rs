@@ -53,10 +53,18 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
 
 fn build(path: &str, dir: &Path) {
     let (title, programs) = load(path);
-    // the executable for now, the modules need their code to move
-    let (_, program) = &programs[0];
-    let analysis = discover::analyze(program);
-    let files = codegen::generate(program, &analysis);
+    let analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
+    let units: Vec<codegen::Unit> = programs
+        .iter()
+        .zip(&analyses)
+        .enumerate()
+        .map(|(i, ((name, program), analysis))| codegen::Unit {
+            module: (i > 0).then_some(name.as_str()),
+            program,
+            analysis,
+        })
+        .collect();
+    let files = codegen::generate(&units);
 
     if let Err(error) = std::fs::create_dir_all(dir) {
         eprintln!("could not create {}, {error}", dir.display());
@@ -81,12 +89,10 @@ fn build(path: &str, dir: &Path) {
     println!("built {} in {:.1?}", library.display(), start.elapsed());
 }
 
-/// runs count of the executable's recompiled functions against the
-/// interpreter.
+/// runs up to count of the recompiled functions of each program against
+/// the interpreter, the modules one at a time, each loaded at the same place.
 fn check(path: &str, library: &Path, count: usize) {
     let (title, programs) = load(path);
-    let (_, program) = &programs[0];
-    let analysis = discover::analyze(program);
     let library = abi::Library::open(library).unwrap_or_else(|error| {
         eprintln!("could not open {}, {error}", library.display());
         exit(1);
@@ -95,36 +101,65 @@ fn check(path: &str, library: &Path, count: usize) {
         eprintln!("could not read the code, {error}");
         exit(1);
     });
-    let memory = verify::memory(
+    let regions = verify::regions(
         (image.text.base, &image.text.bytes),
         (image.rodata.base, &image.rodata.bytes),
         (image.data.base, &image.data.bytes),
         title.exheader.bss_size,
     );
+    let start = std::time::Instant::now();
+
+    let executable = verify::verify(
+        &verify::Memory::new(regions.clone()),
+        &library,
+        &sample(&discover::analyze(&programs[0].1), 0, count),
+    );
+    print_report("executable", &executable);
+
+    let mut modules = verify::Report::default();
+    for (module, bytes) in module_files(&title) {
+        let Some(index) = library.modules().iter().position(|m| m.name() == module.name) else { continue };
+        let Some(program) = module.program(&bytes) else { continue };
+        let mut memory = regions.clone();
+        memory.push(verify::Region {
+            base: verify::MODULE_BASE,
+            bytes: module.image(&bytes, verify::MODULE_BASE),
+            writable: true,
+        });
+        library.place(index, verify::MODULE_BASE);
+        let report = verify::verify(
+            &verify::Memory::new(memory),
+            &library,
+            &sample(&discover::analyze(&program), verify::MODULE_BASE, count),
+        );
+        library.place(index, 0);
+        modules.add(&report);
+    }
+    print_report("modules", &modules);
+    println!("took {:.1?}", start.elapsed());
+}
+
+/// up to count of the functions that became C, spread over the program, as
+/// addresses at base with bit 0 set for Thumb.
+fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
     let functions: Vec<u32> = analysis
         .functions
         .iter()
         .filter(|&(&entry, f)| codegen::recompiles(entry, f))
-        .map(|(&entry, f)| entry | (f.mode == Mode::Thumb) as u32)
+        .map(|(&entry, f)| (base + entry) | (f.mode == Mode::Thumb) as u32)
         .collect();
     let step = (functions.len() / count.max(1)).max(1);
-    let sample: Vec<u32> = functions.into_iter().step_by(step).take(count).collect();
+    functions.into_iter().step_by(step).take(count).collect()
+}
 
-    let start = std::time::Instant::now();
-    let report = verify::verify(&memory, &library, &sample);
+fn print_report(name: &str, report: &verify::Report) {
     println!(
-        "{} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched, in {:.1?}",
-        report.tested,
-        report.returned,
-        report.svc,
-        report.stuck,
-        report.other,
-        report.mismatched,
-        start.elapsed()
+        "{name:<11} {} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched",
+        report.tested, report.returned, report.svc, report.stuck, report.other, report.mismatched
     );
     println!(
-        "instructions {} recompiled, {} through the fallback, {} interpreted alone",
-        report.native, report.fallbacks, report.interpreted
+        "{:<11} instructions {} recompiled, {} through the fallback, {} interpreted alone",
+        "", report.native, report.fallbacks, report.interpreted
     );
 }
 
@@ -242,8 +277,19 @@ fn static_module(title: &Title) -> Option<cro::Module> {
     cro::parse(title.read_romfs(&file, 0, file.data_size as usize)?)
 }
 
-/// every CRO module in the RomFS, by file name.
+/// every CRO module in the RomFS, by the name it gives itself.
 fn modules(title: &Title) -> Vec<(String, Program)> {
+    module_files(title)
+        .into_iter()
+        .filter_map(|(module, bytes)| {
+            let program = module.program(&bytes)?;
+            Some((module.name, program))
+        })
+        .collect()
+}
+
+/// every CRO module in the RomFS with its file.
+fn module_files(title: &Title) -> Vec<(cro::Module, Vec<u8>)> {
     let Some(romfs) = &title.romfs else { return Vec::new() };
     let mut files = Vec::new();
     if let Ok(root) = romfs.root() {
@@ -253,8 +299,7 @@ fn modules(title: &Title) -> Vec<(String, Program)> {
         .into_iter()
         .filter_map(|file| {
             let bytes = title.read_romfs(&file, 0, file.data_size as usize)?;
-            let program = cro::parse(bytes)?.program(bytes)?;
-            Some((file.name, program))
+            Some((cro::parse(bytes)?, bytes.to_vec()))
         })
         .collect()
 }

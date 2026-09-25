@@ -1,11 +1,12 @@
 //! the Rust side of recomp.h, the interface recompiled code runs against.
 
-use std::ffi::c_void;
+use std::cell::RefCell;
+use std::ffi::{CStr, c_char, c_void};
 use std::path::Path;
 
 pub type Code = unsafe extern "C" fn(*mut Context);
 
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 
 pub const EXIT_SVC: u32 = 1;
 pub const EXIT_BUDGET: u32 = 2;
@@ -49,10 +50,37 @@ pub struct Entry {
     pub code: Code,
 }
 
+/// a module's code, whose entries are offsets from where it gets loaded.
+#[repr(C)]
+pub struct Module {
+    name: *const c_char,
+    base: *mut u32,
+    pub size: u32,
+    count: u32,
+    entries: *const Entry,
+}
+
+impl Module {
+    pub fn name(&self) -> &str {
+        // SAFETY: the generated table holds string literals
+        unsafe { CStr::from_ptr(self.name) }.to_str().unwrap_or_default()
+    }
+
+    pub fn entries(&self) -> &[Entry] {
+        // SAFETY: the table lives as long as the library does
+        unsafe { std::slice::from_raw_parts(self.entries, self.count as usize) }
+    }
+
+}
+
 /// a library of recompiled code, loaded.
 pub struct Library {
     entries: *const Entry,
     count: usize,
+    modules: *const Module,
+    module_count: usize,
+    /// the modules placed somewhere, as base, size and index.
+    placed: RefCell<Vec<(u32, u32, usize)>>,
     _library: libloading::Library,
 }
 
@@ -68,7 +96,16 @@ impl Library {
             }
             let count = **library.get::<*const u32>(b"recomp_entry_count").map_err(|e| e.to_string())?;
             let entries = *library.get::<*const Entry>(b"recomp_entries").map_err(|e| e.to_string())?;
-            Ok(Library { entries, count: count as usize, _library: library })
+            let module_count = **library.get::<*const u32>(b"recomp_module_count").map_err(|e| e.to_string())?;
+            let modules = *library.get::<*const Module>(b"recomp_modules").map_err(|e| e.to_string())?;
+            Ok(Library {
+                entries,
+                count: count as usize,
+                modules,
+                module_count: module_count as usize,
+                placed: RefCell::new(Vec::new()),
+                _library: library,
+            })
         }
     }
 
@@ -77,9 +114,35 @@ impl Library {
         unsafe { std::slice::from_raw_parts(self.entries, self.count) }
     }
 
-    /// the code that can run from address, bit 0 set for Thumb.
+    pub fn modules(&self) -> &[Module] {
+        // SAFETY: the table lives as long as the library does
+        unsafe { std::slice::from_raw_parts(self.modules, self.module_count) }
+    }
+
+    /// the code that can run from address, bit 0 set for Thumb, in the
+    /// executable or in a module that is loaded.
     pub fn lookup(&self, address: u32) -> Option<Code> {
-        let entries = self.entries();
-        entries.binary_search_by_key(&address, |entry| entry.address).ok().map(|i| entries[i].code)
+        let find = |entries: &[Entry], address: u32| {
+            entries.binary_search_by_key(&address, |entry| entry.address).ok().map(|i| entries[i].code)
+        };
+        find(self.entries(), address).or_else(|| {
+            let placed = self.placed.borrow();
+            let &(base, _, index) = placed.iter().find(|&&(base, size, _)| address.wrapping_sub(base) < size)?;
+            find(self.modules()[index].entries(), address - base)
+        })
+    }
+
+    /// tells the code of module index where it was loaded, zero when it goes
+    /// away.
+    pub fn place(&self, index: usize, base: u32) {
+        let module = &self.modules()[index];
+        // SAFETY: base points at the module's variable in the library, which
+        // the code only reads on entry
+        unsafe { *module.base = base };
+        let mut placed = self.placed.borrow_mut();
+        placed.retain(|&(_, _, i)| i != index);
+        if base != 0 {
+            placed.push((base, module.size, index));
+        }
     }
 }

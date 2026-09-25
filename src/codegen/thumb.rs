@@ -24,12 +24,12 @@ fn sign_extend(value: u32, bits: u32) -> u32 {
 }
 
 /// reading a register, where r15 is the address plus 4.
-fn reg(register: u32, a: u32) -> String {
-    if register == 15 { format!("0x{:08X}u", a + 4) } else { format!("ctx->r[{register}]") }
+fn reg(scope: &Scope, register: u32, a: u32) -> String {
+    if register == 15 { scope.at(a + 4) } else { format!("ctx->r[{register}]") }
 }
 
-fn interpret(out: &mut String, a: u32, op: u32) -> bool {
-    emit!(out, "    INTERPRET(0x{a:08X}u, 0x{op:04X}u);");
+fn interpret(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    emit!(out, "    INTERPRET({}, 0x{op:04X}u);", scope.at(a));
     true
 }
 
@@ -43,10 +43,10 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
         0b010 if op & (1 << 12) != 0 => register_offset(out, op),
         0b010 if op & (1 << 11) != 0 => {
             let literal = ((a + 4) & !3) + (op & 0xFF) * 4;
-            emit!(out, "    ctx->r[{}] = mem_read32(ctx, 0x{literal:08X}u);", (op >> 8) & 7);
+            emit!(out, "    ctx->r[{}] = mem_read32(ctx, {});", (op >> 8) & 7, scope.at(literal));
             true
         }
-        0b010 if op & (1 << 10) != 0 => high_register(out, a, op),
+        0b010 if op & (1 << 10) != 0 => high_register(out, scope, a, op),
         0b010 => alu(out, op),
         0b011 => immediate_offset(out, op),
         0b100 if op & (1 << 12) != 0 => {
@@ -69,7 +69,7 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
             }
             true
         }
-        0b101 if op & (1 << 12) != 0 => miscellaneous(out, a, op),
+        0b101 if op & (1 << 12) != 0 => miscellaneous(out, scope, a, op),
         0b101 => {
             // add rd, pc or sp, imm
             let offset = (op & 0xFF) * 4;
@@ -77,7 +77,7 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
             if op & (1 << 11) != 0 {
                 emit!(out, "    ctx->r[{rd}] = ctx->r[13] + 0x{offset:X}u;");
             } else {
-                emit!(out, "    ctx->r[{rd}] = 0x{:08X}u;", ((a + 4) & !3) + offset);
+                emit!(out, "    ctx->r[{rd}] = {};", scope.at(((a + 4) & !3) + offset));
             }
             true
         }
@@ -95,7 +95,7 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
                 }
             }
             // a half of bl on its own
-            _ => interpret(out, a, op),
+            _ => interpret(out, scope, a, op),
         },
     }
 }
@@ -175,22 +175,22 @@ fn alu(out: &mut String, op: u32) -> bool {
 }
 
 /// add, cmp and mov on the high registers, and bx and blx.
-fn high_register(out: &mut String, a: u32, op: u32) -> bool {
+fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op & 7) | ((op >> 4) & 8);
     let rs = (op >> 3) & 0xF;
-    let source = reg(rs, a);
+    let source = reg(scope, rs, a);
     match (op >> 8) & 3 {
         0 if rd == 15 => {
             // writing pc keeps Thumb
-            emit!(out, "    target = ({} + {source}) & ~1u; goto dispatch;", reg(rd, a));
+            emit!(out, "    target = ({} + {source}) & ~1u; goto dispatch;", reg(scope, rd, a));
             false
         }
         0 => {
-            emit!(out, "    ctx->r[{rd}] = {} + {source};", reg(rd, a));
+            emit!(out, "    ctx->r[{rd}] = {} + {source};", reg(scope, rd, a));
             true
         }
         1 => {
-            emit!(out, "    {{ uint32_t a = {}, b = {source}, r = a - b; {SUB_FLAGS} }}", reg(rd, a));
+            emit!(out, "    {{ uint32_t a = {}, b = {source}, r = a - b; {SUB_FLAGS} }}", reg(scope, rd, a));
             true
         }
         2 if rd == 15 && rs == 14 => {
@@ -209,11 +209,11 @@ fn high_register(out: &mut String, a: u32, op: u32) -> bool {
             let next = a + 2;
             emit!(
                 out,
-                "    {{ uint32_t v = {source}; ctx->r[14] = 0x{:08X}u; ctx->thumb = v & 1; ctx->r[15] = v & (ctx->thumb ? ~1u : ~3u); }}",
-                next | 1
+                "    {{ uint32_t v = {source}; ctx->r[14] = {} | 1; ctx->thumb = v & 1; ctx->r[15] = v & (ctx->thumb ? ~1u : ~3u); }}",
+                scope.at(next)
             );
             emit!(out, "    CALL(recomp_call);");
-            emit!(out, "    RETURNED_T(0x{next:08X}u);");
+            emit!(out, "    RETURNED_T({});", scope.at(next));
             true
         }
         _ if rs == 14 => {
@@ -260,7 +260,7 @@ fn immediate_offset(out: &mut String, op: u32) -> bool {
     true
 }
 
-fn miscellaneous(out: &mut String, a: u32, op: u32) -> bool {
+fn miscellaneous(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = op & 7;
     let m = format!("ctx->r[{}]", (op >> 3) & 7);
     match (op >> 8) & 0xF {
@@ -284,7 +284,7 @@ fn miscellaneous(out: &mut String, a: u32, op: u32) -> bool {
                 0 => format!("__builtin_bswap32({m})"),
                 1 => format!("(({m} & 0x00FF00FFu) << 8) | (({m} & 0xFF00FF00u) >> 8)"),
                 3 => format!("(uint32_t)(int32_t)(int16_t)((({m} & 0xFF) << 8) | (({m} >> 8) & 0xFF))"),
-                _ => return interpret(out, a, op),
+                _ => return interpret(out, scope, a, op),
             };
             emit!(out, "    ctx->r[{rd}] = {value};");
             true
@@ -292,7 +292,7 @@ fn miscellaneous(out: &mut String, a: u32, op: u32) -> bool {
         // cps, setend and the hints do nothing here
         0b0110 | 0b1111 => true,
         0b0100 | 0b0101 | 0b1100 | 0b1101 => push_pop(out, op),
-        _ => interpret(out, a, op),
+        _ => interpret(out, scope, a, op),
     }
 }
 
@@ -353,10 +353,10 @@ fn block_transfer(out: &mut String, op: u32) -> bool {
 fn conditional_branch(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     match (op >> 8) & 0xF {
         0xF => {
-            emit!(out, "    SVC(0x{:08X}u, 0x{:X}u);", a + 2, op & 0xFF);
+            emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 2), op & 0xFF);
             false
         }
-        0xE => interpret(out, a, op),
+        0xE => interpret(out, scope, a, op),
         condition => {
             let target = (a + 4).wrapping_add(sign_extend(op & 0xFF, 8) << 1);
             emit!(out, "    if ({}) {{", CONDITIONS[condition as usize]);

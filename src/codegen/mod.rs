@@ -19,19 +19,30 @@ pub const HEADER: &str = include_str!("recomp.h");
 pub struct Scope<'a> {
     /// the labels of the function being written.
     pub labels: &'a BTreeSet<u32>,
-    /// the functions written as C, by entry, bit 0 set for Thumb.
-    pub functions: &'a BTreeSet<u32>,
+    /// the C function that runs each function, by entry with bit 0 set
+    /// for Thumb.
+    pub functions: &'a BTreeMap<u32, String>,
+    /// what the names of the functions start with, which keeps modules apart.
+    pub prefix: &'a str,
+    /// whether the code moves, so that addresses are offsets from where the
+    /// host loaded it.
+    pub relative: bool,
 }
 
 impl Scope<'_> {
-    /// the C name of the function at target, if it was written.
+    /// an address as C.
+    fn at(&self, address: u32) -> String {
+        if self.relative { format!("(module_base + 0x{address:X}u)") } else { format!("0x{address:08X}u") }
+    }
+
+    /// the C function that runs the function at target, if there is one.
     fn function(&self, target: u32, thumb: bool) -> Option<String> {
-        self.functions.contains(&(target | thumb as u32)).then(|| name(target, thumb))
+        self.functions.get(&(target | thumb as u32)).cloned()
     }
 }
 
-fn name(entry: u32, thumb: bool) -> String {
-    format!("{}_{entry:08X}", if thumb { 't' } else { 'f' })
+fn name(prefix: &str, entry: u32, thumb: bool) -> String {
+    format!("{prefix}{}_{entry:08X}", if thumb { 't' } else { 'f' })
 }
 
 macro_rules! emit {
@@ -44,7 +55,8 @@ macro_rules! emit {
 /// the caller is Thumb.
 fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) -> bool {
     let caller_thumb = link & 1 != 0;
-    emit!(out, "    ctx->r[14] = 0x{link:08X}u; ctx->r[15] = 0x{target:08X}u;");
+    let lr = if caller_thumb { format!("{} | 1", scope.at(link & !1)) } else { scope.at(link) };
+    emit!(out, "    ctx->r[14] = {lr}; ctx->r[15] = {};", scope.at(target));
     if thumb != caller_thumb {
         emit!(out, "    ctx->thumb = {};", thumb as u8);
     }
@@ -53,7 +65,7 @@ fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) ->
         None => emit!(out, "    CALL(recomp_call);"),
     }
     let check = if caller_thumb { "RETURNED_T" } else { "RETURNED" };
-    emit!(out, "    {check}(0x{:08X}u);", link & !1);
+    emit!(out, "    {check}({});", scope.at(link & !1));
     true
 }
 
@@ -63,17 +75,15 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
         emit!(out, "    goto L_{target:08X};");
     } else if let Some(name) = scope.function(target, thumb) {
         // a tail call
-        emit!(out, "    ctx->r[15] = 0x{target:08X}u; CALL({name}); return;");
+        emit!(out, "    ctx->r[15] = {}; CALL({name}); return;", scope.at(target));
     } else {
-        emit!(out, "    target = 0x{target:08X}u; goto dispatch;");
+        emit!(out, "    target = {}; goto dispatch;", scope.at(target));
     }
     false
 }
 
 /// instructions per source file, so the files compile in parallel.
 const FILE_SIZE: usize = 20_000;
-
-const PRELUDE: &str = "#include \"recomp.h\"\n#include \"functions.h\"\n\n";
 
 /// whether a function becomes C, which it does unless its entry turned
 /// out not to be code.
@@ -86,71 +96,123 @@ fn key(address: u32, mode: Mode) -> u32 {
     address | (mode == Mode::Thumb) as u32
 }
 
-/// the C sources for a program, as file names and contents.
-pub fn generate(program: &Program, analysis: &Analysis) -> Vec<(String, String)> {
-    let functions: BTreeMap<u32, &Function> =
-        analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&entry, f)| (entry, f)).collect();
-    let names: BTreeSet<u32> = functions.iter().map(|(&entry, f)| key(entry, f.mode)).collect();
+/// a program to write as C, the executable or one of its modules.
+pub struct Unit<'a> {
+    /// the module's name, None for the executable, whose code does not move.
+    pub module: Option<&'a str>,
+    pub program: &'a Program,
+    pub analysis: &'a Analysis,
+}
 
+/// the C sources for the units, the executable first, as file names and
+/// contents.
+pub fn generate(units: &[Unit]) -> Vec<(String, String)> {
     let mut files = vec![("recomp.h".to_owned(), HEADER.to_owned())];
-    let mut prototypes = String::new();
-    for (&entry, function) in &functions {
-        writeln!(prototypes, "void {}(Context *ctx);", name(entry, function.mode == Mode::Thumb)).unwrap();
-    }
-    files.push(("functions.h".to_owned(), prototypes));
-
+    let mut sources: Vec<String> = Vec::new();
     let mut source = String::new();
+    // the headers the file being written includes
+    let mut included = BTreeSet::new();
     let mut size = 0;
-    let mut count = 0;
-    for (&address, function) in &functions {
-        if source.is_empty() {
-            source.push_str(PRELUDE);
-        }
-        write_function(&mut source, program, &names, address, function);
-        size += function.instructions.len();
-        if size >= FILE_SIZE {
-            files.push((format!("code{count:03}.c"), std::mem::take(&mut source)));
-            size = 0;
-            count += 1;
-        }
-    }
-    if !source.is_empty() {
-        files.push((format!("code{count:03}.c"), source));
-    }
+    let mut tables = String::from("#include \"recomp.h\"\n");
+    let mut modules = String::new();
 
-    // every label the host can resume at, preferring the function that
-    // starts there
-    let mut entries: BTreeMap<u32, String> = BTreeMap::new();
-    for (&address, function) in &functions {
-        let owner = name(address, function.mode == Mode::Thumb);
-        for &label in &function.labels {
-            let slot = entries.entry(key(label, function.mode)).or_insert_with(|| owner.clone());
-            if label == address {
-                slot.clone_from(&owner);
+    for (index, unit) in units.iter().enumerate() {
+        let prefix = if unit.module.is_some() { format!("m{index:03}_") } else { String::new() };
+        let header = format!("{}functions.h", prefix);
+        let functions: BTreeMap<u32, &Function> =
+            unit.analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&e, f)| (e, f)).collect();
+        let names: BTreeMap<u32, String> = functions
+            .iter()
+            .map(|(&entry, f)| (key(entry, f.mode), name(&prefix, entry, f.mode == Mode::Thumb)))
+            .collect();
+
+        let mut prototypes = String::new();
+        if unit.module.is_some() {
+            emit!(prototypes, "extern uint32_t {prefix}base;");
+        }
+        for (&entry, function) in &functions {
+            emit!(prototypes, "void {}(Context *ctx);", name(&prefix, entry, function.mode == Mode::Thumb));
+        }
+        files.push((header.clone(), prototypes));
+
+        let include = format!("#include \"{header}\"\n\n");
+        for (&entry, function) in &functions {
+            if source.is_empty() {
+                source.push_str("#include \"recomp.h\"\n");
+            }
+            if included.insert(index) {
+                source.push_str(&include);
+            }
+            let scope =
+                Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative: unit.module.is_some() };
+            write_function(&mut source, unit.program, &scope, entry, function);
+            size += function.instructions.len();
+            if size >= FILE_SIZE {
+                sources.push(std::mem::take(&mut source));
+                included.clear();
+                size = 0;
             }
         }
+
+        // every label the host can resume at, preferring the function that
+        // starts there
+        let mut entries: BTreeMap<u32, String> = BTreeMap::new();
+        for (&entry, function) in &functions {
+            let owner = name(&prefix, entry, function.mode == Mode::Thumb);
+            for &label in &function.labels {
+                let slot = entries.entry(key(label, function.mode)).or_insert_with(|| owner.clone());
+                if label == entry {
+                    slot.clone_from(&owner);
+                }
+            }
+        }
+        tables.push_str(&include);
+        let table = match unit.module {
+            Some(module) => {
+                emit!(tables, "uint32_t {prefix}base;");
+                emit!(
+                    modules,
+                    "    {{\"{module}\", &{prefix}base, 0x{:X}u, {}, {prefix}entries}},",
+                    unit.program.text.end(),
+                    entries.len()
+                );
+                format!("static const Entry {prefix}entries[]")
+            }
+            None => {
+                emit!(tables, "RECOMP_EXPORT const uint32_t recomp_entry_count = {};", entries.len());
+                "RECOMP_EXPORT const Entry recomp_entries[]".to_owned()
+            }
+        };
+        emit!(tables, "{table} = {{");
+        for (label, owner) in entries {
+            emit!(tables, "    {{0x{label:08X}u, {owner}}},");
+        }
+        emit!(tables, "}};\n");
     }
-    let mut table = String::from(PRELUDE);
-    writeln!(table, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;").unwrap();
-    writeln!(table, "RECOMP_EXPORT const uint32_t recomp_entry_count = {};", entries.len()).unwrap();
-    writeln!(table, "RECOMP_EXPORT const Entry recomp_entries[] = {{").unwrap();
-    for (label, owner) in entries {
-        writeln!(table, "    {{0x{label:08X}u, {owner}}},").unwrap();
+    if !source.is_empty() {
+        sources.push(source);
     }
-    table.push_str("};\n");
-    files.push(("entries.c".to_owned(), table));
+
+    emit!(tables, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;");
+    emit!(tables, "RECOMP_EXPORT const uint32_t recomp_module_count = {};", units.len() - 1);
+    emit!(tables, "RECOMP_EXPORT const Module recomp_modules[] = {{\n{modules}}};");
+    files.push(("entries.c".to_owned(), tables));
+    files.extend(sources.into_iter().enumerate().map(|(i, source)| (format!("code{i:03}.c"), source)));
     files
 }
 
-fn write_function(out: &mut String, program: &Program, names: &BTreeSet<u32>, entry: u32, function: &Function) {
-    let scope = Scope { labels: &function.labels, functions: names };
+fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
     let thumb = function.mode == Mode::Thumb;
     let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
-    emit!(out, "void {}(Context *ctx) {{", name(entry, thumb));
+    emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
+    if scope.relative {
+        emit!(out, "    const uint32_t module_base = {}base;", scope.prefix);
+    }
     emit!(out, "    uint32_t target = ctx->r[15];");
-    emit!(out, "    if (LIKELY(target == 0x{entry:08X}u && {state})) goto L_{entry:08X};");
+    emit!(out, "    if (LIKELY(target == {} && {state})) goto L_{entry:08X};", scope.at(entry));
     emit!(out, "dispatch:");
-    emit!(out, "    if ({state}) switch (target) {{");
+    let offset = if scope.relative { "target - module_base" } else { "target" };
+    emit!(out, "    if ({state}) switch ({offset}) {{");
     for label in &function.labels {
         emit!(out, "    case 0x{label:08X}u: goto L_{label:08X};");
     }
@@ -165,22 +227,22 @@ fn write_function(out: &mut String, program: &Program, names: &BTreeSet<u32>, en
         if function.labels.contains(&address) {
             let run = instructions[i + 1..].iter().take_while(|a| !function.labels.contains(a)).count() + 1;
             emit!(out, "L_{address:08X}:");
-            emit!(out, "    BUDGET(0x{address:08X}u, {run});");
+            emit!(out, "    BUDGET({}, {run});", scope.at(address));
         }
         let (continues, size) = if thumb {
             let op = program.text.read16(address).unwrap_or(0) as u32;
             let second = program.text.read16(address + 2).unwrap_or(0) as u32;
             let size = crate::thumb::decode(op as u16, Some(second as u16), address).1;
             emit!(out, "    /* {address:08X} {op:04X} */");
-            (thumb::lower(out, &scope, address, op, second), size)
+            (thumb::lower(out, scope, address, op, second), size)
         } else {
             let op = program.text.read32(address).unwrap_or(0);
             emit!(out, "    /* {address:08X} {op:08X} */");
-            (arm::lower(out, &scope, address, op), 4)
+            (arm::lower(out, scope, address, op), 4)
         };
         let next = address + size;
         if continues && instructions.get(i + 1) != Some(&next) {
-            emit!(out, "    target = 0x{next:08X}u; goto dispatch;");
+            emit!(out, "    target = {}; goto dispatch;", scope.at(next));
         }
     }
     emit!(out, "}}\n");

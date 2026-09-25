@@ -14,6 +14,8 @@ pub enum Source {
     Call,
     /// a code address stored in a literal pool or in the data segments.
     Pointer,
+    /// a symbol the image exports to its modules.
+    Export,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -85,9 +87,11 @@ struct Discovery<'a> {
     text: &'a Segment,
     analysis: Analysis,
     queue: VecDeque<(u32, Mode, Source)>,
+    /// pointers found in data, followed only once nothing surer is left.
+    guesses: VecDeque<(u32, Mode, Source)>,
 }
 
-pub fn analyze(image: &Image) -> Analysis {
+pub fn analyze(image: &Image, exports: &[u32]) -> Analysis {
     let mut discovery = Discovery {
         text: &image.text,
         analysis: Analysis {
@@ -99,14 +103,18 @@ pub fn analyze(image: &Image) -> Analysis {
             dead_ends: 0,
         },
         queue: VecDeque::new(),
+        guesses: VecDeque::new(),
     };
     discovery.queue.push_back((image.entry, Mode::Arm, Source::Entry));
+    for &export in exports {
+        discovery.code_pointer(export, Source::Export);
+    }
     discovery.run();
 
     // then whatever the data segments point at
     for segment in [&image.rodata, &image.data] {
         for (_, value) in segment.words() {
-            discovery.code_pointer(value);
+            discovery.code_pointer(value, Source::Pointer);
         }
     }
     discovery.run();
@@ -115,7 +123,7 @@ pub fn analyze(image: &Image) -> Analysis {
 
 impl Discovery<'_> {
     fn run(&mut self) {
-        while let Some((entry, mode, source)) = self.queue.pop_front() {
+        while let Some((entry, mode, source)) = self.queue.pop_front().or_else(|| self.guesses.pop_front()) {
             if !self.analysis.functions.contains_key(&entry) {
                 let instructions = self.explore(entry, mode);
                 self.analysis.functions.insert(entry, Function { source, mode, instructions });
@@ -141,7 +149,7 @@ impl Discovery<'_> {
     }
 
     /// a value that may be the address of a function, odd for Thumb.
-    fn code_pointer(&mut self, value: u32) {
+    fn code_pointer(&mut self, value: u32, source: Source) {
         let (address, mode) = if value & 1 != 0 {
             (value & !1, Mode::Thumb)
         } else if value & 3 == 0 {
@@ -150,7 +158,11 @@ impl Discovery<'_> {
             return;
         };
         if self.text.contains(address) && !self.analysis.functions.contains_key(&address) {
-            self.queue.push_back((address, mode, Source::Pointer));
+            if source == Source::Pointer {
+                self.guesses.push_back((address, mode, source));
+            } else {
+                self.queue.push_back((address, mode, source));
+            }
         }
     }
 
@@ -229,7 +241,7 @@ impl Discovery<'_> {
                     Flow::LoadPcLiteral { literal } => {
                         self.mark(literal, 4, Byte::Literal);
                         if let Some(target) = self.text.read32(literal) {
-                            self.code_pointer(target);
+                            self.code_pointer(target, Source::Pointer);
                         }
                         if !conditional {
                             break;
@@ -242,7 +254,7 @@ impl Discovery<'_> {
                             self.mark(literal, size, Byte::Literal);
                             if size == 4 {
                                 if let Some(value) = self.text.read32(literal) {
-                                    self.code_pointer(value);
+                                    self.code_pointer(value, Source::Pointer);
                                 }
                             }
                         }
@@ -298,7 +310,7 @@ impl Discovery<'_> {
             if target & 3 == 0 {
                 blocks.push(target);
             } else {
-                self.code_pointer(target);
+                self.code_pointer(target, Source::Pointer);
             }
         }
     }
@@ -309,6 +321,10 @@ mod tests {
     use super::*;
 
     const BASE: u32 = 0x0010_0000;
+
+    fn analyze_words(words: &[u32]) -> Analysis {
+        analyze(&image(words), &[])
+    }
 
     fn image(words: &[u32]) -> Image {
         let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -323,7 +339,7 @@ mod tests {
 
     #[test]
     fn follows_calls_and_marks_literals() {
-        let analysis = analyze(&image(&[
+        let analysis = analyze_words(&[
             0xEB00_0002, // bl 0x100010
             0xEF00_0000, // svc 0
             0xEAFF_FFFE, // b .
@@ -331,7 +347,7 @@ mod tests {
             0xE59F_0000, // ldr r0, [pc] (literal at 0x100018)
             0xE12F_FF1E, // bx lr
             0x0010_0000, // the literal
-        ]));
+        ]);
         assert_eq!(analysis.functions.keys().copied().collect::<Vec<_>>(), [BASE, BASE + 0x10]);
         assert_eq!(analysis.functions[&(BASE + 0x10)].source, Source::Call);
         assert_eq!(analysis.count(Byte::Code), 5 * 4);
@@ -342,7 +358,7 @@ mod tests {
 
     #[test]
     fn a_switch_table_leads_to_every_case() {
-        let analysis = analyze(&image(&[
+        let analysis = analyze_words(&[
             0xE350_0001, // cmp r0, 1
             0x908F_F100, // addls pc, pc, r0 lsl 2
             0xEA00_0002, // b default (0x100018)
@@ -352,14 +368,14 @@ mod tests {
             0xE12F_FF1E, // default
             0xE12F_FF1E, // case 0
             0xE12F_FF1E, // case 1
-        ]));
+        ]);
         assert_eq!(analysis.jump_tables, 1);
         assert_eq!(analysis.count(Byte::Code), 8 * 4);
     }
 
     #[test]
     fn an_address_table_is_sized_by_its_compare() {
-        let analysis = analyze(&image(&[
+        let analysis = analyze_words(&[
             0xE350_0001, // cmp r0, 1
             0x979F_F100, // ldrls pc, [pc, r0 lsl 2]
             0xE12F_FF1E, // bx lr, the default case
@@ -367,7 +383,7 @@ mod tests {
             BASE + 0x18, // case 1
             0xE12F_FF1E, // case 0
             0xE12F_FF1E, // case 1
-        ]));
+        ]);
         assert_eq!(analysis.jump_tables, 1);
         assert_eq!(analysis.count(Byte::Literal), 8);
         assert_eq!(analysis.count(Byte::Code), 5 * 4);
@@ -375,11 +391,11 @@ mod tests {
 
     #[test]
     fn blx_leads_into_thumb_code() {
-        let analysis = analyze(&image(&[
+        let analysis = analyze_words(&[
             0xFA00_0000, // blx 0x100008
             0xE12F_FF1E, // bx lr
             0x4770_2001, // movs r0, 1 then bx lr, in Thumb
-        ]));
+        ]);
         let thumb = &analysis.functions[&(BASE + 8)];
         assert_eq!(thumb.mode, Mode::Thumb);
         assert_eq!(thumb.instructions, 2);
@@ -389,7 +405,7 @@ mod tests {
     fn pointers_in_data_become_functions() {
         let mut image = image(&[0xE12F_FF1E, 0x4770_4770, 0xE12F_FF1E]);
         image.rodata.bytes = [BASE + 8, BASE + 5].iter().flat_map(|w| w.to_le_bytes()).collect();
-        let analysis = analyze(&image);
+        let analysis = analyze(&image, &[]);
         assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Pointer);
         assert_eq!(analysis.functions[&(BASE + 4)].mode, Mode::Thumb);
     }

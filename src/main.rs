@@ -4,6 +4,7 @@
 //! pass can discover on its own.
 
 mod arm;
+mod cro;
 mod discover;
 mod image;
 mod thumb;
@@ -36,8 +37,11 @@ fn main() {
         }
     };
 
+    let module = static_module(&title);
+    let exports = module.as_ref().map(cro::Module::code_exports).unwrap_or_default();
+
     let start = std::time::Instant::now();
-    let analysis = discover::analyze(&image);
+    let analysis = discover::analyze(&image, &exports);
     let elapsed = start.elapsed();
 
     let text_size = image.text.bytes.len();
@@ -49,11 +53,16 @@ fn main() {
 
     println!("title        {}", title.exheader.title);
     println!("text         0x{:08X}, {} KiB", image.text.base, text_size / 1024);
+    if let Some(module) = &module {
+        println!("module       {}, {} exports in code", module.name, exports.len());
+    }
     println!(
-        "functions    {} ({} from calls, {} from pointers)",
+        "functions    {} ({} from calls, {} from pointers, {} from {} exports)",
         analysis.functions.len(),
         from(Source::Call),
-        from(Source::Pointer)
+        from(Source::Pointer),
+        from(Source::Export),
+        exports.len()
     );
     let instructions: usize = analysis.functions.values().map(|f| f.instructions).sum();
     println!(
@@ -76,4 +85,12 @@ fn main() {
     for (start, length) in analysis.largest_gaps(image.text.base, 8) {
         println!("  0x{start:08X}  {length} bytes");
     }
+}
+
+/// the main executable's module description, the static.crs every title
+/// carries in its RomFS.
+fn static_module(title: &zakuro_fs::Title) -> Option<cro::Module> {
+    let romfs = title.romfs.as_ref()?;
+    let file = romfs.lookup("static.crs").ok()?;
+    cro::parse(title.read_romfs(&file, 0, file.data_size as usize)?)
 }

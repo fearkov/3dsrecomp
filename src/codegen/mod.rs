@@ -96,6 +96,47 @@ fn key(address: u32, mode: Mode) -> u32 {
     address | (mode == Mode::Thumb) as u32
 }
 
+/// the functions whose code another function already has, each with the
+/// entry of the function that runs it. a jump table's cases and the target
+/// of a tail call turn up both ways, as functions of their own and inside
+/// the function that reaches them.
+fn containers(functions: &BTreeMap<u32, &Function>) -> BTreeMap<u32, u32> {
+    let mut owners: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for (&entry, function) in functions {
+        for &label in &function.labels {
+            owners.entry(label).or_default().push(entry);
+        }
+    }
+    // a function only moves into a bigger one, so the links cannot loop
+    let rank = |entry: u32| (functions[&entry].instructions.len(), std::cmp::Reverse(entry));
+    let mut parent = BTreeMap::new();
+    for (&entry, function) in functions {
+        let contains = |other: u32| {
+            let code = &functions[&other].instructions;
+            function.instructions.iter().all(|address| code.binary_search(address).is_ok())
+        };
+        let best = owners[&entry]
+            .iter()
+            .copied()
+            .filter(|&other| functions[&other].mode == function.mode && rank(other) > rank(entry))
+            .filter(|&other| contains(other))
+            .max_by_key(|&other| rank(other));
+        if let Some(best) = best {
+            parent.insert(entry, best);
+        }
+    }
+    parent
+        .keys()
+        .map(|&entry| {
+            let mut container = parent[&entry];
+            while let Some(&next) = parent.get(&container) {
+                container = next;
+            }
+            (entry, container)
+        })
+        .collect()
+}
+
 /// a program to write as C, the executable or one of its modules.
 pub struct Unit<'a> {
     /// the module's name, None for the executable, whose code does not move.
@@ -119,12 +160,17 @@ pub fn generate(units: &[Unit]) -> Vec<(String, String)> {
     for (index, unit) in units.iter().enumerate() {
         let prefix = if unit.module.is_some() { format!("m{index:03}_") } else { String::new() };
         let header = format!("{}functions.h", prefix);
-        let functions: BTreeMap<u32, &Function> =
+        let mut functions: BTreeMap<u32, &Function> =
             unit.analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&e, f)| (e, f)).collect();
+        let containers = containers(&functions);
         let names: BTreeMap<u32, String> = functions
             .iter()
-            .map(|(&entry, f)| (key(entry, f.mode), name(&prefix, entry, f.mode == Mode::Thumb)))
+            .map(|(&entry, f)| {
+                let home = containers.get(&entry).copied().unwrap_or(entry);
+                (key(entry, f.mode), name(&prefix, home, f.mode == Mode::Thumb))
+            })
             .collect();
+        functions.retain(|entry, _| !containers.contains_key(entry));
 
         let mut prototypes = String::new();
         if unit.module.is_some() {

@@ -6,8 +6,9 @@
 mod arm;
 mod discover;
 mod image;
+mod thumb;
 
-use discover::{Byte, Source};
+use discover::{Byte, Mode, Source};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -60,7 +61,8 @@ fn main() {
         instructions,
         instructions / analysis.functions.len().max(1)
     );
-    println!("thumb        {} entry points, not followed yet", analysis.thumb_entries.len());
+    let thumb = analysis.functions.values().filter(|f| f.mode == Mode::Thumb).count();
+    println!("modes        {} ARM, {} Thumb", analysis.functions.len() - thumb, thumb);
     println!("code         {:.1}% of text", percent(code));
     println!("literals     {:.1}% of text", percent(literal));
     println!("unreached    {:.1}% of text", percent(unknown));
@@ -68,6 +70,7 @@ fn main() {
         "indirect     {} sites, {} switch tables, {} svc",
         analysis.indirect_sites, analysis.jump_tables, analysis.svc_sites
     );
+    println!("dead ends    {} paths ran into something that cannot be code", analysis.dead_ends);
     println!("analysis     {elapsed:.2?}");
     println!("largest unreached runs");
     for (start, length) in analysis.largest_gaps(image.text.base, 8) {

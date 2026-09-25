@@ -4,8 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::arm::{self, Flow};
+use crate::arm::{self, Flow, Instruction};
 use crate::image::{Image, Segment};
+use crate::thumb;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
@@ -15,9 +16,25 @@ pub enum Source {
     Pointer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Mode {
+    Arm,
+    Thumb,
+}
+
+impl Mode {
+    fn other(self) -> Mode {
+        match self {
+            Mode::Arm => Mode::Thumb,
+            Mode::Thumb => Mode::Arm,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Function {
     pub source: Source,
+    pub mode: Mode,
     pub instructions: usize,
 }
 
@@ -31,12 +48,12 @@ pub enum Byte {
 
 pub struct Analysis {
     pub functions: BTreeMap<u32, Function>,
-    /// entry points of Thumb code, not followed yet.
-    pub thumb_entries: BTreeSet<u32>,
     pub map: Vec<Byte>,
     pub indirect_sites: usize,
     pub jump_tables: usize,
     pub svc_sites: usize,
+    /// paths abandoned because they ran into something that cannot be code.
+    pub dead_ends: usize,
 }
 
 impl Analysis {
@@ -67,7 +84,7 @@ impl Analysis {
 struct Discovery<'a> {
     text: &'a Segment,
     analysis: Analysis,
-    queue: VecDeque<(u32, Source)>,
+    queue: VecDeque<(u32, Mode, Source)>,
 }
 
 pub fn analyze(image: &Image) -> Analysis {
@@ -75,15 +92,15 @@ pub fn analyze(image: &Image) -> Analysis {
         text: &image.text,
         analysis: Analysis {
             functions: BTreeMap::new(),
-            thumb_entries: BTreeSet::new(),
             map: vec![Byte::Unknown; image.text.bytes.len()],
             indirect_sites: 0,
             jump_tables: 0,
             svc_sites: 0,
+            dead_ends: 0,
         },
         queue: VecDeque::new(),
     };
-    discovery.queue.push_back((image.entry, Source::Entry));
+    discovery.queue.push_back((image.entry, Mode::Arm, Source::Entry));
     discovery.run();
 
     // then whatever the data segments point at
@@ -98,10 +115,10 @@ pub fn analyze(image: &Image) -> Analysis {
 
 impl Discovery<'_> {
     fn run(&mut self) {
-        while let Some((entry, source)) = self.queue.pop_front() {
+        while let Some((entry, mode, source)) = self.queue.pop_front() {
             if !self.analysis.functions.contains_key(&entry) {
-                let instructions = self.explore(entry);
-                self.analysis.functions.insert(entry, Function { source, instructions });
+                let instructions = self.explore(entry, mode);
+                self.analysis.functions.insert(entry, Function { source, mode, instructions });
             }
         }
     }
@@ -119,31 +136,43 @@ impl Discovery<'_> {
         }
     }
 
-    fn is_code(&self, address: u32) -> bool {
-        self.analysis.map[(address - self.text.base) as usize] == Byte::Code
+    fn byte(&self, address: u32) -> Byte {
+        self.analysis.map[(address - self.text.base) as usize]
     }
 
-    /// a value that may be the address of a function.
+    /// a value that may be the address of a function, odd for Thumb.
     fn code_pointer(&mut self, value: u32) {
-        if !self.text.contains(value & !1) {
+        let (address, mode) = if value & 1 != 0 {
+            (value & !1, Mode::Thumb)
+        } else if value & 3 == 0 {
+            (value, Mode::Arm)
+        } else {
             return;
-        }
-        if value & 1 != 0 {
-            self.analysis.thumb_entries.insert(value & !1);
-        } else if value & 3 == 0 && !self.analysis.functions.contains_key(&value) {
-            self.queue.push_back((value, Source::Pointer));
+        };
+        if self.text.contains(address) && !self.analysis.functions.contains_key(&address) {
+            self.queue.push_back((address, mode, Source::Pointer));
         }
     }
 
-    fn call(&mut self, target: u32) {
+    fn call(&mut self, target: u32, mode: Mode) {
         if self.text.contains(target) && !self.analysis.functions.contains_key(&target) {
-            self.queue.push_back((target, Source::Call));
+            self.queue.push_back((target, mode, Source::Call));
+        }
+    }
+
+    fn decode(&self, address: u32, mode: Mode) -> Option<(Instruction, u32)> {
+        match mode {
+            Mode::Arm => Some((arm::decode(self.text.read32(address)?, address), 4)),
+            Mode::Thumb => {
+                let halfword = self.text.read16(address)?;
+                Some(thumb::decode(halfword, self.text.read16(address + 2), address))
+            }
         }
     }
 
     /// follows every path through one function, returning how many
     /// instructions it decoded.
-    fn explore(&mut self, entry: u32) -> usize {
+    fn explore(&mut self, entry: u32, mode: Mode) -> usize {
         let mut blocks = vec![entry];
         let mut seen = BTreeSet::new();
         let mut decoded = 0;
@@ -151,18 +180,22 @@ impl Discovery<'_> {
         while let Some(start) = blocks.pop() {
             let mut address = start;
             while self.text.contains(address) && seen.insert(address) {
-                if self.analysis.map[(address - self.text.base) as usize] == Byte::Literal {
+                if self.byte(address) == Byte::Literal {
                     // ran into a literal pool, the path is wrong or it ended
                     break;
                 }
-                let Some(word) = self.text.read32(address) else { break };
-                let instruction = arm::decode(word, address);
-                self.mark(address, 4, Byte::Code);
+                let Some((instruction, size)) = self.decode(address, mode) else { break };
+                if instruction.flow == Flow::Undefined {
+                    self.analysis.dead_ends += 1;
+                    break;
+                }
+                self.mark(address, size, Byte::Code);
                 decoded += 1;
                 let conditional = instruction.is_conditional();
 
                 match instruction.flow {
-                    Flow::Branch { target, link: true } => self.call(target),
+                    Flow::Branch { target, link: true } => self.call(target, mode),
+                    Flow::CallOtherMode { target } => self.call(target, mode.other()),
                     Flow::Branch { target, link: false } => {
                         if self.text.contains(target) {
                             blocks.push(target);
@@ -170,9 +203,6 @@ impl Discovery<'_> {
                         if !conditional {
                             break;
                         }
-                    }
-                    Flow::BranchToThumb { target } => {
-                        self.analysis.thumb_entries.insert(target);
                     }
                     Flow::BranchRegister { link: true, .. } => self.analysis.indirect_sites += 1,
                     Flow::BranchRegister { link: false, .. } | Flow::IndirectJump => {
@@ -187,23 +217,14 @@ impl Discovery<'_> {
                         }
                     }
                     Flow::JumpTable => {
-                        // the table is a run of branches starting right after
-                        // the default case
-                        self.analysis.jump_tables += 1;
-                        let mut entry = address + 4;
-                        while let Some(word) = self.text.read32(entry) {
-                            match arm::decode(word, entry) {
-                                arm::Instruction { condition: arm::ALWAYS, flow: Flow::Branch { target, link: false } } => {
-                                    self.mark(entry, 4, Byte::Code);
-                                    if self.text.contains(target) {
-                                        blocks.push(target);
-                                    }
-                                    entry += 4;
-                                }
-                                _ => break,
-                            }
-                        }
+                        self.branch_table(address, &mut blocks);
                         break;
+                    }
+                    Flow::AddressTable { index } => {
+                        self.address_table(address, index, &mut blocks);
+                        if !conditional {
+                            break;
+                        }
                     }
                     Flow::LoadPcLiteral { literal } => {
                         self.mark(literal, 4, Byte::Literal);
@@ -215,10 +236,9 @@ impl Discovery<'_> {
                         }
                     }
                     Flow::LiteralLoad { literal, size } => {
-                        if !self.text.contains(literal) || self.is_code(literal) {
-                            // a load from inside the code that we already
-                            // decoded as instructions, leave it be
-                        } else {
+                        // a load from something already decoded as code is
+                        // left alone
+                        if self.text.contains(literal) && self.byte(literal) != Byte::Code {
                             self.mark(literal, size, Byte::Literal);
                             if size == 4 {
                                 if let Some(value) = self.text.read32(literal) {
@@ -228,12 +248,59 @@ impl Discovery<'_> {
                         }
                     }
                     Flow::Svc => self.analysis.svc_sites += 1,
-                    Flow::Other => {}
+                    Flow::Undefined | Flow::Other => {}
                 }
-                address += 4;
+                address += size;
             }
         }
         decoded
+    }
+
+    /// add pc, pc, rm lsl 2 jumps into a run of branches that starts right
+    /// after the default case.
+    fn branch_table(&mut self, address: u32, blocks: &mut Vec<u32>) {
+        self.analysis.jump_tables += 1;
+        let mut entry = address + 4;
+        while let Some(word) = self.text.read32(entry) {
+            match arm::decode(word, entry) {
+                Instruction { condition: arm::ALWAYS, flow: Flow::Branch { target, link: false } } => {
+                    self.mark(entry, 4, Byte::Code);
+                    if self.text.contains(target) {
+                        blocks.push(target);
+                    }
+                    entry += 4;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// ldr pc, [pc, rm lsl 2] loads its target from the table of addresses
+    /// right after the default branch. its size comes from the cmp just
+    /// before it, or failing that from how far the entries keep pointing
+    /// into the code.
+    fn address_table(&mut self, address: u32, index: u32, blocks: &mut Vec<u32>) {
+        self.analysis.jump_tables += 1;
+        let entries = address
+            .checked_sub(4)
+            .and_then(|previous| self.text.read32(previous))
+            .and_then(arm::compare_immediate)
+            .filter(|&(register, _)| register == index)
+            .map(|(_, limit)| limit as usize + 1);
+        let table = address + 8;
+        for i in 0..entries.unwrap_or(256) {
+            let slot = table + i as u32 * 4;
+            let Some(target) = self.text.read32(slot) else { break };
+            if !self.text.contains(target & !1) {
+                break;
+            }
+            self.mark(slot, 4, Byte::Literal);
+            if target & 3 == 0 {
+                blocks.push(target);
+            } else {
+                self.code_pointer(target);
+            }
+        }
     }
 }
 
@@ -291,11 +358,39 @@ mod tests {
     }
 
     #[test]
+    fn an_address_table_is_sized_by_its_compare() {
+        let analysis = analyze(&image(&[
+            0xE350_0001, // cmp r0, 1
+            0x979F_F100, // ldrls pc, [pc, r0 lsl 2]
+            0xE12F_FF1E, // bx lr, the default case
+            BASE + 0x14, // case 0
+            BASE + 0x18, // case 1
+            0xE12F_FF1E, // case 0
+            0xE12F_FF1E, // case 1
+        ]));
+        assert_eq!(analysis.jump_tables, 1);
+        assert_eq!(analysis.count(Byte::Literal), 8);
+        assert_eq!(analysis.count(Byte::Code), 5 * 4);
+    }
+
+    #[test]
+    fn blx_leads_into_thumb_code() {
+        let analysis = analyze(&image(&[
+            0xFA00_0000, // blx 0x100008
+            0xE12F_FF1E, // bx lr
+            0x4770_2001, // movs r0, 1 then bx lr, in Thumb
+        ]));
+        let thumb = &analysis.functions[&(BASE + 8)];
+        assert_eq!(thumb.mode, Mode::Thumb);
+        assert_eq!(thumb.instructions, 2);
+    }
+
+    #[test]
     fn pointers_in_data_become_functions() {
-        let mut image = image(&[0xE12F_FF1E, 0xE12F_FF1E, 0xE12F_FF1E]);
+        let mut image = image(&[0xE12F_FF1E, 0x4770_4770, 0xE12F_FF1E]);
         image.rodata.bytes = [BASE + 8, BASE + 5].iter().flat_map(|w| w.to_le_bytes()).collect();
         let analysis = analyze(&image);
         assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Pointer);
-        assert!(analysis.thumb_entries.contains(&(BASE + 4)));
+        assert_eq!(analysis.functions[&(BASE + 4)].mode, Mode::Thumb);
     }
 }

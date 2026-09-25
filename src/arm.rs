@@ -12,14 +12,16 @@ const SP: u32 = 13;
 pub enum Flow {
     /// b or bl to a known address.
     Branch { target: u32, link: bool },
-    /// blx to a known address, which switches to Thumb.
-    BranchToThumb { target: u32 },
+    /// blx to a known address, which switches between ARM and Thumb.
+    CallOtherMode { target: u32 },
     /// bx or blx through a register.
     BranchRegister { register: u32, link: bool },
     /// bx lr, pop with pc, mov pc lr and the like.
     Return,
     /// add pc, pc, rm lsl 2, followed by a table of branches.
     JumpTable,
+    /// ldr pc, [pc, rm lsl 2], followed by a table of addresses.
+    AddressTable { index: u32 },
     /// any other write to pc whose target is not known statically.
     IndirectJump,
     /// ldr pc from a literal, whose value is the target.
@@ -27,6 +29,8 @@ pub enum Flow {
     /// a load from a literal pool inside the code.
     LiteralLoad { literal: u32, size: u32 },
     Svc,
+    /// an encoding that cannot be code, so the path that reached it is wrong.
+    Undefined,
     Other,
 }
 
@@ -40,6 +44,15 @@ impl Instruction {
     pub fn is_conditional(self) -> bool {
         self.condition != ALWAYS
     }
+}
+
+/// the register and immediate of cmp rn, imm, used to size switch tables.
+pub fn compare_immediate(word: u32) -> Option<(u32, u32)> {
+    if word & 0x0FF0_F000 != 0x0350_0000 {
+        return None;
+    }
+    let rotate = ((word >> 8) & 0xF) * 2;
+    Some(((word >> 16) & 0xF, (word & 0xFF).rotate_right(rotate)))
 }
 
 fn sign_extend_24(value: u32) -> i32 {
@@ -57,7 +70,7 @@ pub fn decode(word: u32, address: u32) -> Instruction {
         if word & 0x0E00_0000 == 0x0A00_0000 {
             let half = (word >> 24) & 1;
             let offset = (sign_extend_24(word & 0x00FF_FFFF) << 2) + (half << 1) as i32;
-            Flow::BranchToThumb { target: pc.wrapping_add(offset as u32) }
+            Flow::CallOtherMode { target: pc.wrapping_add(offset as u32) }
         } else {
             Flow::Other
         }
@@ -104,6 +117,10 @@ fn single_transfer(word: u32, pc: u32, rd: u32, rn: u32) -> Flow {
     let register_offset = word & (1 << 25) != 0;
     if !load {
         return Flow::Other;
+    }
+    // ldr pc, [pc, rm lsl 2] with an immediate shift and no writeback
+    if rd == PC && rn == PC && register_offset && word & 0x0170_0FF0 == 0x0110_0100 {
+        return Flow::AddressTable { index: word & 0xF };
     }
     if rn == PC && !register_offset && word & (1 << 24) != 0 {
         let offset = word & 0xFFF;
@@ -161,7 +178,7 @@ mod tests {
         assert_eq!(flow(0xEA00_0000), Flow::Branch { target: BASE + 8, link: false });
         assert_eq!(flow(0xEB00_0001), Flow::Branch { target: BASE + 12, link: true });
         assert_eq!(flow(0xEAFF_FFFE), Flow::Branch { target: BASE, link: false });
-        assert_eq!(flow(0xFB00_0000), Flow::BranchToThumb { target: BASE + 10 });
+        assert_eq!(flow(0xFB00_0000), Flow::CallOtherMode { target: BASE + 10 });
     }
 
     #[test]
@@ -177,6 +194,7 @@ mod tests {
         assert_eq!(flow(0xE12F_FF33), Flow::BranchRegister { register: 3, link: true }); // blx r3
         assert_eq!(flow(0x908F_F100), Flow::JumpTable); // addls pc, pc, r0 lsl 2
         assert_eq!(flow(0xE593_F000), Flow::IndirectJump); // ldr pc, [r3]
+        assert_eq!(flow(0x979F_F100), Flow::AddressTable { index: 0 }); // ldrls pc, [pc, r0 lsl 2]
     }
 
     #[test]

@@ -25,6 +25,12 @@ impl Segment {
         Some(u32::from_le_bytes(bytes.try_into().unwrap()))
     }
 
+    pub fn read16(&self, address: u32) -> Option<u16> {
+        let offset = address.checked_sub(self.base)? as usize;
+        let bytes = self.bytes.get(offset..offset + 2)?;
+        Some(u16::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
     /// every aligned word in the segment, with its address.
     pub fn words(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.bytes

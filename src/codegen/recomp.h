@@ -179,7 +179,7 @@ static inline uint32_t shift_ror(uint32_t value, uint32_t amount, uint8_t *carry
 }
 
 #define FPSCR_FZ (1u << 24)
-/* the short vector length, anything but zero is left to the interpreter. */
+/* the short vector length, zero when an instruction works on one register. */
 #define FPSCR_LEN (7u << 16)
 
 static inline float vfp_s(Context *ctx, int r) {
@@ -231,6 +231,68 @@ static inline uint32_t vfp_to_u32(double value) {
     if (value >= 4294967295.0) return 0xFFFFFFFFu;
     if (value <= 0.0) return 0;
     return (uint32_t)value;
+}
+
+/* the arithmetic, numbered the way the code generator passes it, from the
+   multiply-accumulates to vsqrt, whose operand is b. */
+static inline float vfp_apply_s(int op, float a, float b, float acc) {
+    switch (op) {
+    case 0: return acc + a * b;
+    case 1: return acc - a * b;
+    case 2: return -acc + a * b;
+    case 3: return -acc - a * b;
+    case 4: return a * b;
+    case 5: return -(a * b);
+    case 6: return a + b;
+    case 7: return a - b;
+    case 8: return a / b;
+    default: return sqrtf(b);
+    }
+}
+
+static inline double vfp_apply_d(int op, double a, double b, double acc) {
+    switch (op) {
+    case 0: return acc + a * b;
+    case 1: return acc - a * b;
+    case 2: return -acc + a * b;
+    case 3: return -acc - a * b;
+    case 4: return a * b;
+    case 5: return -(a * b);
+    case 6: return a + b;
+    case 7: return a - b;
+    case 8: return a / b;
+    case 9: return b;
+    case 10: return fabs(b);
+    case 11: return -b;
+    default: return sqrt(b);
+    }
+}
+
+/* where register reg is on step i of a short vector, going around its bank. */
+static inline int vfp_step(int reg, int bank, int i, int stride) {
+    return (reg & ~(bank - 1)) | ((reg + i * stride) & (bank - 1));
+}
+
+/* an operation on a short vector, which fpscr's len and stride shape. m
+   stays put when it is in the first bank. */
+static void vfp_vector(Context *ctx, int op, int wide, int d, int n, int m) {
+    uint32_t fpscr = *ctx->fpscr;
+    int length = ((fpscr >> 16) & 7) + 1;
+    int stride = ((fpscr >> 20) & 3) == 3 ? 2 : 1;
+    int bank = wide ? 4 : 8;
+    for (int i = 0; i < length; i++) {
+        int dd = vfp_step(d, bank, i, stride), nn = vfp_step(n, bank, i, stride);
+        int mm = m < bank ? m : vfp_step(m, bank, i, stride);
+        if (wide) {
+            vfp_set_d(ctx, dd & 15, vfp_apply_d(op, vfp_d(ctx, nn & 15), vfp_d(ctx, mm & 15), vfp_d(ctx, dd & 15)));
+        } else if (op >= 9 && op <= 11) {
+            /* vmov, vabs and vneg move the bits untouched */
+            uint32_t bits = ctx->vfp[mm];
+            ctx->vfp[dd] = op == 9 ? bits : op == 10 ? bits & 0x7FFFFFFFu : bits ^ 0x80000000u;
+        } else {
+            vfp_set_s(ctx, dd, vfp_apply_s(op, vfp_s(ctx, nn), vfp_s(ctx, mm), vfp_s(ctx, dd)));
+        }
+    }
 }
 
 #define RECOMP_DEPTH_LIMIT 2048

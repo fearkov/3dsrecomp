@@ -1,6 +1,6 @@
 //! lowering VFPv2 to C, following zakuro-cpu's VFP, which computes singles
 //! as f32 and doubles as f64, rounding once, and flushes results to zero
-//! when fpscr asks. short vectors are left to the interpreter.
+//! when fpscr asks.
 
 use std::fmt::Write;
 
@@ -34,15 +34,21 @@ fn set(double: bool, register: u32, value: &str) -> String {
     if double { format!("vfp_set_d(ctx, {}, {value});", register & 15) } else { format!("vfp_set_s(ctx, {register}, {value});") }
 }
 
-/// writes body, or leaves the instruction to the interpreter when fpscr
-/// has it working on a short vector, which only a destination past the
-/// first bank can.
-fn scalar(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, destination: u32, body: &str) -> bool {
+/// writes body, or when fpscr has the instruction working on a short
+/// vector, which only a destination past the first bank can, the loop
+/// over it. operation numbers the arithmetic the way vfp_apply does, and
+/// registers are d, n and m.
+fn scalar(out: &mut String, double: bool, operation: u32, registers: (u32, u32, u32), body: &str) -> bool {
+    let (d, n, m) = registers;
     let bank = if double { 4 } else { 8 };
-    if destination < bank {
+    if d < bank {
         emit!(out, "    {{ {body} }}");
     } else {
-        emit!(out, "    if (UNLIKELY(*ctx->fpscr & FPSCR_LEN)) INTERPRET({}, 0x{op:08X}u); else {{ {body} }}", scope.at(a));
+        emit!(
+            out,
+            "    if (UNLIKELY(*ctx->fpscr & FPSCR_LEN)) vfp_vector(ctx, {operation}, {}, {d}, {n}, {m}); else {{ {body} }}",
+            double as u8
+        );
     }
     true
 }
@@ -63,16 +69,16 @@ pub fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool
         (sreg(vd, d_bit), sreg(vn, n_bit), sreg(vm, m_bit))
     };
     let negate = op & (1 << 6) != 0;
-    let expression = match ((op >> 20) & 0b1011, negate) {
-        (0b0000, false) => "acc + a * b",
-        (0b0000, true) => "acc - a * b",
-        (0b0001, false) => "-acc + a * b",
-        (0b0001, true) => "-acc - a * b",
-        (0b0010, false) => "a * b",
-        (0b0010, true) => "-(a * b)",
-        (0b0011, false) => "a + b",
-        (0b0011, true) => "a - b",
-        (0b1000, false) => "a / b",
+    let (operation, expression) = match ((op >> 20) & 0b1011, negate) {
+        (0b0000, false) => (0, "acc + a * b"),
+        (0b0000, true) => (1, "acc - a * b"),
+        (0b0001, false) => (2, "-acc + a * b"),
+        (0b0001, true) => (3, "-acc - a * b"),
+        (0b0010, false) => (4, "a * b"),
+        (0b0010, true) => (5, "-(a * b)"),
+        (0b0011, false) => (6, "a + b"),
+        (0b0011, true) => (7, "a - b"),
+        (0b1000, false) => (8, "a / b"),
         (0b1011, true) => return extension(out, scope, a, op, double, rd, rm),
         _ => return interpret(out, scope, a, op),
     };
@@ -86,7 +92,7 @@ pub fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool
         get(double, rd),
         set(double, rd, expression)
     );
-    scalar(out, scope, a, op, double, rd, &body)
+    scalar(out, double, operation, (rd, rn, rm), &body)
 }
 
 fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd: u32, rm: u32) -> bool {
@@ -111,7 +117,7 @@ fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd:
                     (true, true) => set(false, rd, &format!("sqrtf({})", get(false, rm))),
                 }
             };
-            scalar(out, scope, a, op, double, rd, &body)
+            scalar(out, double, 9 + ((second as u32) << 1 | top as u32), (rd, rd, rm), &body)
         }
         // vcmp against a register or zero, singles compared as doubles
         (0b0100, _) => {

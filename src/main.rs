@@ -101,8 +101,12 @@ fn check(path: &str, library: &Path, count: usize) {
         (image.data.base, &image.data.bytes),
         title.exheader.bss_size,
     );
-    let functions: Vec<u32> =
-        analysis.functions.iter().filter(|&(&entry, f)| codegen::recompiles(entry, f)).map(|(&entry, _)| entry).collect();
+    let functions: Vec<u32> = analysis
+        .functions
+        .iter()
+        .filter(|&(&entry, f)| codegen::recompiles(entry, f))
+        .map(|(&entry, f)| entry | (f.mode == Mode::Thumb) as u32)
+        .collect();
     let step = (functions.len() / count.max(1)).max(1);
     let sample: Vec<u32> = functions.into_iter().step_by(step).take(count).collect();
 

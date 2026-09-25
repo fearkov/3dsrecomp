@@ -184,6 +184,9 @@ static inline void recomp_call(Context *ctx) {
 #define RETURNED(address) \
     if (UNLIKELY(ctx->r[15] != (address) || ctx->thumb)) { target = ctx->r[15]; goto dispatch; }
 
+#define RETURNED_T(address) \
+    if (UNLIKELY(ctx->r[15] != (address) || !ctx->thumb)) { target = ctx->r[15]; goto dispatch; }
+
 /* a return that may switch to Thumb. */
 #define RETURN_TO(value) do { \
     uint32_t v_ = (value); \

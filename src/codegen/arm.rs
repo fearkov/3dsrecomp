@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use super::Scope;
+use super::{Scope, call, jump};
 
 macro_rules! emit {
     ($out:expr, $($arg:tt)*) => {
@@ -58,7 +58,7 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         0b100 => block_transfer(out, a, op),
         0b101 => {
             let target = (a + 8).wrapping_add(sign_extend_24(op & 0x00FF_FFFF) << 2);
-            if op & (1 << 24) != 0 { call(out, scope, a, target, false) } else { jump(out, scope, target) }
+            if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
         0b111 if op & (1 << 24) != 0 => {
             emit!(out, "    SVC(0x{:08X}u, 0x{:X}u);", a + 4, op & 0x00FF_FFFF);
@@ -474,7 +474,7 @@ fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     if op & 0xFE00_0000 == 0xFA00_0000 {
         // blx to Thumb
         let offset = (sign_extend_24(op & 0x00FF_FFFF) << 2) | (((op >> 24) & 1) << 1);
-        return call(out, scope, a, (a + 8).wrapping_add(offset) & !1, true);
+        return call(out, scope, a + 4, (a + 8).wrapping_add(offset) & !1, true);
     }
     if op & 0xFFF0_00F0 == 0xF570_0010 {
         // clrex, the reservation lives with the interpreter
@@ -485,31 +485,4 @@ fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         return true;
     }
     interpret(out, a, op)
-}
-
-/// a branch without link, to a label of this function if it is one.
-fn jump(out: &mut String, scope: &Scope, target: u32) -> bool {
-    if scope.labels.contains(&target) {
-        emit!(out, "    goto L_{target:08X};");
-    } else if scope.functions.contains(&target) {
-        // a tail call
-        emit!(out, "    ctx->r[15] = 0x{target:08X}u; CALL(f_{target:08X}); return;");
-    } else {
-        emit!(out, "    target = 0x{target:08X}u; goto dispatch;");
-    }
-    false
-}
-
-fn call(out: &mut String, scope: &Scope, a: u32, target: u32, thumb: bool) -> bool {
-    let next = a + 4;
-    emit!(out, "    ctx->r[14] = 0x{next:08X}u; ctx->r[15] = 0x{target:08X}u;");
-    if thumb {
-        emit!(out, "    ctx->thumb = 1; CALL(recomp_call);");
-    } else if scope.functions.contains(&target) {
-        emit!(out, "    CALL(f_{target:08X});");
-    } else {
-        emit!(out, "    CALL(recomp_call);");
-    }
-    emit!(out, "    RETURNED(0x{next:08X}u);");
-    true
 }

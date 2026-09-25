@@ -370,7 +370,8 @@ pub struct Report {
     pub mismatched: usize,
 }
 
-/// runs each function both ways, printing the first few mismatches.
+/// runs each function both ways, printing the first few mismatches. the
+/// functions are entries with bit 0 set for Thumb.
 pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
     let fresh =
         || Run { memory: pristine.duplicate(), cpu: Cpu::new(), library, pending: None, interpreted: 0, fallbacks: 0 };
@@ -393,7 +394,8 @@ pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report
         }
         cpu.regs[13] = STACK_TOP - 0x1000;
         cpu.regs[14] = RETURN;
-        cpu.regs[15] = function;
+        cpu.regs[15] = function & !1;
+        cpu.cpsr.thumb = function & 1 != 0;
         let flags = random.next();
         cpu.cpsr.n = flags & 1 != 0;
         cpu.cpsr.z = flags & 2 != 0;

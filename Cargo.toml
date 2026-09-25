@@ -1,0 +1,16 @@
+[package]
+name = "recomp3ds"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Static recompilation toolkit for the Nintendo 3DS"
+
+[[bin]]
+name = "3dsrecomp"
+path = "src/main.rs"
+
+[dependencies]
+zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
+
+[profile.release]
+debug = 1

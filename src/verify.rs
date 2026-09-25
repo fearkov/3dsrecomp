@@ -22,6 +22,8 @@ const LIMIT: i32 = 200_000;
 
 /// where the harness loads the module it checks.
 pub const MODULE_BASE: u32 = 0x0A00_0000;
+/// what a module's imports lead to, a function returning zero.
+pub const IMPORT_STUB: u32 = 0x0B00_0000;
 
 #[derive(Clone)]
 pub struct Region {
@@ -73,11 +75,50 @@ impl Memory {
     }
 
     /// the first address whose byte differs between two copies.
+    /// the first address whose byte differs between two copies, where two
+    /// NaNs count as the same whatever their bits.
     fn first_difference(&self, other: &Memory) -> Option<u32> {
         self.regions.iter().zip(&other.regions).filter(|(region, _)| region.writable).find_map(|(a, b)| {
-            a.bytes.iter().zip(&b.bytes).position(|(x, y)| x != y).map(|i| a.base + i as u32)
+            let mut i = 0;
+            while i < a.bytes.len() {
+                if a.bytes[i] == b.bytes[i] {
+                    i += 1;
+                    continue;
+                }
+                let word = i & !3;
+                let double = i & !7;
+                if nans(&a.bytes, &b.bytes, double, 8) {
+                    i = double + 8;
+                } else if nans(&a.bytes, &b.bytes, word, 4) {
+                    i = word + 4;
+                } else {
+                    return Some(a.base + i as u32);
+                }
+            }
+            None
         })
     }
+}
+
+/// whether the float of size bytes at offset is a NaN in both a and b.
+fn nans(a: &[u8], b: &[u8], offset: usize, size: usize) -> bool {
+    let nan = |bytes: &[u8]| match *bytes.get(offset..offset + size).unwrap_or_default() {
+        [_, _, _, _] => f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()).is_nan(),
+        [_, _, _, _, _, _, _, _] => f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap()).is_nan(),
+        _ => false,
+    };
+    nan(a) && nan(b)
+}
+
+/// whether two sets of VFP registers hold the same values, where two NaNs
+/// count as the same. the compilers on each side are free to pick which NaN
+/// comes out of an operation, and so is the hardware.
+fn same_vfp(a: &[u32; 32], b: &[u32; 32]) -> bool {
+    let single = |bits: u32| f32::from_bits(bits).is_nan();
+    let double = |r: &[u32; 32], d: usize| f64::from_bits((r[2 * d + 1] as u64) << 32 | r[2 * d] as u64).is_nan();
+    (0..16).all(|d| {
+        (double(a, d) && double(b, d)) || (2 * d..2 * d + 2).all(|s| a[s] == b[s] || (single(a[s]) && single(b[s])))
+    })
 }
 
 impl Bus for Memory {
@@ -307,8 +348,10 @@ impl Random {
 
 fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
     let mut found = Vec::new();
+    let nan = |bits: u32| f32::from_bits(bits).is_nan();
     for i in 0..16 {
-        if a.cpu.regs[i] != ctx.r[i] {
+        // a NaN moved out of a VFP register
+        if a.cpu.regs[i] != ctx.r[i] && !(nan(a.cpu.regs[i]) && nan(ctx.r[i])) {
             found.push(format!("r{i} {:08X} against {:08X}", a.cpu.regs[i], ctx.r[i]));
         }
     }
@@ -328,7 +371,7 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
     if a.cpu.cpsr.ge != ctx.ge {
         found.push(format!("ge {:X} against {:X}", a.cpu.cpsr.ge, ctx.ge));
     }
-    if a.cpu.vfp.regs != b.cpu.vfp.regs || a.cpu.vfp.fpscr != b.cpu.vfp.fpscr {
+    if !same_vfp(&a.cpu.vfp.regs, &b.cpu.vfp.regs) || a.cpu.vfp.fpscr != b.cpu.vfp.fpscr {
         found.push("vfp state".to_owned());
     }
     if let Some(address) = a.memory.first_difference(&b.memory) {
@@ -358,6 +401,8 @@ pub fn regions(text: (u32, &[u8]), rodata: (u32, &[u8]), data: (u32, &[u8]), bss
         Region { base: HEAP, bytes: heap, writable: true },
         Region { base: STACK_TOP - STACK_SIZE, bytes: vec![0; STACK_SIZE as usize], writable: true },
         Region { base: TLS, bytes: vec![0; PAGE_SIZE], writable: true },
+        // mov r0, 0 and bx lr
+        Region { base: IMPORT_STUB, bytes: [0xE3A0_0000u32, 0xE12F_FF1E].iter().flat_map(|w| w.to_le_bytes()).collect(), writable: false },
     ]
 }
 
@@ -392,7 +437,7 @@ impl Report {
 
 /// runs each function both ways, printing the first few mismatches. the
 /// functions are entries with bit 0 set for Thumb.
-pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
+pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
     let fresh =
         || Run { memory: pristine.duplicate(), cpu: Cpu::new(), library, pending: None, interpreted: 0, fallbacks: 0 };
     let mut a = fresh();
@@ -460,6 +505,25 @@ pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report
         report.native += spent.saturating_sub(b.interpreted + b.fallbacks);
         report.fallbacks += b.fallbacks;
         report.interpreted += b.interpreted;
+        if functions.len() == 1 {
+            // a single function gets the whole story
+            println!("  {name} {function:08X}, interpreter stopped with {expected:?}, recompiled with {got:?}");
+            println!(
+                "  recompiled side, {} native, {} fallbacks, {} interpreted alone",
+                spent.saturating_sub(b.interpreted + b.fallbacks),
+                b.fallbacks,
+                b.interpreted
+            );
+            println!("  interpreter {:08X?}", a.cpu.regs);
+            println!("  recompiled  {:08X?}", ctx.r);
+            for i in 0..32 {
+                if a.cpu.vfp.regs[i] != b.cpu.vfp.regs[i] {
+                    let (x, y) = (a.cpu.vfp.regs[i], b.cpu.vfp.regs[i]);
+                    println!("  s{i} {x:08X} ({}) against {y:08X} ({})", f32::from_bits(x), f32::from_bits(y));
+                }
+            }
+            println!("  fpscr {:08X} against {:08X}", a.cpu.vfp.fpscr, b.cpu.vfp.fpscr);
+        }
         if expected == Stop::Limit || got == Stop::Limit {
             report.stuck += 1;
             continue;
@@ -471,7 +535,7 @@ pub fn verify(pristine: &Memory, library: &Library, functions: &[u32]) -> Report
         if !found.is_empty() {
             report.mismatched += 1;
             if report.mismatched <= 20 {
-                println!("  {function:08X}  {}", found.join(", "));
+                println!("  {name} {function:08X}  {}", found.join(", "));
             }
             continue;
         }

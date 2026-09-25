@@ -21,6 +21,9 @@ pub struct Module {
     pub indexed_exports: Vec<u32>,
     /// the addresses the module writes into itself when it is loaded.
     pub relocations: Vec<Relocation>,
+    /// the places that get the addresses of what it imports, whose segment
+    /// field means nothing.
+    pub imports: Vec<Relocation>,
 }
 
 pub struct Relocation {
@@ -74,21 +77,21 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
         .map(|entry| (cstring(bytes, word(entry, 0) as usize), word(entry, 4)))
         .collect();
     let indexed_exports = table(bytes, 0xD8, 0xDC, 4)?.into_iter().map(|entry| word(entry, 0)).collect();
-    let relocations = table(bytes, 0x128, 0x12C, 12)?
-        .into_iter()
-        .map(|entry| Relocation {
-            target: word(entry, 0),
-            kind: entry[4],
-            segment: entry[5] as u32,
-            addend: word(entry, 8),
-        })
-        .collect();
+    let relocation = |entry: &[u8]| Relocation {
+        target: word(entry, 0),
+        kind: entry[4],
+        segment: entry[5] as u32,
+        addend: word(entry, 8),
+    };
+    let relocations = table(bytes, 0x128, 0x12C, 12)?.into_iter().map(relocation).collect();
+    let imports = table(bytes, 0xF8, 0xFC, 12)?.into_iter().map(relocation).collect();
     Some(Module {
         name: cstring(bytes, field(bytes, 0xC0)? as usize),
         segments,
         exports,
         indexed_exports,
         relocations,
+        imports,
     })
 }
 
@@ -115,8 +118,9 @@ impl Module {
     }
 
     /// the module as it looks loaded at base, its bss after the file and
-    /// its relocations applied, for running it without a loader.
-    pub fn image(&self, bytes: &[u8], base: u32) -> Vec<u8> {
+    /// its relocations applied, for running it without a loader. everything
+    /// it imports points at stub.
+    pub fn image(&self, bytes: &[u8], base: u32, stub: u32) -> Vec<u8> {
         let bss = (bytes.len() as u32).next_multiple_of(0x1000);
         let bss_size: u32 = self.segments.iter().filter(|s| s.kind == BSS).map(|s| s.size).sum();
         let mut image = bytes.to_vec();
@@ -129,6 +133,13 @@ impl Module {
             let value = base + offset(symbol) + relocation.addend;
             if let Some(slot) = image.get_mut(at..at + 4) {
                 slot.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for import in self.imports.iter().filter(|r| r.is_absolute()) {
+            let Some(target) = self.segments.get((import.target & 0xF) as usize) else { continue };
+            let at = (offset(target) + (import.target >> 4)) as usize;
+            if let Some(slot) = image.get_mut(at..at + 4) {
+                slot.copy_from_slice(&stub.wrapping_add(import.addend).to_le_bytes());
             }
         }
         image

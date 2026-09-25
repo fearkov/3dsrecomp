@@ -110,6 +110,7 @@ fn check(path: &str, library: &Path, count: usize) {
     let start = std::time::Instant::now();
 
     let executable = verify::verify(
+        "executable",
         &verify::Memory::new(regions.clone()),
         &library,
         &sample(&discover::analyze(&programs[0].1), 0, count),
@@ -123,11 +124,12 @@ fn check(path: &str, library: &Path, count: usize) {
         let mut memory = regions.clone();
         memory.push(verify::Region {
             base: verify::MODULE_BASE,
-            bytes: module.image(&bytes, verify::MODULE_BASE),
+            bytes: module.image(&bytes, verify::MODULE_BASE, verify::IMPORT_STUB),
             writable: true,
         });
         library.place(index, verify::MODULE_BASE);
         let report = verify::verify(
+            &module.name,
             &verify::Memory::new(memory),
             &library,
             &sample(&discover::analyze(&program), verify::MODULE_BASE, count),
@@ -148,6 +150,10 @@ fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
         .filter(|&(&entry, f)| codegen::recompiles(entry, f))
         .map(|(&entry, f)| (base + entry) | (f.mode == Mode::Thumb) as u32)
         .collect();
+    // VERIFY_ONLY=address checks that one function alone
+    if let Some(only) = std::env::var("VERIFY_ONLY").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()) {
+        return functions.into_iter().filter(|&f| f == only).collect();
+    }
     let step = (functions.len() / count.max(1)).max(1);
     functions.into_iter().step_by(step).take(count).collect()
 }

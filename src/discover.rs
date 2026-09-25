@@ -40,7 +40,11 @@ impl Mode {
 pub struct Function {
     pub source: Source,
     pub mode: Mode,
-    pub instructions: usize,
+    /// the address of every instruction, in order.
+    pub instructions: Vec<u32>,
+    /// where execution can enter the function's code, its entry, the
+    /// targets of its branches and the instructions after calls and svc.
+    pub labels: BTreeSet<u32>,
 }
 
 /// what each byte of the text segment turned out to be.
@@ -133,8 +137,8 @@ impl Discovery<'_> {
     fn run(&mut self) {
         while let Some((entry, mode, source)) = self.queue.pop_front().or_else(|| self.guesses.pop_front()) {
             if !self.analysis.functions.contains_key(&entry) {
-                let instructions = self.explore(entry, mode);
-                self.analysis.functions.insert(entry, Function { source, mode, instructions });
+                let (instructions, labels) = self.explore(entry, mode);
+                self.analysis.functions.insert(entry, Function { source, mode, instructions, labels });
             }
         }
     }
@@ -195,14 +199,16 @@ impl Discovery<'_> {
         }
     }
 
-    /// follows every path through one function, returning how many
-    /// instructions it decoded.
-    fn explore(&mut self, entry: u32, mode: Mode) -> usize {
+    /// follows every path through one function, returning its instructions
+    /// and labels.
+    fn explore(&mut self, entry: u32, mode: Mode) -> (Vec<u32>, BTreeSet<u32>) {
         let mut blocks = vec![entry];
         let mut seen = BTreeSet::new();
-        let mut decoded = 0;
+        let mut code = BTreeSet::new();
+        let mut labels = BTreeSet::new();
 
         while let Some(start) = blocks.pop() {
+            labels.insert(start);
             let mut address = start;
             while self.text.contains(address) && seen.insert(address) {
                 if self.byte(address) == Byte::Literal {
@@ -215,9 +221,20 @@ impl Discovery<'_> {
                     break;
                 }
                 self.mark(address, size, Byte::Code);
-                decoded += 1;
+                code.insert(address);
                 let conditional = instruction.is_conditional();
 
+                let returns = matches!(
+                    instruction.flow,
+                    Flow::Branch { link: true, .. }
+                        | Flow::CallOtherMode { .. }
+                        | Flow::BranchRegister { link: true, .. }
+                        | Flow::Svc
+                );
+                if returns {
+                    // execution comes back after a call or an svc
+                    labels.insert(address + size);
+                }
                 match instruction.flow {
                     Flow::Branch { target, link: true } => self.call(target, mode),
                     Flow::CallOtherMode { target } => self.call(target, mode.other()),
@@ -278,21 +295,19 @@ impl Discovery<'_> {
                 address += size;
             }
         }
-        decoded
+        labels.retain(|label| code.contains(label));
+        (code.into_iter().collect(), labels)
     }
 
-    /// add pc, pc, rm lsl 2 jumps into a run of branches that starts right
-    /// after the default case.
+    /// add pc, pc, rm lsl 2 jumps into a run of branches that starts with
+    /// the default case right after it.
     fn branch_table(&mut self, address: u32, blocks: &mut Vec<u32>) {
         self.analysis.jump_tables += 1;
         let mut entry = address + 4;
         while let Some(word) = self.text.read32(entry) {
             match arm::decode(word, entry) {
-                Instruction { condition: arm::ALWAYS, flow: Flow::Branch { target, link: false } } => {
-                    self.mark(entry, 4, Byte::Code);
-                    if self.text.contains(target) {
-                        blocks.push(target);
-                    }
+                Instruction { condition: arm::ALWAYS, flow: Flow::Branch { link: false, .. } } => {
+                    blocks.push(entry);
                     entry += 4;
                 }
                 _ => break,
@@ -359,6 +374,7 @@ mod tests {
             0x0010_0000, // the literal
         ]);
         assert_eq!(analysis.functions.keys().copied().collect::<Vec<_>>(), [BASE, BASE + 0x10]);
+        assert_eq!(analysis.functions[&BASE].labels, BTreeSet::from([BASE, BASE + 4, BASE + 8]));
         assert_eq!(analysis.functions[&(BASE + 0x10)].source, Source::Call);
         assert_eq!(analysis.count(Byte::Code), 5 * 4);
         assert_eq!(analysis.count(Byte::Literal), 4);
@@ -381,6 +397,8 @@ mod tests {
         ]);
         assert_eq!(analysis.jump_tables, 1);
         assert_eq!(analysis.count(Byte::Code), 8 * 4);
+        let labels: Vec<_> = analysis.functions[&BASE].labels.iter().map(|l| l - BASE).collect();
+        assert_eq!(labels, [0, 8, 0xC, 0x10, 0x18, 0x1C, 0x20]);
     }
 
     #[test]
@@ -408,7 +426,7 @@ mod tests {
         ]);
         let thumb = &analysis.functions[&(BASE + 8)];
         assert_eq!(thumb.mode, Mode::Thumb);
-        assert_eq!(thumb.instructions, 2);
+        assert_eq!(thumb.instructions, [BASE + 8, BASE + 10]);
     }
 
     #[test]

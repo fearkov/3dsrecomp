@@ -1,0 +1,223 @@
+/* the interface between recompiled code and the emulator running it. */
+
+#ifndef RECOMP_H
+#define RECOMP_H
+
+#include <stdint.h>
+#include <string.h>
+
+#define RECOMP_ABI 1
+
+typedef struct Context Context;
+typedef void (*Code)(Context *);
+
+typedef struct Host {
+    uint8_t (*read8)(Context *, uint32_t);
+    uint16_t (*read16)(Context *, uint32_t);
+    uint32_t (*read32)(Context *, uint32_t);
+    void (*write8)(Context *, uint32_t, uint8_t);
+    void (*write16)(Context *, uint32_t, uint16_t);
+    void (*write32)(Context *, uint32_t, uint32_t);
+    /* runs one instruction the recompiler left to the interpreter. when it
+       branches or fails the host sets exit and r15. */
+    void (*interpret)(Context *, uint32_t address, uint32_t opcode);
+    /* the code for an address, bit 0 set for Thumb, or null. */
+    Code (*lookup)(Context *, uint32_t address);
+} Host;
+
+/* why the code gave control back to the host. */
+enum {
+    EXIT_NONE,
+    /* an svc, its number is in svc and r15 points after it. */
+    EXIT_SVC,
+    /* the budget ran out, r15 is where to resume. */
+    EXIT_BUDGET,
+    /* anything else, the host carries on from r15. */
+    EXIT_UNWIND,
+};
+
+struct Context {
+    uint32_t r[16];
+    uint8_t n, z, c, v, q, thumb, ge, pad;
+    int32_t budget;
+    uint32_t exit;
+    uint32_t svc;
+    uint32_t depth;
+    /* a host pointer for each 4 KiB page, or null when the host has to
+       handle the access. */
+    uint8_t *const *read_pages;
+    uint8_t *const *write_pages;
+    const Host *host;
+    void *user;
+};
+
+typedef struct Entry {
+    uint32_t address;
+    Code code;
+} Entry;
+
+#define RECOMP_EXPORT __attribute__((visibility("default")))
+#define LIKELY(x) __builtin_expect(!!(x), 1)
+#define UNLIKELY(x) __builtin_expect(!!(x), 0)
+
+static inline uint8_t mem_read8(Context *ctx, uint32_t address) {
+    uint8_t *page = ctx->read_pages[address >> 12];
+    if (LIKELY(page)) return page[address & 0xFFF];
+    return ctx->host->read8(ctx, address);
+}
+
+static inline uint16_t mem_read16(Context *ctx, uint32_t address) {
+    uint8_t *page = ctx->read_pages[address >> 12];
+    uint32_t offset = address & 0xFFF;
+    if (LIKELY(page && offset <= 0xFFE)) {
+        uint16_t value;
+        memcpy(&value, page + offset, 2);
+        return value;
+    }
+    return ctx->host->read16(ctx, address);
+}
+
+static inline uint32_t mem_read32(Context *ctx, uint32_t address) {
+    uint8_t *page = ctx->read_pages[address >> 12];
+    uint32_t offset = address & 0xFFF;
+    if (LIKELY(page && offset <= 0xFFC)) {
+        uint32_t value;
+        memcpy(&value, page + offset, 4);
+        return value;
+    }
+    return ctx->host->read32(ctx, address);
+}
+
+static inline void mem_write8(Context *ctx, uint32_t address, uint8_t value) {
+    uint8_t *page = ctx->write_pages[address >> 12];
+    if (LIKELY(page)) page[address & 0xFFF] = value;
+    else ctx->host->write8(ctx, address, value);
+}
+
+static inline void mem_write16(Context *ctx, uint32_t address, uint16_t value) {
+    uint8_t *page = ctx->write_pages[address >> 12];
+    uint32_t offset = address & 0xFFF;
+    if (LIKELY(page && offset <= 0xFFE)) memcpy(page + offset, &value, 2);
+    else ctx->host->write16(ctx, address, value);
+}
+
+static inline void mem_write32(Context *ctx, uint32_t address, uint32_t value) {
+    uint8_t *page = ctx->write_pages[address >> 12];
+    uint32_t offset = address & 0xFFF;
+    if (LIKELY(page && offset <= 0xFFC)) memcpy(page + offset, &value, 4);
+    else ctx->host->write32(ctx, address, value);
+}
+
+#define C_EQ (ctx->z)
+#define C_NE (!ctx->z)
+#define C_CS (ctx->c)
+#define C_CC (!ctx->c)
+#define C_MI (ctx->n)
+#define C_PL (!ctx->n)
+#define C_VS (ctx->v)
+#define C_VC (!ctx->v)
+#define C_HI (ctx->c && !ctx->z)
+#define C_LS (!ctx->c || ctx->z)
+#define C_GE (ctx->n == ctx->v)
+#define C_LT (ctx->n != ctx->v)
+#define C_GT (!ctx->z && ctx->n == ctx->v)
+#define C_LE (ctx->z || ctx->n != ctx->v)
+
+static inline uint32_t ror32(uint32_t value, uint32_t amount) {
+    amount &= 31;
+    return amount ? (value >> amount) | (value << (32 - amount)) : value;
+}
+
+/* shifts by a register, the amount is its bottom byte. */
+static inline uint32_t shift_lsl(uint32_t value, uint32_t amount, uint8_t *carry) {
+    amount &= 0xFF;
+    if (amount == 0) return value;
+    if (amount < 32) { *carry = (value >> (32 - amount)) & 1; return value << amount; }
+    *carry = amount == 32 ? value & 1 : 0;
+    return 0;
+}
+
+static inline uint32_t shift_lsr(uint32_t value, uint32_t amount, uint8_t *carry) {
+    amount &= 0xFF;
+    if (amount == 0) return value;
+    if (amount < 32) { *carry = (value >> (amount - 1)) & 1; return value >> amount; }
+    *carry = amount == 32 ? value >> 31 : 0;
+    return 0;
+}
+
+static inline uint32_t shift_asr(uint32_t value, uint32_t amount, uint8_t *carry) {
+    amount &= 0xFF;
+    if (amount == 0) return value;
+    if (amount < 32) { *carry = ((int32_t)value >> (amount - 1)) & 1; return (uint32_t)((int32_t)value >> amount); }
+    *carry = value >> 31;
+    return (uint32_t)((int32_t)value >> 31);
+}
+
+static inline uint32_t shift_ror(uint32_t value, uint32_t amount, uint8_t *carry) {
+    amount &= 0xFF;
+    if (amount == 0) return value;
+    amount &= 31;
+    if (amount == 0) { *carry = value >> 31; return value; }
+    *carry = (value >> (amount - 1)) & 1;
+    return ror32(value, amount);
+}
+
+#define RECOMP_DEPTH_LIMIT 2048
+
+/* a guest call, leaving the caller too when the host has to take over. */
+#define CALL(code) do { \
+    if (UNLIKELY(++ctx->depth > RECOMP_DEPTH_LIMIT)) { ctx->depth--; ctx->exit = EXIT_UNWIND; return; } \
+    code(ctx); \
+    ctx->depth--; \
+    if (UNLIKELY(ctx->exit)) return; \
+} while (0)
+
+/* runs whatever code the host has for r15. */
+static inline void recomp_call(Context *ctx) {
+    Code code = ctx->host->lookup(ctx, ctx->r[15] | ctx->thumb);
+    if (code) code(ctx);
+    else ctx->exit = EXIT_UNWIND;
+}
+
+/* after a call, anything but a plain return to the next instruction goes
+   through dispatch. */
+#define RETURNED(address) \
+    if (UNLIKELY(ctx->r[15] != (address) || ctx->thumb)) { target = ctx->r[15]; goto dispatch; }
+
+/* a return that may switch to Thumb. */
+#define RETURN_TO(value) do { \
+    uint32_t v_ = (value); \
+    ctx->thumb = v_ & 1; \
+    ctx->r[15] = v_ & (ctx->thumb ? ~1u : ~3u); \
+    return; \
+} while (0)
+
+/* a jump that may switch to Thumb. */
+#define JUMP_TO(value) do { \
+    uint32_t v_ = (value); \
+    ctx->thumb = v_ & 1; \
+    target = v_ & (ctx->thumb ? ~1u : ~3u); \
+    goto dispatch; \
+} while (0)
+
+#define BUDGET(address, count) \
+    if (UNLIKELY((ctx->budget -= (count)) < 0)) { \
+        ctx->budget += (count); \
+        ctx->r[15] = (address); \
+        ctx->exit = EXIT_BUDGET; \
+        return; \
+    }
+
+#define SVC(next, number) do { \
+    ctx->r[15] = (next); \
+    ctx->svc = (number); \
+    ctx->exit = EXIT_SVC; \
+    return; \
+} while (0)
+
+#define INTERPRET(address, opcode) do { \
+    ctx->host->interpret(ctx, (address), (opcode)); \
+    if (UNLIKELY(ctx->exit)) return; \
+} while (0)
+
+#endif

@@ -10,6 +10,8 @@ name = "3dsrecomp"
 path = "src/main.rs"
 
 [dependencies]
+libloading = "0.8"
+zakuro-cpu = { path = "../zakuro/crates/zakuro-cpu" }
 zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
 
 [profile.release]

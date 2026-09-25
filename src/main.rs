@@ -1,50 +1,132 @@
 //! 3dsrecomp, a static recompiler for 3DS titles built on the Zakuro runtime.
 //!
-//! for now it only analyzes, finding how much of a title's code a generic
-//! pass can discover on its own.
+//! analyze reports how much of a title's code a generic pass can discover
+//! on its own, build turns what it found into C and compiles it into a
+//! library the emulator can load.
 
+mod abi;
 mod arm;
+mod codegen;
+mod compile;
 mod cro;
 mod discover;
 mod image;
 mod thumb;
+mod verify;
+
+use std::path::Path;
+use std::process::exit;
 
 use discover::{Analysis, Byte, Mode, Program, Source};
 use zakuro_fs::Title;
 use zakuro_fs::romfs::{DirEntry, FileEntry, RomFs};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let (Some(command), Some(path)) = (args.next(), args.next()) else {
-        eprintln!("usage, 3dsrecomp analyze <rom>");
-        std::process::exit(2);
-    };
-    if command != "analyze" {
-        eprintln!("unknown command {command}");
-        std::process::exit(2);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["analyze", rom] => analyze(rom),
+        ["build", rom, dir] => build(rom, Path::new(dir)),
+        ["verify", rom, library] => check(rom, Path::new(library), 500),
+        ["verify", rom, library, count] => check(rom, Path::new(library), count.parse().unwrap_or(500)),
+        _ => {
+            eprintln!("usage, 3dsrecomp analyze <rom>, build <rom> <dir> or verify <rom> <library> [count]");
+            exit(2);
+        }
     }
+}
 
-    let title = match Title::load(&path) {
-        Ok(title) => title,
-        Err(error) => {
-            eprintln!("could not load {path}, {error}");
-            std::process::exit(1);
-        }
-    };
-    let image = match image::Image::from_title(&title) {
-        Ok(image) => image,
-        Err(error) => {
-            eprintln!("could not read the code, {error}");
-            std::process::exit(1);
-        }
-    };
-
+/// the title and its programs, the executable first and then its modules.
+fn load(path: &str) -> (Title, Vec<(String, Program)>) {
+    let title = Title::load(path).unwrap_or_else(|error| {
+        eprintln!("could not load {path}, {error}");
+        exit(1);
+    });
+    let image = image::Image::from_title(&title).unwrap_or_else(|error| {
+        eprintln!("could not read the code, {error}");
+        exit(1);
+    });
     let exports = static_module(&title).map(|module| module.code_exports()).unwrap_or_default();
     let mut programs = vec![("executable".to_owned(), image.into_program(&exports))];
-    let modules = modules(&title);
-    let module_count = modules.len();
-    programs.extend(modules);
+    programs.extend(modules(&title));
+    (title, programs)
+}
 
+fn build(path: &str, dir: &Path) {
+    let (title, programs) = load(path);
+    // the executable for now, the modules need their code to move
+    let (_, program) = &programs[0];
+    let analysis = discover::analyze(program);
+    let files = codegen::generate(program, &analysis);
+
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        eprintln!("could not create {}, {error}", dir.display());
+        exit(1);
+    }
+    for (name, contents) in &files {
+        if let Err(error) = std::fs::write(dir.join(name), contents) {
+            eprintln!("could not write {name}, {error}");
+            exit(1);
+        }
+    }
+    let size: usize = files.iter().map(|(_, contents)| contents.len()).sum();
+    println!("wrote {} files, {} MiB of C", files.len(), size >> 20);
+
+    let sources: Vec<String> = files.iter().map(|(name, _)| name.clone()).filter(|name| name.ends_with(".c")).collect();
+    let library = dir.join(format!("{:016X}.so", title.program_id()));
+    let start = std::time::Instant::now();
+    if let Err(error) = compile::compile(dir, &sources, &library) {
+        eprintln!("{error}");
+        exit(1);
+    }
+    println!("built {} in {:.1?}", library.display(), start.elapsed());
+}
+
+/// runs count of the executable's recompiled functions against the
+/// interpreter.
+fn check(path: &str, library: &Path, count: usize) {
+    let (title, programs) = load(path);
+    let (_, program) = &programs[0];
+    let analysis = discover::analyze(program);
+    let library = abi::Library::open(library).unwrap_or_else(|error| {
+        eprintln!("could not open {}, {error}", library.display());
+        exit(1);
+    });
+    let image = image::Image::from_title(&title).unwrap_or_else(|error| {
+        eprintln!("could not read the code, {error}");
+        exit(1);
+    });
+    let memory = verify::memory(
+        (image.text.base, &image.text.bytes),
+        (image.rodata.base, &image.rodata.bytes),
+        (image.data.base, &image.data.bytes),
+        title.exheader.bss_size,
+    );
+    let functions: Vec<u32> =
+        analysis.functions.iter().filter(|&(&entry, f)| codegen::recompiles(entry, f)).map(|(&entry, _)| entry).collect();
+    let step = (functions.len() / count.max(1)).max(1);
+    let sample: Vec<u32> = functions.into_iter().step_by(step).take(count).collect();
+
+    let start = std::time::Instant::now();
+    let report = verify::verify(&memory, &library, &sample);
+    println!(
+        "{} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched, in {:.1?}",
+        report.tested,
+        report.returned,
+        report.svc,
+        report.stuck,
+        report.other,
+        report.mismatched,
+        start.elapsed()
+    );
+    println!(
+        "instructions {} recompiled, {} through the fallback, {} interpreted alone",
+        report.native, report.fallbacks, report.interpreted
+    );
+}
+
+fn analyze(path: &str) {
+    let (title, programs) = load(path);
+    let module_count = programs.len() - 1;
     let start = std::time::Instant::now();
     let analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
     let elapsed = start.elapsed();
@@ -70,7 +152,7 @@ fn main() {
         from(Source::Entry)
     );
     let thumb = functions().filter(|f| f.mode == Mode::Thumb).count();
-    let instructions: usize = functions().map(|f| f.instructions).sum();
+    let instructions: usize = functions().map(|f| f.instructions.len()).sum();
     println!("thumb       {thumb} functions");
     println!("decoded     {instructions} instructions, shared code once per function");
     println!("analysis    {elapsed:.2?}");

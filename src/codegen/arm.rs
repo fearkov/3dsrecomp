@@ -64,11 +64,16 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             false
         }
         0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),
-        // cp15, where reading the TLS address is common enough to do here
+        // cp15, where reading the TLS address is common enough to do here,
+        // and so are the barriers and data cache maintenance, which change
+        // nothing for code that sees memory as it is
         0b111 if op & 0x10 != 0 => {
             let rd = (op >> 12) & 0xF;
+            let data_cache = op & 0x0FFF_0F10 == 0x0E07_0F10 && !matches!(op & 0xF, 5 | 7 | 13);
             if op & 0x0FFF_0FFF == 0x0E1D_0F70 && rd != 15 {
                 emit!(out, "    ctx->r[{rd}] = ctx->tls;");
+                true
+            } else if data_cache {
                 true
             } else {
                 interpret(out, scope, a, op)

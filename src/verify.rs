@@ -257,6 +257,7 @@ fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.cpsr.q = ctx.q != 0;
     cpu.cpsr.ge = ctx.ge;
     cpu.cpsr.thumb = ctx.thumb != 0;
+    cpu.exclusive_addr = (ctx.exclusive != 0).then_some(ctx.exclusive_address);
 }
 
 fn store(cpu: &Cpu, ctx: &mut Context) {
@@ -268,6 +269,9 @@ fn store(cpu: &Cpu, ctx: &mut Context) {
     ctx.q = cpu.cpsr.q as u8;
     ctx.ge = cpu.cpsr.ge;
     ctx.thumb = cpu.cpsr.thumb as u8;
+    ctx.exclusive = cpu.exclusive_addr.is_some() as u8;
+    ctx.exclusive_address = cpu.exclusive_addr.unwrap_or(0);
+    ctx.tls = cpu.cp15.thread_id_ro;
 }
 
 fn interpreted(run: &mut Run) -> Stop {
@@ -367,6 +371,10 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
         if expected as u8 != got {
             found.push(format!("{name} {} against {got}", expected as u8));
         }
+    }
+    let monitor = (ctx.exclusive != 0).then_some(ctx.exclusive_address);
+    if a.cpu.exclusive_addr != monitor {
+        found.push(format!("exclusive monitor {:X?} against {monitor:X?}", a.cpu.exclusive_addr));
     }
     if a.cpu.cpsr.ge != ctx.ge {
         found.push(format!("ge {:X} against {:X}", a.cpu.cpsr.ge, ctx.ge));
@@ -488,11 +496,13 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             q: 0,
             thumb: 0,
             ge: 0,
-            pad: 0,
+            exclusive: 0,
             budget: 0,
             exit: 0,
             svc: 0,
             depth: 0,
+            exclusive_address: 0,
+            tls: 0,
             read_pages: b.memory.read_pages.as_ptr(),
             write_pages: b.memory.write_pages.as_ptr(),
             vfp: b.cpu.vfp.regs.as_mut_ptr(),

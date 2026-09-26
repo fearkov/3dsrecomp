@@ -64,8 +64,16 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             false
         }
         0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),
-        // cp15
-        0b111 if op & 0x10 != 0 => interpret(out, scope, a, op),
+        // cp15, where reading the TLS address is common enough to do here
+        0b111 if op & 0x10 != 0 => {
+            let rd = (op >> 12) & 0xF;
+            if op & 0x0FFF_0FFF == 0x0E1D_0F70 && rd != 15 {
+                emit!(out, "    ctx->r[{rd}] = ctx->tls;");
+                true
+            } else {
+                interpret(out, scope, a, op)
+            }
+        }
         _ => vfp::data_processing(out, scope, a, op),
     }
 }
@@ -78,8 +86,7 @@ fn register_space(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             return extra_transfer(out, scope, a, op);
         }
         if op & (1 << 24) != 0 {
-            // swap and the exclusives
-            return interpret(out, scope, a, op);
+            return if op & (1 << 23) != 0 { exclusive(out, scope, a, op) } else { swap(out, scope, a, op) };
         }
         return match (op >> 21) & 7 {
             0b000 | 0b001 => multiply(out, scope, a, op),
@@ -372,6 +379,60 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
+/// swp and swpb.
+fn swap(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    let rd = (op >> 12) & 0xF;
+    if rd == 15 {
+        return interpret(out, scope, a, op);
+    }
+    let (read, write, cast) = if op & (1 << 22) != 0 { ("mem_read8", "mem_write8", "(uint8_t)") } else { ("mem_read32", "mem_write32", "") };
+    emit!(
+        out,
+        "    {{ uint32_t address = {}, source = {}, old = {read}(ctx, address); {write}(ctx, address, {cast}source); ctx->r[{rd}] = old; }}",
+        reg(scope, (op >> 16) & 0xF, a + 8),
+        reg(scope, op & 0xF, a + 8)
+    );
+    true
+}
+
+/// ldrex and strex in all their sizes. a store only goes through while
+/// the monitor still has its address, and a successful one clears it.
+fn exclusive(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    let rd = (op >> 12) & 0xF;
+    let rm = op & 0xF;
+    let size = (op >> 21) & 3;
+    let load = op & (1 << 20) != 0;
+    // r15 as a destination, or a pair that runs into it
+    if rd == 15 || (size == 0b01 && (if load { rd } else { rm }) >= 14) {
+        return interpret(out, scope, a, op);
+    }
+    let address = reg(scope, (op >> 16) & 0xF, a + 8);
+    let (read, write, cast) = match size {
+        0b00 | 0b01 => ("mem_read32", "mem_write32", ""),
+        0b10 => ("mem_read8", "mem_write8", "(uint8_t)"),
+        _ => ("mem_read16", "mem_write16", "(uint16_t)"),
+    };
+    if load {
+        let value = if size == 0b01 {
+            format!("ctx->r[{rd}] = mem_read32(ctx, address); ctx->r[{}] = mem_read32(ctx, address + 4);", rd + 1)
+        } else {
+            format!("ctx->r[{rd}] = {read}(ctx, address);")
+        };
+        emit!(out, "    {{ uint32_t address = {address}; ctx->exclusive = 1; ctx->exclusive_address = address; {value} }}");
+    } else {
+        let store = if size == 0b01 {
+            format!("mem_write32(ctx, address, ctx->r[{rm}]); mem_write32(ctx, address + 4, ctx->r[{}]);", rm + 1)
+        } else {
+            format!("{write}(ctx, address, {cast}ctx->r[{rm}]);")
+        };
+        emit!(
+            out,
+            "    {{ uint32_t address = {address}; if (ctx->exclusive && ctx->exclusive_address == address) {{ {store} ctx->exclusive = 0; ctx->r[{rd}] = 0; }} else ctx->r[{rd}] = 1; }}"
+        );
+    }
+    true
+}
+
 /// mul and mla.
 fn multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 16) & 0xF;
@@ -649,8 +710,9 @@ fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         return call(out, scope, a + 4, (a + 8).wrapping_add(offset) & !1, true);
     }
     if op & 0xFFF0_00F0 == 0xF570_0010 {
-        // clrex, the reservation lives with the interpreter
-        return interpret(out, scope, a, op);
+        // clrex
+        emit!(out, "    ctx->exclusive = 0;");
+        return true;
     }
     if matches!((op >> 25) & 7, 0b010 | 0b011) {
         // pld and the barriers do nothing here

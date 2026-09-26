@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 3
+#define RECOMP_ABI 4
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
@@ -39,11 +39,17 @@ enum {
 
 struct Context {
     uint32_t r[16];
-    uint8_t n, z, c, v, q, thumb, ge, pad;
+    uint8_t n, z, c, v, q, thumb, ge;
+    /* whether ldrex marked exclusive_address. */
+    uint8_t exclusive;
     int32_t budget;
     uint32_t exit;
     uint32_t svc;
     uint32_t depth;
+    uint32_t exclusive_address;
+    /* the read-only thread id register, which holds the thread's TLS
+       address. */
+    uint32_t tls;
     /* a host pointer for each 4 KiB page, or null when the host has to
        handle the access. */
     uint8_t *const *read_pages;

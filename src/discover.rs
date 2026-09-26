@@ -21,6 +21,9 @@ pub enum Source {
     Relocation,
     /// a code address another module takes from this one without a name.
     Import,
+    /// the start of a gap nothing led to, or a push in one, which is how
+    /// functions reached only through tables nobody can see begin.
+    Scan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -136,6 +139,16 @@ pub fn analyze(program: &Program) -> Analysis {
         discovery.code_pointer(address, source);
     }
     discovery.run();
+    // once nothing surer is left, the gaps get looked at for how functions
+    // begin, each round of them can lead to more
+    loop {
+        let starts = discovery.gap_starts();
+        if starts.is_empty() {
+            break;
+        }
+        discovery.queue.extend(starts.into_iter().map(|address| (address, Mode::Arm, Source::Scan)));
+        discovery.run();
+    }
     discovery.analysis
 }
 
@@ -164,6 +177,31 @@ impl Discovery<'_> {
 
     fn byte(&self, address: u32) -> Byte {
         self.analysis.map[(address - self.text.base) as usize]
+    }
+
+    /// likely ARM functions in the text nothing reached, the first word of
+    /// each gap when it is an unconditional instruction, and every push of
+    /// registers onto the stack. Thumb is left alone, too much data looks
+    /// like it.
+    fn gap_starts(&self) -> Vec<u32> {
+        let mut starts = Vec::new();
+        let mut in_gap = false;
+        let mut address = self.text.base.next_multiple_of(4);
+        while let Some(word) = self.text.read32(address) {
+            let offset = (address - self.text.base) as usize;
+            let unknown = self.analysis.map[offset..offset + 4].iter().all(|&byte| byte == Byte::Unknown);
+            if unknown && !self.analysis.functions.contains_key(&address) {
+                let instruction = arm::decode(word, address);
+                let push = word & 0xFFFF_0000 == 0xE92D_0000 && word & 0xFFFF != 0;
+                let starts_gap = !in_gap && instruction.condition == arm::ALWAYS && instruction.flow != Flow::Undefined;
+                if push || starts_gap {
+                    starts.push(address);
+                }
+            }
+            in_gap = unknown;
+            address += 4;
+        }
+        starts
     }
 
     /// whether the word at address may hold a code address.
@@ -396,7 +434,7 @@ mod tests {
             0xEA00_0002, // b default (0x100018)
             0xEA00_0002, // b case 0 (0x10001c)
             0xEA00_0002, // b case 1 (0x100020)
-            0xE12F_FF1E, // bx lr, unreachable filler
+            0x0000_0000, // data between the table and the cases
             0xE12F_FF1E, // default
             0xE12F_FF1E, // case 0
             0xE12F_FF1E, // case 1
@@ -452,9 +490,28 @@ mod tests {
             BASE + 0xC,  // looks like a code address
             0xE12F_FF1E, // bx lr
         ];
-        assert!(analyze_words(&words).functions.contains_key(&(BASE + 0xC)));
+        assert_eq!(analyze_words(&words).functions[&(BASE + 0xC)].source, Source::Pointer);
         let mut program = program(&words);
         program.slots = Some(BTreeSet::new());
-        assert!(!analyze(&program).functions.contains_key(&(BASE + 0xC)));
+        // the code is still there for the scan to find, only not through
+        // the literal
+        assert_eq!(analyze(&program).functions[&(BASE + 0xC)].source, Source::Scan);
+    }
+
+    /// code nothing leads to still becomes functions where a gap begins
+    /// with an instruction or a push saves registers, data does not.
+    #[test]
+    fn gaps_are_scanned_for_functions() {
+        let analysis = analyze_words(&[
+            0xE12F_FF1E, // bx lr, the entry
+            0xE3A0_0001, // mov r0, #1, the start of a gap
+            0xE12F_FF1E, // bx lr
+            0x1234_5678, // data
+            0xE92D_4010, // push {r4, lr}
+            0xE8BD_8010, // pop {r4, pc}
+        ]);
+        assert_eq!(analysis.functions[&(BASE + 4)].source, Source::Scan);
+        assert_eq!(analysis.functions[&(BASE + 16)].source, Source::Scan);
+        assert!(!analysis.functions.contains_key(&(BASE + 12)));
     }
 }

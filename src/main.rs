@@ -48,22 +48,23 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
     let files = module_files(&title);
     let crs = static_module(&title);
     let exports = crs.as_ref().map(|module| module.code_exports()).unwrap_or_default();
-    let imported_from_executable = crs.as_ref().map(|module| imported(&files, module)).unwrap_or_default();
+    let imported_from_executable = crs.as_ref().map(|module| imported(&files, crs.as_ref(), module)).unwrap_or_default();
     let mut programs = vec![("executable".to_owned(), image.into_program(&exports, &imported_from_executable))];
-    programs.extend(
-        files
-            .iter()
-            .filter_map(|(module, bytes)| Some((module.name.clone(), module.program(bytes, &imported(&files, module))?))),
-    );
+    programs.extend(files.iter().filter_map(|(module, bytes)| {
+        Some((module.name.clone(), module.program(bytes, &imported(&files, crs.as_ref(), module))?))
+    }));
     (title, programs)
 }
 
-/// the code addresses in module that other modules take from it without a
-/// name, which nothing else may lead to.
-fn imported(files: &[(cro::Module, Vec<u8>)], module: &cro::Module) -> Vec<u32> {
+/// the code addresses in module that the other modules, and the executable
+/// through its crs, take from it without a name, which nothing else may lead
+/// to.
+fn imported(files: &[(cro::Module, Vec<u8>)], crs: Option<&cro::Module>, module: &cro::Module) -> Vec<u32> {
     files
         .iter()
-        .flat_map(|(other, _)| &other.anonymous_imports)
+        .map(|(other, _)| other)
+        .chain(crs)
+        .flat_map(|other| &other.anonymous_imports)
         .filter(|(name, _)| *name == module.name)
         .filter_map(|&(_, tag)| module.code_address(tag))
         .collect()
@@ -137,9 +138,10 @@ fn check(path: &str, library: &Path, count: usize) {
 
     let mut modules = verify::Report::default();
     let files = module_files(&title);
+    let crs = static_module(&title);
     for (module, bytes) in &files {
         let Some(index) = library.modules().iter().position(|m| m.name() == module.name) else { continue };
-        let Some(program) = module.program(bytes, &imported(&files, module)) else { continue };
+        let Some(program) = module.program(bytes, &imported(&files, crs.as_ref(), module)) else { continue };
         let mut memory = regions.clone();
         memory.push(verify::Region {
             base: verify::MODULE_BASE,
@@ -208,12 +210,13 @@ fn analyze(path: &str) {
     let functions = || analyses.iter().flat_map(|analysis| analysis.functions.values());
     let from = |source: Source| functions().filter(|f| f.source == source).count();
     println!(
-        "found by    {} calls, {} pointers, {} relocations, {} exports, {} imports, {} entry",
+        "found by    {} calls, {} pointers, {} relocations, {} exports, {} imports, {} scanned, {} entry",
         from(Source::Call),
         from(Source::Pointer),
         from(Source::Relocation),
         from(Source::Export),
         from(Source::Import),
+        from(Source::Scan),
         from(Source::Entry)
     );
     let thumb = functions().filter(|f| f.mode == Mode::Thumb).count();

@@ -24,6 +24,9 @@ pub struct Module {
     /// the places that get the addresses of what it imports, whose segment
     /// field means nothing.
     pub imports: Vec<Relocation>,
+    /// what it takes from other modules without a name, the module and the
+    /// segment tag there.
+    pub anonymous_imports: Vec<(String, u32)>,
 }
 
 pub struct Relocation {
@@ -85,6 +88,16 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
     };
     let relocations = table(bytes, 0x128, 0x12C, 12)?.into_iter().map(relocation).collect();
     let imports = table(bytes, 0xF8, 0xFC, 12)?.into_iter().map(relocation).collect();
+    // each module imported from names its anonymous symbols, a table of a
+    // segment tag and the first place it goes
+    let mut anonymous_imports = Vec::new();
+    for entry in table(bytes, 0xF0, 0xF4, 20)? {
+        let module = cstring(bytes, word(entry, 0) as usize);
+        let (offset, count) = (word(entry, 12) as usize, word(entry, 16) as usize);
+        for i in 0..count {
+            anonymous_imports.push((module.clone(), field(bytes, offset + i * 8)?));
+        }
+    }
     Some(Module {
         name: cstring(bytes, field(bytes, 0xC0)? as usize),
         segments,
@@ -92,6 +105,7 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
         indexed_exports,
         relocations,
         imports,
+        anonymous_imports,
     })
 }
 
@@ -108,6 +122,11 @@ impl Module {
             .filter(|tag| self.segments.get((tag & 0xF) as usize).is_some_and(|s| s.kind == CODE))
             .filter_map(|tag| self.resolve(tag))
             .collect()
+    }
+
+    /// the address a segment tag points at when it is in code.
+    pub fn code_address(&self, tag: u32) -> Option<u32> {
+        self.is_code(tag & 0xF).then(|| self.resolve(tag)).flatten()
     }
 
     /// the address a segment tag points at, given where each segment lives.
@@ -151,13 +170,15 @@ impl Module {
 
     /// the module's code as discovery sees it, at its offsets in the file
     /// with the code addresses its relocations store filled in. bytes is the
-    /// whole file, where the stored addresses are still zero.
-    pub fn program(&self, bytes: &[u8]) -> Option<Program> {
+    /// whole file, where the stored addresses are still zero, and imported
+    /// the code addresses other modules take from it.
+    pub fn program(&self, bytes: &[u8], imported: &[u32]) -> Option<Program> {
         let segment = self.segments.iter().find(|s| s.kind == CODE && s.size > 0)?;
         let range = segment.offset as usize..(segment.offset + segment.size) as usize;
         let mut text = image::Segment { base: segment.offset, bytes: bytes.get(range)?.to_vec() };
 
         let mut seeds: Vec<_> = self.code_exports().into_iter().map(|address| (address, Source::Export)).collect();
+        seeds.extend(imported.iter().map(|&address| (address, Source::Import)));
         // every word in the code that a relocation or an import fills in is
         // data, whatever it points at
         let (start, end) = (text.base, text.end());
@@ -211,6 +232,27 @@ mod tests {
         bytes
     }
 
+    /// a module names what it takes from another module without a name as
+    /// that module's segment tags, which lead into its code.
+    #[test]
+    fn anonymous_imports_lead_into_the_other_module() {
+        let mut bytes = module(&[0xE12F_FF1E; 8], &[]);
+        let mut put = |at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        // one module imported from, with one anonymous symbol, segment 0
+        // at offset 0x10
+        put(0xF0, 0x380);
+        put(0xF4, 1);
+        put(0x380, 0x3A0);
+        put(0x38C, 0x3B0);
+        put(0x390, 1);
+        put(0x3B0, 0x10 << 4);
+        bytes[0x3A0..0x3A9].copy_from_slice(b"|static|\0");
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.anonymous_imports, vec![("|static|".to_owned(), 0x100)]);
+        assert_eq!(module.code_address(0x100), Some(0x210));
+        assert_eq!(module.code_address(0x101), None, "segment 1 holds data");
+    }
+
     #[test]
     fn relocations_fill_in_code_pointers() {
         let bytes = module(
@@ -224,7 +266,7 @@ mod tests {
             // the literal (segment 0, offset 8) and a data word (segment 1)
             &[(8 << 4, 0x10), (1, 0xC)],
         );
-        let program = parse(&bytes).unwrap().program(&bytes).unwrap();
+        let program = parse(&bytes).unwrap().program(&bytes, &[]).unwrap();
         assert_eq!(program.text.read32(0x208), Some(0x210));
         assert_eq!(program.slots, Some(BTreeSet::from([0x208])));
         let analysis = discover::analyze(&program);

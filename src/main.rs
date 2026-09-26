@@ -45,10 +45,28 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
         eprintln!("could not read the code, {error}");
         exit(1);
     });
-    let exports = static_module(&title).map(|module| module.code_exports()).unwrap_or_default();
-    let mut programs = vec![("executable".to_owned(), image.into_program(&exports))];
-    programs.extend(modules(&title));
+    let files = module_files(&title);
+    let crs = static_module(&title);
+    let exports = crs.as_ref().map(|module| module.code_exports()).unwrap_or_default();
+    let imported_from_executable = crs.as_ref().map(|module| imported(&files, module)).unwrap_or_default();
+    let mut programs = vec![("executable".to_owned(), image.into_program(&exports, &imported_from_executable))];
+    programs.extend(
+        files
+            .iter()
+            .filter_map(|(module, bytes)| Some((module.name.clone(), module.program(bytes, &imported(&files, module))?))),
+    );
     (title, programs)
+}
+
+/// the code addresses in module that other modules take from it without a
+/// name, which nothing else may lead to.
+fn imported(files: &[(cro::Module, Vec<u8>)], module: &cro::Module) -> Vec<u32> {
+    files
+        .iter()
+        .flat_map(|(other, _)| &other.anonymous_imports)
+        .filter(|(name, _)| *name == module.name)
+        .filter_map(|&(_, tag)| module.code_address(tag))
+        .collect()
 }
 
 fn build(path: &str, dir: &Path) {
@@ -118,13 +136,14 @@ fn check(path: &str, library: &Path, count: usize) {
     print_report("executable", &executable);
 
     let mut modules = verify::Report::default();
-    for (module, bytes) in module_files(&title) {
+    let files = module_files(&title);
+    for (module, bytes) in &files {
         let Some(index) = library.modules().iter().position(|m| m.name() == module.name) else { continue };
-        let Some(program) = module.program(&bytes) else { continue };
+        let Some(program) = module.program(bytes, &imported(&files, module)) else { continue };
         let mut memory = regions.clone();
         memory.push(verify::Region {
             base: verify::MODULE_BASE,
-            bytes: module.image(&bytes, verify::MODULE_BASE, verify::IMPORT_STUB),
+            bytes: module.image(bytes, verify::MODULE_BASE, verify::IMPORT_STUB),
             writable: true,
         });
         library.place(index, verify::MODULE_BASE);
@@ -189,11 +208,12 @@ fn analyze(path: &str) {
     let functions = || analyses.iter().flat_map(|analysis| analysis.functions.values());
     let from = |source: Source| functions().filter(|f| f.source == source).count();
     println!(
-        "found by    {} calls, {} pointers, {} relocations, {} exports, {} entry",
+        "found by    {} calls, {} pointers, {} relocations, {} exports, {} imports, {} entry",
         from(Source::Call),
         from(Source::Pointer),
         from(Source::Relocation),
         from(Source::Export),
+        from(Source::Import),
         from(Source::Entry)
     );
     let thumb = functions().filter(|f| f.mode == Mode::Thumb).count();
@@ -281,17 +301,6 @@ fn static_module(title: &Title) -> Option<cro::Module> {
     let romfs = title.romfs.as_ref()?;
     let file = romfs.lookup("static.crs").ok()?;
     cro::parse(title.read_romfs(&file, 0, file.data_size as usize)?)
-}
-
-/// every CRO module in the RomFS, by the name it gives itself.
-fn modules(title: &Title) -> Vec<(String, Program)> {
-    module_files(title)
-        .into_iter()
-        .filter_map(|(module, bytes)| {
-            let program = module.program(&bytes)?;
-            Some((module.name, program))
-        })
-        .collect()
 }
 
 /// every CRO module in the RomFS with its file.

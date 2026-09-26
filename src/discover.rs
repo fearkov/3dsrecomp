@@ -19,6 +19,8 @@ pub enum Source {
     /// a code address a module's relocations store, in its vtables, jump
     /// tables and literal pools.
     Relocation,
+    /// a code address another module takes from this one without a name.
+    Import,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

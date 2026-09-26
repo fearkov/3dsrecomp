@@ -79,18 +79,20 @@ impl Image {
         })
     }
 
-    /// the executable as discovery sees it, starting from the entry point
-    /// and the exports. nothing says where it keeps pointers, so any word in
-    /// the data segments that lands in the code is taken for one.
-    pub fn into_program(self, exports: &[u32]) -> Program {
+    /// the executable as discovery sees it, starting from the entry point,
+    /// the exports and what modules take from it without a name. nothing
+    /// says where it keeps pointers, so any word in the data segments that
+    /// lands in the code is taken for one.
+    pub fn into_program(self, exports: &[u32], imported: &[u32]) -> Program {
         let entry = std::iter::once((self.entry, Source::Entry));
         let exports = exports.iter().map(|&address| (address, Source::Export));
+        let imported = imported.iter().map(|&address| (address, Source::Import));
         let pointers = [&self.rodata, &self.data]
             .into_iter()
             .flat_map(Segment::words)
             .filter(|&(_, value)| self.text.contains(value & !1))
             .map(|(_, value)| (value, Source::Pointer));
-        let seeds = entry.chain(exports).chain(pointers).collect();
+        let seeds = entry.chain(exports).chain(imported).chain(pointers).collect();
         Program { text: self.text, seeds, slots: None }
     }
 }
@@ -114,7 +116,7 @@ mod tests {
             rodata: segment(0x0020_0000, &[BASE + 8, 12345]),
             data: segment(0x0030_0000, &[BASE + 5]),
         };
-        let program = image.into_program(&[]);
+        let program = image.into_program(&[], &[]);
         assert_eq!(program.seeds.len(), 3);
         let analysis = discover::analyze(&program);
         assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Pointer);

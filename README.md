@@ -4,11 +4,11 @@ This is a static recompiler for Nintendo 3DS games, made to run with [Zakuro](ht
 
 It reads a game's code, finds the functions in it and turns them into C, which compiles into a library the emulator loads. Anything it can't handle or didn't find still runs in Zakuro's interpreter, so a game doesn't have to be fully recompiled to work.
 
-So far it has been tested with Pokémon Alpha Sapphire, which runs through its intro on recompiled code. It doesn't make it much faster yet, since most of the time goes to Zakuro's renderer.
+So far it has been tested with Pokémon Alpha Sapphire, which runs through its intro and into Littleroot Town on recompiled code, with more than 99% of the instructions it runs coming from the library. With Zakuro now drawing on the GPU, the game runs about twice as fast as it did on the interpreter.
 
 ## Features
 
-- finding the code in the main executable and in the CRO modules, from the entry point, calls, exports, relocations and pointers in data
+- finding the code in the main executable and in the CRO modules, from the entry point, calls, exports, relocations, pointers in data and what the modules import from each other, then looking for where functions begin in whatever is left
 - generating C for ARM, Thumb and VFP code, with the less common instructions going through the interpreter
 - modules get code that works wherever the game loads them
 - checking every recompiled function against Zakuro's interpreter, running both from the same state and comparing registers, flags and memory

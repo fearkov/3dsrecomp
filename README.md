@@ -16,18 +16,23 @@ So far it has been tested with Pokémon Alpha Sapphire, which runs through its i
 
 ## How to use
 
-You need Rust, a C compiler and Zakuro cloned next to this repository, since 3dsrecomp uses its crates. I've only tested on Linux so far.
+You need Rust and a C compiler. I've only tested on Linux so far.
 
 ```
 cargo build --release
 ./target/release/3dsrecomp analyze game.3ds
 ./target/release/3dsrecomp build game.3ds out
-./target/release/3dsrecomp verify game.3ds out/<title id>.so
 ```
 
 analyze - shows how much of the code was found; 
-build - writes the C to out and compiles it; 
-verify - runs the recompiled functions against the interpreter. 
+build - writes the C to out and compiles it. 
+
+verify runs the recompiled functions against Zakuro's interpreter, which cargo fetches when it's built with the verify feature:
+
+```
+cargo build --release --features verify
+./target/release/3dsrecomp verify game.3ds out/<title id>.so
+```
 
 The build takes a while, so don't worry. Then point Zakuro at the library, or at the directory holding it:
 

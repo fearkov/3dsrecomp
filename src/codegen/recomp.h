@@ -160,6 +160,119 @@ static inline uint32_t accumulate(Context *ctx, int64_t value) {
 /* the bottom or top halfword, signed. */
 #define HALF(value, top) ((int64_t)(int16_t)((top) ? (value) >> 16 : (value)))
 
+/* saturates value to a signed or unsigned number of bits, noting when it
+   had to. */
+static inline int64_t saturate_signed(int64_t value, int bits, int *saturated) {
+    int64_t max = ((int64_t)1 << (bits - 1)) - 1, min = -((int64_t)1 << (bits - 1));
+    if (value > max) { *saturated = 1; return max; }
+    if (value < min) { *saturated = 1; return min; }
+    return value;
+}
+
+static inline int64_t saturate_unsigned(int64_t value, int bits, int *saturated) {
+    int64_t max = bits >= 32 ? 0xFFFFFFFFll : ((int64_t)1 << bits) - 1;
+    if (value > max) { *saturated = 1; return max; }
+    if (value < 0) { *saturated = 1; return 0; }
+    return value;
+}
+
+/* ssat and usat, setting q when the value did not fit. */
+static inline uint32_t media_saturate(Context *ctx, int64_t value, int bits, int is_unsigned) {
+    int saturated = 0;
+    int64_t result = is_unsigned ? saturate_unsigned(value, bits, &saturated) : saturate_signed(value, bits, &saturated);
+    if (saturated) ctx->q = 1;
+    return (uint32_t)result;
+}
+
+/* ssat16 and usat16. */
+static inline uint32_t media_saturate16(Context *ctx, uint32_t value, int bits, int is_unsigned) {
+    int saturated = 0;
+    uint32_t out = 0;
+    for (int i = 0; i < 2; i++) {
+        int64_t lane = (int16_t)(value >> (16 * i));
+        int64_t result = is_unsigned ? saturate_unsigned(lane, bits, &saturated) : saturate_signed(lane, bits, &saturated);
+        out |= ((uint32_t)result & 0xFFFF) << (16 * i);
+    }
+    if (saturated) ctx->q = 1;
+    return out;
+}
+
+/* one lane of a parallel add or subtract, 8 or 16 bits wide. */
+static inline uint32_t media_lane(uint32_t a, uint32_t b, int width, int sub, int is_signed, int saturating,
+                                  int halving, int *ge) {
+    uint32_t mask = width == 16 ? 0xFFFFu : 0xFFu;
+    int32_t wide;
+    if (is_signed) {
+        int32_t x = width == 16 ? (int16_t)a : (int8_t)a, y = width == 16 ? (int16_t)b : (int8_t)b;
+        wide = sub ? x - y : x + y;
+        *ge = wide >= 0;
+    } else {
+        int32_t x = a & mask, y = b & mask;
+        wide = sub ? x - y : x + y;
+        /* no borrow for a subtract, a carry out for an add */
+        *ge = sub ? wide >= 0 : wide > (int32_t)mask;
+    }
+    int unused = 0;
+    int64_t value = wide;
+    if (halving) value = wide >> 1;
+    else if (saturating) value = is_signed ? saturate_signed(wide, width, &unused) : saturate_unsigned(wide, width, &unused);
+    return (uint32_t)value & mask;
+}
+
+/* sadd16, uqsub8, shasx and the rest. op1 picks signed or unsigned and
+   plain, saturating or halving, op2 the lanes. only the plain forms set
+   ge. */
+static inline uint32_t media_parallel(Context *ctx, int op1, int op2, uint32_t a, uint32_t b) {
+    int is_signed = !(op1 & 4), saturating = (op1 & 3) == 2, halving = (op1 & 3) == 3;
+    uint32_t result = 0;
+    int ge = 0, g;
+    if (op2 <= 3) {
+        /* asx and sax cross the halves of b */
+        int cross = op2 == 1 || op2 == 2;
+        uint32_t b_lo = cross ? b >> 16 : b & 0xFFFF, b_hi = cross ? b & 0xFFFF : b >> 16;
+        result = media_lane(a & 0xFFFF, b_lo, 16, op2 == 1 || op2 == 3, is_signed, saturating, halving, &g);
+        if (g) ge |= 3;
+        result |= media_lane(a >> 16, b_hi, 16, op2 == 2 || op2 == 3, is_signed, saturating, halving, &g) << 16;
+        if (g) ge |= 12;
+    } else {
+        for (int i = 0; i < 4; i++) {
+            result |= media_lane(a >> (8 * i), b >> (8 * i), 8, op2 == 7, is_signed, saturating, halving, &g) << (8 * i);
+            if (g) ge |= 1 << i;
+        }
+    }
+    if (!saturating && !halving) ctx->ge = ge;
+    return result;
+}
+
+/* sel, each byte from a where its ge bit is set and from b where not. */
+static inline uint32_t media_select(Context *ctx, uint32_t a, uint32_t b) {
+    uint32_t out = 0;
+    for (int i = 0; i < 4; i++) out |= ((ctx->ge >> i) & 1 ? a : b) & (0xFFu << (8 * i));
+    return out;
+}
+
+/* adds the halves of a and b apart, for the accumulating packed extends. */
+static inline uint32_t add_halves(uint32_t a, uint32_t b) {
+    return ((a + b) & 0xFFFF) | (((a >> 16) + (b >> 16)) << 16);
+}
+
+/* usad8, the sum of the absolute differences of the bytes. */
+static inline uint32_t media_usad8(uint32_t a, uint32_t b) {
+    uint32_t sum = 0;
+    for (int i = 0; i < 4; i++) {
+        int32_t x = (a >> (8 * i)) & 0xFF, y = (b >> (8 * i)) & 0xFF;
+        sum += (uint32_t)(x > y ? x - y : y - x);
+    }
+    return sum;
+}
+
+static inline uint32_t reverse_bits(uint32_t value) {
+    value = ((value >> 1) & 0x55555555u) | ((value & 0x55555555u) << 1);
+    value = ((value >> 2) & 0x33333333u) | ((value & 0x33333333u) << 2);
+    value = ((value >> 4) & 0x0F0F0F0Fu) | ((value & 0x0F0F0F0Fu) << 4);
+    return __builtin_bswap32(value);
+}
+
 /* shifts by a register, the amount is its bottom byte. */
 static inline uint32_t shift_lsl(uint32_t value, uint32_t amount, uint8_t *carry) {
     amount &= 0xFF;

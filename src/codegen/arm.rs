@@ -490,35 +490,153 @@ fn branch_exchange(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     false
 }
 
-/// the sign and zero extensions and the byte reversals.
+/// the ARMv6 media instructions, decoded in zakuro-cpu's order.
 fn media(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let op1 = (op >> 20) & 0x1F;
     let op2 = (op >> 5) & 7;
+    match op1 >> 3 {
+        0b00 => parallel(out, scope, a, op, op1, op2),
+        0b01 => pack_saturate_extend(out, scope, a, op, op1, op2),
+        0b10 => dual_multiply(out, scope, a, op, op1),
+        _ if op1 == 0b11000 && op2 == 0 => usad8(out, scope, a, op),
+        _ => interpret(out, scope, a, op),
+    }
+}
+
+/// the parallel adds and subtracts, sadd16 to uhsub8.
+fn parallel(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32, op2: u32) -> bool {
     let rd = (op >> 12) & 0xF;
-    if rd == 15 || op1 >> 3 != 0b01 {
+    if rd == 15 || op1 & 3 == 0 || matches!(op2, 5 | 6) {
         return interpret(out, scope, a, op);
     }
+    let n = reg(scope, (op >> 16) & 0xF, a + 8);
     let m = reg(scope, op & 0xF, a + 8);
-    let value = match (op1, op2) {
+    emit!(out, "    ctx->r[{rd}] = media_parallel(ctx, {op1}, {op2}, {n}, {m});");
+    true
+}
+
+/// packing, the extensions, sel, the reversals and the saturations.
+fn pack_saturate_extend(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32, op2: u32) -> bool {
+    let rd = (op >> 12) & 0xF;
+    if rd == 15 {
+        return interpret(out, scope, a, op);
+    }
+    let rn = (op >> 16) & 0xF;
+    let n = reg(scope, rn, a + 8);
+    let m = reg(scope, op & 0xF, a + 8);
+    let shift = (op >> 7) & 0x1F;
+    let unsigned = op1 & 0b100 != 0;
+    let value = match (op1 & 7, op2) {
+        // pkhbt and pkhtb
+        (0b000, 0 | 2 | 4 | 6) if op1 == 0b01000 => {
+            if op & (1 << 6) != 0 {
+                format!("((uint32_t)((int32_t){m} >> {}) & 0xFFFF) | ({n} & 0xFFFF0000u)", if shift == 0 { 31 } else { shift })
+            } else {
+                format!("({n} & 0xFFFF) | (({m} << {shift}) & 0xFFFF0000u)")
+            }
+        }
         (_, 0b011) => {
             let rotate = ((op >> 10) & 3) * 8;
             let x = if rotate == 0 { m } else { format!("ror32({m}, {rotate})") };
-            let extended = match op1 & 7 {
-                0b010 => format!("(uint32_t)(int32_t)(int8_t){x}"),
-                0b011 => format!("(uint32_t)(int32_t)(int16_t){x}"),
-                0b110 => format!("({x} & 0xFF)"),
-                0b111 => format!("({x} & 0xFFFF)"),
-                // the packed halfword forms
+            let (extended, packed) = match op1 & 7 {
+                0b000 => (
+                    format!(
+                        "(((uint32_t)(int32_t)(int8_t){x} & 0xFFFF) | (((uint32_t)(int32_t)(int8_t)({x} >> 16) & 0xFFFF) << 16))"
+                    ),
+                    true,
+                ),
+                0b010 => (format!("(uint32_t)(int32_t)(int8_t){x}"), false),
+                0b011 => (format!("(uint32_t)(int32_t)(int16_t){x}"), false),
+                0b100 => (format!("({x} & 0x00FF00FFu)"), true),
+                0b110 => (format!("({x} & 0xFF)"), false),
+                0b111 => (format!("({x} & 0xFFFF)"), false),
                 _ => return interpret(out, scope, a, op),
             };
-            let rn = (op >> 16) & 0xF;
-            if rn == 15 { extended } else { format!("ctx->r[{rn}] + {extended}") }
+            match (rn, packed) {
+                (15, _) => extended,
+                (_, true) => format!("add_halves(ctx->r[{rn}], {extended})"),
+                (_, false) => format!("ctx->r[{rn}] + {extended}"),
+            }
         }
-        (0b01011, 0b001) => format!("__builtin_bswap32({m})"),
-        (0b01011, 0b101) => format!("((({m}) & 0x00FF00FFu) << 8) | ((({m}) & 0xFF00FF00u) >> 8)"),
-        (0b01111, 0b101) => format!("(uint32_t)(int32_t)(int16_t)(((({m}) & 0xFF) << 8) | ((({m}) >> 8) & 0xFF))"),
+        (0b000, 0b101) if op1 == 0b01000 => format!("media_select(ctx, {n}, {m})"),
+        (0b011, 0b001) if op1 == 0b01011 => format!("__builtin_bswap32({m})"),
+        (0b011, 0b101) if op1 == 0b01011 => format!("((({m}) & 0x00FF00FFu) << 8) | ((({m}) & 0xFF00FF00u) >> 8)"),
+        (0b111, 0b001) if op1 == 0b01111 => format!("reverse_bits({m})"),
+        (0b111, 0b101) if op1 == 0b01111 => {
+            format!("(uint32_t)(int32_t)(int16_t)(((({m}) & 0xFF) << 8) | ((({m}) >> 8) & 0xFF))")
+        }
+        // ssat16 and usat16
+        (0b010 | 0b110, 0b001) => {
+            let bits = ((op >> 16) & 0xF) + !unsigned as u32;
+            format!("media_saturate16(ctx, {m}, {bits}, {})", unsigned as u8)
+        }
+        // ssat and usat, of a value shifted first
+        (_, o) if o & 1 == 0 && matches!((op1 >> 2) & 0b111, 0b010 | 0b011) => {
+            let bits = ((op >> 16) & 0x1F) + !unsigned as u32;
+            let shifted = if op & (1 << 6) != 0 {
+                format!("(int64_t)((int32_t){m} >> {})", if shift == 0 { 31 } else { shift })
+            } else {
+                format!("(int64_t)(int32_t)({m} << {shift})")
+            };
+            format!("media_saturate(ctx, {shifted}, {bits}, {})", unsigned as u8)
+        }
         _ => return interpret(out, scope, a, op),
     };
+    emit!(out, "    ctx->r[{rd}] = {value};");
+    true
+}
+
+/// smlad, smuad, smlsd, smusd, smlald, smlsld, smmul, smmla and smmls.
+fn dual_multiply(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32) -> bool {
+    let rd = (op >> 16) & 0xF;
+    let ra = (op >> 12) & 0xF;
+    if rd == 15 || (op1 == 0b10100 && ra == 15) {
+        return interpret(out, scope, a, op);
+    }
+    let m = reg(scope, op & 0xF, a + 8);
+    let s = reg(scope, (op >> 8) & 0xF, a + 8);
+    let bit5 = op & (1 << 5) != 0;
+    let subtract = op & (1 << 6) != 0;
+    match op1 {
+        0b10000 | 0b10100 => {
+            // bit 5 swaps the halves of the second operand
+            let b = if bit5 { format!("ror32({s}, 16)") } else { s };
+            let sign = if subtract { '-' } else { '+' };
+            let dual = format!(
+                "((int64_t)(int16_t){m} * (int16_t){b} {sign} (int64_t)(int16_t)({m} >> 16) * (int16_t)({b} >> 16))"
+            );
+            if op1 == 0b10000 {
+                let sum = if ra == 15 { dual } else { format!("{dual} + (int32_t)ctx->r[{ra}]") };
+                emit!(out, "    ctx->r[{rd}] = accumulate(ctx, {sum});");
+            } else {
+                emit!(
+                    out,
+                    "    {{ uint64_t r = ((uint64_t)ctx->r[{rd}] << 32 | ctx->r[{ra}]) + (uint64_t){dual}; ctx->r[{ra}] = (uint32_t)r; ctx->r[{rd}] = (uint32_t)(r >> 32); }}"
+                );
+            }
+        }
+        // the top of a full 64 bit product, bit 5 rounding it
+        0b10101 => {
+            let product = format!("(uint64_t)((int64_t)(int32_t){m} * (int32_t){s})");
+            let acc = if ra == 15 { "0".to_owned() } else { format!("((uint64_t)ctx->r[{ra}] << 32)") };
+            let sign = if subtract { '-' } else { '+' };
+            let round = if bit5 { " + 0x80000000u" } else { "" };
+            emit!(out, "    ctx->r[{rd}] = (uint32_t)(({acc} {sign} {product}{round}) >> 32);");
+        }
+        _ => return interpret(out, scope, a, op),
+    }
+    true
+}
+
+/// usad8 and usada8.
+fn usad8(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
+    let rd = (op >> 16) & 0xF;
+    let ra = (op >> 12) & 0xF;
+    if rd == 15 {
+        return interpret(out, scope, a, op);
+    }
+    let sum = format!("media_usad8({}, {})", reg(scope, op & 0xF, a + 8), reg(scope, (op >> 8) & 0xF, a + 8));
+    let value = if ra == 15 { sum } else { format!("{sum} + ctx->r[{ra}]") };
     emit!(out, "    ctx->r[{rd}] = {value};");
     true
 }

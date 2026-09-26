@@ -15,12 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "libc"
-version = "0.2.189"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -35,15 +29,6 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
-
-[[package]]
-name = "memmap2"
-version = "0.9.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "proc-macro2"
@@ -69,7 +54,6 @@ version = "0.1.0"
 dependencies = [
  "libloading",
  "zakuro-cpu",
- "zakuro-fs",
 ]
 
 [[package]]
@@ -118,6 +102,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "zakuro-common"
 version = "0.1.0"
+source = "git+https://github.com/fearkov/zakuro#3e853d5a091dab9b7bfb3b0f41e3457d42ff4bb6"
 dependencies = [
  "bitflags",
  "log",
@@ -127,17 +112,8 @@ dependencies = [
 [[package]]
 name = "zakuro-cpu"
 version = "0.1.0"
+source = "git+https://github.com/fearkov/zakuro#3e853d5a091dab9b7bfb3b0f41e3457d42ff4bb6"
 dependencies = [
  "log",
- "zakuro-common",
-]
-
-[[package]]
-name = "zakuro-fs"
-version = "0.1.0"
-dependencies = [
- "log",
- "memmap2",
- "thiserror",
  "zakuro-common",
 ]

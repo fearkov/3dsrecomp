@@ -1,9 +1,12 @@
-//! 3dsrecomp, a static recompiler for 3DS titles built on the Zakuro runtime.
+//! 3dsrecomp, a static recompiler for 3DS titles, whose code runs in any
+//! emulator that implements recomp.h, Zakuro being the one it was made for.
 //!
 //! analyze reports how much of a title's code a generic pass can discover
 //! on its own, build turns what it found into C and compiles it into a
-//! library the emulator can load.
+//! library the emulator can load, and verify, built with the verify
+//! feature, checks that library against Zakuro's interpreter.
 
+#[cfg(feature = "verify")]
 mod abi;
 mod arm;
 mod codegen;
@@ -11,23 +14,31 @@ mod compile;
 mod cro;
 mod discover;
 mod image;
+mod rom;
 mod thumb;
+#[cfg(feature = "verify")]
 mod verify;
 
 use std::path::Path;
 use std::process::exit;
 
 use discover::{Analysis, Byte, Mode, Program, Source};
-use zakuro_fs::Title;
-use zakuro_fs::romfs::{DirEntry, FileEntry, RomFs};
+use rom::{DirEntry, FileEntry, RomFs, Title};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["analyze", rom] => analyze(rom),
         ["build", rom, dir] => build(rom, Path::new(dir)),
+        #[cfg(feature = "verify")]
         ["verify", rom, library] => check(rom, Path::new(library), 500),
+        #[cfg(feature = "verify")]
         ["verify", rom, library, count] => check(rom, Path::new(library), count.parse().unwrap_or(500)),
+        #[cfg(not(feature = "verify"))]
+        ["verify", ..] => {
+            eprintln!("this build has no verify, build it with --features verify");
+            exit(2);
+        }
         _ => {
             eprintln!("usage, 3dsrecomp analyze <rom>, build <rom> <dir> or verify <rom> <library> [count]");
             exit(2);
@@ -110,6 +121,7 @@ fn build(path: &str, dir: &Path) {
 
 /// runs up to count of the recompiled functions of each program against
 /// the interpreter, the modules one at a time, each loaded at the same place.
+#[cfg(feature = "verify")]
 fn check(path: &str, library: &Path, count: usize) {
     let (title, programs) = load(path);
     let library = abi::Library::open(library).unwrap_or_else(|error| {
@@ -164,6 +176,7 @@ fn check(path: &str, library: &Path, count: usize) {
 
 /// up to count of the functions that became C, spread over the program, as
 /// addresses at base with bit 0 set for Thumb.
+#[cfg(feature = "verify")]
 fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
     let functions: Vec<u32> = analysis
         .functions
@@ -179,6 +192,7 @@ fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
     functions.into_iter().step_by(step).take(count).collect()
 }
 
+#[cfg(feature = "verify")]
 fn print_report(name: &str, report: &verify::Report) {
     println!(
         "{name:<11} {} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched",
@@ -303,7 +317,7 @@ impl Totals {
 fn static_module(title: &Title) -> Option<cro::Module> {
     let romfs = title.romfs.as_ref()?;
     let file = romfs.lookup("static.crs").ok()?;
-    cro::parse(title.read_romfs(&file, 0, file.data_size as usize)?)
+    cro::parse(&title.read_romfs(&file, 0, file.data_size as usize)?)
 }
 
 /// every CRO module in the RomFS with its file.
@@ -317,7 +331,7 @@ fn module_files(title: &Title) -> Vec<(cro::Module, Vec<u8>)> {
         .into_iter()
         .filter_map(|file| {
             let bytes = title.read_romfs(&file, 0, file.data_size as usize)?;
-            Some((cro::parse(bytes)?, bytes.to_vec()))
+            Some((cro::parse(&bytes)?, bytes))
         })
         .collect()
 }

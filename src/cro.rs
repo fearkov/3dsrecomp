@@ -111,6 +111,7 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
 
 /// the segment types holding code and holding zeros.
 const CODE: u32 = 0;
+#[cfg(feature = "verify")]
 const BSS: u32 = 3;
 
 impl Module {
@@ -139,6 +140,7 @@ impl Module {
     /// the module as it looks loaded at base, its bss after the file and
     /// its relocations applied, for running it without a loader. everything
     /// it imports points at stub.
+    #[cfg(feature = "verify")]
     pub fn image(&self, bytes: &[u8], base: u32, stub: u32) -> Vec<u8> {
         let bss = (bytes.len() as u32).next_multiple_of(0x1000);
         let bss_size: u32 = self.segments.iter().filter(|s| s.kind == BSS).map(|s| s.size).sum();

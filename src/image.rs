@@ -1,7 +1,7 @@
 //! the executable image of a title, split into its segments at the addresses
 //! the title expects to run at.
 
-use zakuro_fs::{FsError, Title};
+use crate::rom::{CodeSetInfo, Error, Title};
 
 use crate::discover::{Program, Source};
 
@@ -59,10 +59,10 @@ pub struct Image {
 impl Image {
     /// the segments sit one after another in the decompressed code, each
     /// padded to whole pages, the same way the loader maps them.
-    pub fn from_title(title: &Title) -> Result<Image, FsError> {
+    pub fn from_title(title: &Title) -> Result<Image, Error> {
         let code = title.code()?;
         let header = &title.exheader;
-        let segment = |info: zakuro_fs::CodeSetInfo, offset: usize| Segment {
+        let segment = |info: CodeSetInfo, offset: usize| Segment {
             base: info.address,
             bytes: code
                 .get(offset..offset + info.size as usize)

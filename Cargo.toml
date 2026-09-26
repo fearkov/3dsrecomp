@@ -9,10 +9,13 @@ description = "Static recompilation toolkit for the Nintendo 3DS"
 name = "3dsrecomp"
 path = "src/main.rs"
 
+[features]
+# checking recompiled code against Zakuro's interpreter, which it fetches
+verify = ["dep:zakuro-cpu", "dep:libloading"]
+
 [dependencies]
-libloading = "0.8"
-zakuro-cpu = { path = "../zakuro/crates/zakuro-cpu" }
-zakuro-fs = { path = "../zakuro/crates/zakuro-fs" }
+libloading = { version = "0.8", optional = true }
+zakuro-cpu = { git = "https://github.com/fearkov/zakuro", optional = true }
 
 [profile.release]
 debug = 1

@@ -17,7 +17,7 @@ use crate::discover::{Analysis, Function, Mode, Program};
 pub const HEADER: &str = include_str!("recomp.h");
 
 /// what the lowering of one instruction may refer to.
-pub struct Scope<'a> {
+pub(crate) struct Scope<'a> {
     /// the labels of the function being written.
     pub labels: &'a BTreeSet<u32>,
     /// the C function that runs each function, by entry with bit 0 set

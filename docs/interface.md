@@ -294,7 +294,8 @@ A working host also fills in the page tables, `vfp`, `fpscr`, `tls` and
 ## Reference hosts
 
 - [`src/abi.rs`](../src/abi.rs) is the interface in Rust. It loads the
-  library, does the lookups and places the modules.
+  library, does the lookups and places the modules. Other crates can use it
+  as `recomp3ds::abi` with the `host` feature.
 - [`src/verify.rs`](../src/verify.rs) is a complete host built on Zakuro's
   interpreter. It runs each recompiled function against the interpreter and
   compares the results (`--features verify`).

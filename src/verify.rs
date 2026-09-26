@@ -237,7 +237,7 @@ unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
         let step = if ctx.thumb != 0 { 2 } else { 4 };
         if exit.is_some() || ctx.r[15] != address.wrapping_add(step) {
             run.pending = exit;
-            ctx.exit = 3;
+            ctx.exit = abi::EXIT_UNWIND;
         }
     }
 }
@@ -305,7 +305,7 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context) -> Stop {
             }
             match (*(*run).library).lookup((*ctx).r[15] | (*ctx).thumb as u32) {
                 Some(code) => {
-                    (*ctx).exit = 0;
+                    (*ctx).exit = abi::EXIT_NONE;
                     (*ctx).depth = 0;
                     code(ctx);
                     if let Some(exit) = (*run).pending.take() {

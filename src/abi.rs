@@ -8,8 +8,10 @@ pub type Code = unsafe extern "C" fn(*mut Context);
 
 pub const ABI: u32 = 4;
 
+pub const EXIT_NONE: u32 = 0;
 pub const EXIT_SVC: u32 = 1;
 pub const EXIT_BUDGET: u32 = 2;
+pub const EXIT_UNWIND: u32 = 3;
 
 #[repr(C)]
 pub struct Host {

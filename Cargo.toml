@@ -10,8 +10,10 @@ name = "3dsrecomp"
 path = "src/main.rs"
 
 [features]
+# loading a recompiled library from Rust
+host = ["dep:libloading"]
 # checking recompiled code against Zakuro's interpreter, which it fetches
-verify = ["dep:zakuro-cpu", "dep:libloading"]
+verify = ["host", "dep:zakuro-cpu"]
 
 [dependencies]
 libloading = { version = "0.8", optional = true }

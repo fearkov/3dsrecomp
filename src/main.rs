@@ -242,12 +242,12 @@ fn analyze(path: &str) {
     let module_count = programs.len() - 1;
     let start = std::time::Instant::now();
     let mut analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
-    let (labels, functions) = build::apply_hints(&title, &mut programs, &mut analyses);
+    let functions = build::apply_hints(&title, &mut programs, &mut analyses);
     let elapsed = start.elapsed();
 
     println!("title       {}, {} modules", title.exheader.title, module_count);
-    if labels + functions > 0 {
-        println!("hints       {labels} ways into functions, {functions} new functions, from where Zakuro interpreted");
+    if functions > 0 {
+        println!("hints       {functions} new functions, from where Zakuro interpreted");
     }
     println!();
     println!("                  KiB  functions   code  literals  unreached  indirect  switches    svc  dead ends");

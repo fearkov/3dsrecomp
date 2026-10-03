@@ -70,11 +70,9 @@ pub fn generate(
     }
 
     let mut analyses: Vec<Analysis> = programs.iter().map(|(_, program)| discover::analyze(program)).collect();
-    let (labels, functions) = apply_hints(&title, &mut programs, &mut analyses);
-    if labels + functions > 0 {
-        events(Event::Note(format!(
-            "of the places Zakuro interpreted, {labels} become ways into functions and {functions} start new ones"
-        )));
+    let functions = apply_hints(&title, &mut programs, &mut analyses);
+    if functions > 0 {
+        events(Event::Note(format!("{functions} of the places Zakuro interpreted start new functions")));
     }
     for item in &replaced {
         let index = programs.iter().position(|(name, _)| Some(name.as_str()) == item.module.as_deref()).unwrap_or(0);
@@ -145,16 +143,19 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
 }
 
 /// takes in where the emulator had to interpret the title's last library,
-/// which only ever ran code. a place inside a function found already
-/// becomes a way into it, and the rest start functions, found by analyzing
-/// the executable again. says how many of each.
-pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: &mut [Analysis]) -> (usize, usize) {
-    let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return (0, 0) };
+/// which only ever ran code. the places outside the functions found already
+/// start functions, found by analyzing the executable again, and says how
+/// many. a place inside one adds nothing, discovery already makes a label of
+/// every way the code goes in, branch targets and the returns from calls and
+/// svcs, while Zakuro used to note where it finished a block the budget did
+/// not cover, which as labels split the hot loops into single instructions.
+pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: &mut [Analysis]) -> usize {
+    let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return 0 };
     let program = &mut programs[index].1;
     let text = program.text.base..program.text.end();
     let hinted: Vec<u32> = hints(title.program_id()).into_iter().filter(|&address| text.contains(&(address & !1))).collect();
     if hinted.is_empty() {
-        return (0, 0);
+        return 0;
     }
     let owners = |analysis: &Analysis| {
         let mut owners = std::collections::HashMap::new();
@@ -174,15 +175,7 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
         program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
     }
-    let owners = owners(&analyses[index]);
-    let mut labels = 0;
-    for address in hinted.iter().filter(|address| !outside.contains(address)) {
-        let Some(entry) = owners.get(address) else { continue };
-        if let Some(function) = analyses[index].functions.get_mut(entry) {
-            labels += function.labels.insert(address & !1) as usize;
-        }
-    }
-    (labels, outside.len())
+    outside.len()
 }
 
 /// the addresses Zakuro wrote down next to a title's library, those it ran

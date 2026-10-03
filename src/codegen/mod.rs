@@ -6,6 +6,7 @@
 //! out to the host, which picks up again from r15.
 
 mod arm;
+mod locals;
 mod thumb;
 mod vfp;
 
@@ -74,13 +75,52 @@ fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) ->
     true
 }
 
+/// the words a load or store multiple moves, from p up, a destination for
+/// each when loading and a value for each when storing, both as C. they
+/// nearly always lie on one page the code reaches directly, which one
+/// check covers, and otherwise go through the usual path one at a time.
+fn words(out: &mut String, load: bool, words: &[String]) {
+    let bytes = words.len() * 4;
+    if let [word] = words {
+        // nothing to share
+        if load {
+            emit!(out, "    {word} = mem_read32(ctx, p);");
+        } else {
+            emit!(out, "    mem_write32(ctx, p, {word});");
+        }
+        return;
+    }
+    if load {
+        emit!(out, "    {{ const uint8_t *span = mem_read_span(ctx, p, {bytes}u);");
+        emit!(out, "    if (LIKELY(span)) {{");
+        for (i, destination) in words.iter().enumerate() {
+            emit!(out, "    {destination} = load32(span + {});", i * 4);
+        }
+        emit!(out, "    }} else {{");
+        for (i, destination) in words.iter().enumerate() {
+            emit!(out, "    {destination} = mem_read32(ctx, p + {}u);", i * 4);
+        }
+    } else {
+        emit!(out, "    {{ uint8_t *span = mem_write_span(ctx, p, {bytes}u);");
+        emit!(out, "    if (LIKELY(span)) {{");
+        for (i, value) in words.iter().enumerate() {
+            emit!(out, "    store32(span + {}, {value});", i * 4);
+        }
+        emit!(out, "    }} else {{");
+        for (i, value) in words.iter().enumerate() {
+            emit!(out, "    mem_write32(ctx, p + {}u, {value});", i * 4);
+        }
+    }
+    emit!(out, "    }} }}");
+}
+
 /// a branch without link, to a label of this function if it is one.
 fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
     if scope.labels.contains(&target) {
         emit!(out, "    goto L_{target:08X};");
     } else if let Some(name) = scope.function(target, thumb) {
         // a tail call
-        emit!(out, "    ctx->r[15] = {}; CALL({name}); return;", scope.at(target));
+        emit!(out, "    ctx->r[15] = {}; CALL({name}); RETURN();", scope.at(target));
     } else {
         emit!(out, "    target = {}; goto dispatch;", scope.at(target));
     }
@@ -303,12 +343,23 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
 
 fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
     let thumb = function.mode == Mode::Thumb;
-    let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
     emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
+    let mut body = String::new();
+    write_body(&mut body, program, scope, entry, function);
+    out.push_str(&locals::keep(&body));
+    emit!(out, "}}");
+    out.push_str(locals::RESET);
+    out.push('\n');
+}
+
+/// what a function does, between its braces.
+fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
+    let thumb = function.mode == Mode::Thumb;
+    let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
     if scope.relative {
         emit!(out, "    const uint32_t module_base = {}base;", scope.prefix);
     }
-    emit!(out, "    uint32_t target = ctx->r[15];");
+    emit!(out, "    uint32_t target = ctx->r[15], resume = 0;");
     emit!(out, "    if (LIKELY(target == {} && {state})) goto L_{entry:08X};", scope.at(entry));
     emit!(out, "dispatch:");
     let offset = if scope.relative { "target - module_base" } else { "target" };
@@ -320,14 +371,14 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
     // somewhere else, the host knows where
     emit!(out, "    ctx->r[15] = target;");
     emit!(out, "    CALL(recomp_call);");
-    emit!(out, "    return;");
+    emit!(out, "    RETURN();");
 
     let instructions = &function.instructions;
     for (i, &address) in instructions.iter().enumerate() {
         if function.labels.contains(&address) {
             let run = instructions[i + 1..].iter().take_while(|a| !function.labels.contains(a)).count() + 1;
             emit!(out, "L_{address:08X}:");
-            emit!(out, "    BUDGET({}, {run});", scope.at(address));
+            emit!(out, "    BLOCK({}, {run});", scope.at(address));
         }
         let (continues, size) = if thumb {
             let op = program.text.read16(address).unwrap_or(0) as u32;
@@ -345,7 +396,7 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
             emit!(out, "    target = {}; goto dispatch;", scope.at(next));
         }
     }
-    emit!(out, "}}\n");
+    emit!(out, "    OUT_OF_BUDGET();");
 }
 
 #[cfg(test)]
@@ -356,10 +407,8 @@ mod tests {
 
     const BASE: u32 = 0x0010_0000;
 
-    /// the files for a function that calls another, the callee replaced.
-    fn generated(overrides: &[Override]) -> BTreeMap<String, String> {
-        // bl BASE + 8, bx lr, bx lr
-        let words = [0xEB00_0000u32, 0xE12F_FF1E, 0xE12F_FF1E];
+    /// the files for ARM code at BASE, entered at its start.
+    fn files(words: &[u32], overrides: &[Override]) -> BTreeMap<String, String> {
         let program = Program {
             text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
             seeds: vec![(BASE, Source::Entry)],
@@ -368,6 +417,76 @@ mod tests {
         let analysis = discover::analyze(&program);
         let units = [Unit { module: None, program: &program, analysis: &analysis }];
         generate(&units, overrides).into_iter().collect()
+    }
+
+    /// the files for a function that calls another, the callee replaced.
+    fn generated(overrides: &[Override]) -> BTreeMap<String, String> {
+        // bl BASE + 8, bx lr, bx lr
+        files(&[0xEB00_0000, 0xE12F_FF1E, 0xE12F_FF1E], overrides)
+    }
+
+    #[test]
+    fn multiple_transfers_check_one_page_for_all_their_words() {
+        // push {r4, r5, lr}, vpush {d8}, vpop {d8}, pop {r4, r5, pc}
+        let files = files(&[0xE92D_4030, 0xED2D_8B02, 0xECBD_8B02, 0xE8BD_8030], &[]);
+        let code = &files["code000.c"];
+        assert!(code.contains("mem_write_span(ctx, p, 12u)"));
+        assert!(code.contains("store32(span + 8, reg14_);"));
+        assert!(code.contains("mem_write_span(ctx, p, 8u)"));
+        assert!(code.contains("mem_read_span(ctx, p, 12u)"));
+        assert!(code.contains("next = load32(span + 8);"));
+        assert!(code.contains("RETURN_TO(next);"));
+
+        compiles("transfers", &files, &["code000.c"]);
+    }
+
+    /// compiles sources among files, in a folder of their own named after
+    /// test, panicking with the compiler's complaint when they do not.
+    fn compiles(test: &str, files: &BTreeMap<String, String>, sources: &[&str]) {
+        let dir = std::env::temp_dir().join(format!("3dsrecomp-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+        let built = crate::compile::objects(&dir, &sources, &|_, _| true);
+        std::fs::remove_dir_all(&dir).ok();
+        built.unwrap();
+    }
+
+    #[test]
+    fn overrides_written_as_the_docs_show_compile() {
+        let replaced = Override {
+            module: None,
+            address: BASE + 8,
+            name: "override_0x00100008".to_owned(),
+            original: "original_0x00100008".to_owned(),
+        };
+        let mut files = generated(std::slice::from_ref(&replaced));
+        files.insert(
+            "override.c".to_owned(),
+            r#"#include "overrides.h"
+
+RECOMP_OVERRIDE(0x00100008) {
+    uint32_t start = ctx->r[0], end = start;
+    BUDGET(0x00100008u, 4);
+    while (mem_read8(ctx, end))
+        end++;
+    mem_write32(ctx, ctx->r[1], mem_read32(ctx, ctx->r[2]));
+    vfp_set_s(ctx, 0, vfp_s(ctx, 1) * 2.0f);
+    vfp_set_d(ctx, 1, vfp_d(ctx, 2) + 1.0);
+    vfp_compare(ctx, vfp_d(ctx, 1), 0.0);
+    ctx->r[0] = end - start;
+    if (ctx->r[0] == 0) {
+        CALL(RECOMP_ORIGINAL(0x00100008));
+        return;
+    }
+    RETURN_TO(ctx->r[14]);
+}
+"#
+            .to_owned(),
+        );
+        compiles("overrides", &files, &["code000.c", "override.c"]);
     }
 
     #[test]

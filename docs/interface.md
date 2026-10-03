@@ -127,10 +127,13 @@ context. The context does not need to live between two runs.
 `vfp` and `fpscr` are pointers so that the code and an interpreter can work on
 the same registers without copying them back and forth.
 
-`r[15]` is only kept up to date at the points where the code hands control
-back: when it returns, and when it calls `lookup`. It is not current inside
-the memory callbacks. The `interpret` callback receives the address it needs
-as an argument.
+The code keeps the registers, the flags, the VFP registers, `fpscr` and the
+budget in locals while it runs, and puts them back in the context wherever
+something else can look at them: when it returns, and before it calls
+`lookup`, `interpret` or another function. Inside the memory callbacks they
+are not current, only the arguments, `host`, `user` and the page tables are.
+`r[15]` is set when the code returns and before it calls `lookup`. The
+`interpret` callback receives the address it needs as an argument.
 
 ## Memory
 

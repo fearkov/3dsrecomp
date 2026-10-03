@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use super::Scope;
+use super::{Scope, words};
 
 macro_rules! emit {
     ($out:expr, $($arg:tt)*) => {
@@ -235,23 +235,12 @@ pub fn load_store(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         (false, _) => format!("base - 0x{offset:X}u"),
     };
     emit!(out, "    {{ uint32_t base = {base}, p = {start};");
-    for i in 0..count.max(1) {
-        let words: Vec<u32> = if double {
-            let index = first + i;
-            vec![(index * 2) & 31, (index * 2 + 1) & 31]
-        } else {
-            vec![(first + i) & 31]
-        };
-        for (j, word) in words.into_iter().enumerate() {
-            let address = if j == 0 { "p".to_owned() } else { "p + 4".to_owned() };
-            if load {
-                emit!(out, "    ctx->vfp[{word}] = mem_read32(ctx, {address});");
-            } else {
-                emit!(out, "    mem_write32(ctx, {address}, ctx->vfp[{word}]);");
-            }
-        }
-        emit!(out, "    p += {};", if double { 8 } else { 4 });
-    }
+    // a double is two words, the singles at 2N and 2N + 1
+    let registers: Vec<String> = (0..count.max(1))
+        .flat_map(|i| if double { vec![(first + i) * 2, (first + i) * 2 + 1] } else { vec![first + i] })
+        .map(|word| format!("ctx->vfp[{}]", word & 31))
+        .collect();
+    words(out, load, &registers);
     if writeback {
         let sign = if up { '+' } else { '-' };
         emit!(out, "    ctx->r[{rn}] = base {sign} 0x{offset:X}u;");

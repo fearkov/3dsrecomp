@@ -85,15 +85,25 @@ typedef struct Module {
 #endif
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+/* the helpers every load, store and VFP register access goes through,
+   inlined even where a big generated function makes the compiler give up on
+   inlining, a call per access costs as much as the access itself */
+#define ALWAYS_INLINE inline __attribute__((always_inline))
 
-static inline uint8_t mem_read8(Context *ctx, uint32_t address) {
-    uint8_t *page = ctx->read_pages[address >> 12];
+/* the page tables loads and stores go through. a generated function keeps
+   them in locals, which a store to guest memory, through a byte pointer
+   that could point anywhere, does not make the compiler read again. */
+#define READ_PAGES(c) ((c)->read_pages)
+#define WRITE_PAGES(c) ((c)->write_pages)
+
+static ALWAYS_INLINE uint8_t mem_read8_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
+    uint8_t *page = pages[address >> 12];
     if (LIKELY(page)) return page[address & 0xFFF];
     return ctx->host->read8(ctx, address);
 }
 
-static inline uint16_t mem_read16(Context *ctx, uint32_t address) {
-    uint8_t *page = ctx->read_pages[address >> 12];
+static ALWAYS_INLINE uint16_t mem_read16_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
+    uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
     if (LIKELY(page && offset <= 0xFFE)) {
         uint16_t value;
@@ -103,8 +113,8 @@ static inline uint16_t mem_read16(Context *ctx, uint32_t address) {
     return ctx->host->read16(ctx, address);
 }
 
-static inline uint32_t mem_read32(Context *ctx, uint32_t address) {
-    uint8_t *page = ctx->read_pages[address >> 12];
+static ALWAYS_INLINE uint32_t mem_read32_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
+    uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
     if (LIKELY(page && offset <= 0xFFC)) {
         uint32_t value;
@@ -114,24 +124,51 @@ static inline uint32_t mem_read32(Context *ctx, uint32_t address) {
     return ctx->host->read32(ctx, address);
 }
 
-static inline void mem_write8(Context *ctx, uint32_t address, uint8_t value) {
-    uint8_t *page = ctx->write_pages[address >> 12];
+static ALWAYS_INLINE void mem_write8_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint8_t value) {
+    uint8_t *page = pages[address >> 12];
     if (LIKELY(page)) page[address & 0xFFF] = value;
     else ctx->host->write8(ctx, address, value);
 }
 
-static inline void mem_write16(Context *ctx, uint32_t address, uint16_t value) {
-    uint8_t *page = ctx->write_pages[address >> 12];
+static ALWAYS_INLINE void mem_write16_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint16_t value) {
+    uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
     if (LIKELY(page && offset <= 0xFFE)) memcpy(page + offset, &value, 2);
     else ctx->host->write16(ctx, address, value);
 }
 
-static inline void mem_write32(Context *ctx, uint32_t address, uint32_t value) {
-    uint8_t *page = ctx->write_pages[address >> 12];
+static ALWAYS_INLINE void mem_write32_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint32_t value) {
+    uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
     if (LIKELY(page && offset <= 0xFFC)) memcpy(page + offset, &value, 4);
     else ctx->host->write32(ctx, address, value);
+}
+
+/* where the bytes from address are, when they all lie on one page the code
+   reaches directly, or null, for loads and stores of several words. */
+static ALWAYS_INLINE uint8_t *mem_span_in(uint8_t *const *pages, uint32_t address, uint32_t bytes) {
+    uint8_t *page = pages[address >> 12];
+    uint32_t offset = address & 0xFFF;
+    return LIKELY(page && offset <= 0x1000 - bytes) ? page + offset : 0;
+}
+
+#define mem_read8(c, address) mem_read8_in((c), READ_PAGES(c), (address))
+#define mem_read16(c, address) mem_read16_in((c), READ_PAGES(c), (address))
+#define mem_read32(c, address) mem_read32_in((c), READ_PAGES(c), (address))
+#define mem_write8(c, address, value) mem_write8_in((c), WRITE_PAGES(c), (address), (value))
+#define mem_write16(c, address, value) mem_write16_in((c), WRITE_PAGES(c), (address), (value))
+#define mem_write32(c, address, value) mem_write32_in((c), WRITE_PAGES(c), (address), (value))
+#define mem_read_span(c, address, bytes) ((const uint8_t *)mem_span_in(READ_PAGES(c), (address), (bytes)))
+#define mem_write_span(c, address, bytes) mem_span_in(WRITE_PAGES(c), (address), (bytes))
+
+static ALWAYS_INLINE uint32_t load32(const uint8_t *at) {
+    uint32_t value;
+    memcpy(&value, at, 4);
+    return value;
+}
+
+static ALWAYS_INLINE void store32(uint8_t *at, uint32_t value) {
+    memcpy(at, &value, 4);
 }
 
 #define C_EQ (ctx->z)
@@ -321,41 +358,76 @@ static inline uint32_t shift_ror(uint32_t value, uint32_t amount, uint8_t *carry
 /* the short vector length, zero when an instruction works on one register. */
 #define FPSCR_LEN (7u << 16)
 
-static inline float vfp_s(Context *ctx, int r) {
+/* fpscr, which a generated function keeps in a local, along with the VFP
+   registers it uses. */
+#define FPSCR(c) (*(c)->fpscr)
+
+/* the bits of a single, and of a double held in two singles, as numbers. */
+static ALWAYS_INLINE float vfp_from_s(uint32_t bits) {
     float value;
-    memcpy(&value, &ctx->vfp[r], 4);
+    memcpy(&value, &bits, 4);
     return value;
 }
 
-static inline double vfp_d(Context *ctx, int d) {
-    uint64_t bits = ctx->vfp[2 * d] | (uint64_t)ctx->vfp[2 * d + 1] << 32;
+static ALWAYS_INLINE double vfp_from_d(uint32_t low, uint32_t high) {
+    uint64_t bits = low | (uint64_t)high << 32;
     double value;
     memcpy(&value, &bits, 8);
     return value;
 }
 
-/* stores a result, flushing a subnormal to zero when the guest asked. */
-static inline void vfp_set_s(Context *ctx, int r, float value) {
+/* a result's bits, a subnormal flushed to zero when the guest asked. a
+   zero keeps its sign either way, so the exponent alone decides. */
+static ALWAYS_INLINE uint32_t vfp_to_s_in(uint32_t fpscr, float value) {
     uint32_t bits;
     memcpy(&bits, &value, 4);
-    if ((*ctx->fpscr & FPSCR_FZ) && !(bits & 0x7F800000u) && (bits & 0x007FFFFFu)) bits &= 0x80000000u;
-    ctx->vfp[r] = bits;
+    if ((fpscr & FPSCR_FZ) && !(bits & 0x7F800000u)) bits &= 0x80000000u;
+    return bits;
 }
 
-static inline void vfp_set_d(Context *ctx, int d, double value) {
+static ALWAYS_INLINE uint64_t vfp_to_d_in(uint32_t fpscr, double value) {
     uint64_t bits;
     memcpy(&bits, &value, 8);
-    if ((*ctx->fpscr & FPSCR_FZ) && !(bits & 0x7FF0000000000000ull) && (bits & 0x000FFFFFFFFFFFFFull))
-        bits &= 0x8000000000000000ull;
+    if ((fpscr & FPSCR_FZ) && !(bits & 0x7FF0000000000000ull)) bits &= 0x8000000000000000ull;
+    return bits;
+}
+
+#define vfp_to_s(c, value) vfp_to_s_in(FPSCR(c), (value))
+#define vfp_to_d(c, value) vfp_to_d_in(FPSCR(c), (value))
+
+/* a double's result into the two singles that hold it. */
+#define VFP_SET_D(low, high, value) do { \
+    uint64_t bits_ = vfp_to_d(ctx, (value)); \
+    low = (uint32_t)bits_; \
+    high = (uint32_t)(bits_ >> 32); \
+} while (0)
+
+/* the registers in the context, for code written by hand. */
+static ALWAYS_INLINE float vfp_s(Context *ctx, int r) {
+    return vfp_from_s(ctx->vfp[r]);
+}
+
+static ALWAYS_INLINE double vfp_d(Context *ctx, int d) {
+    return vfp_from_d(ctx->vfp[2 * d], ctx->vfp[2 * d + 1]);
+}
+
+static ALWAYS_INLINE void vfp_set_s(Context *ctx, int r, float value) {
+    ctx->vfp[r] = vfp_to_s_in(*ctx->fpscr, value);
+}
+
+static ALWAYS_INLINE void vfp_set_d(Context *ctx, int d, double value) {
+    uint64_t bits = vfp_to_d_in(*ctx->fpscr, value);
     ctx->vfp[2 * d] = (uint32_t)bits;
     ctx->vfp[2 * d + 1] = (uint32_t)(bits >> 32);
 }
 
-/* the comparison result in fpscr's top bits, the nzcv encoding. */
-static inline void vfp_compare(Context *ctx, double a, double b) {
+/* fpscr with the comparison result in its top bits, the nzcv encoding. */
+static inline uint32_t vfp_compared(uint32_t fpscr, double a, double b) {
     uint32_t flags = (a != a || b != b) ? 0x3 : a == b ? 0x6 : a < b ? 0x8 : 0x2;
-    *ctx->fpscr = (*ctx->fpscr & 0x0FFFFFFFu) | flags << 28;
+    return (fpscr & 0x0FFFFFFFu) | flags << 28;
 }
+
+#define vfp_compare(c, a, b) (FPSCR(c) = vfp_compared(FPSCR(c), (a), (b)))
 
 /* conversions to integers, rounding toward zero and saturating. */
 static inline uint32_t vfp_to_s32(double value) {
@@ -442,12 +514,28 @@ static void vfp_vector(Context *ctx, int op, int wide, int d, int n, int m) {
 
 #define RECOMP_DEPTH_LIMIT 2048
 
+/* a generated function keeps the registers and flags it uses in locals,
+   which the compiler can hold in host registers. SYNC_OUT puts them back in
+   the context before anything else can look at it, and SYNC_IN takes them
+   again after. each function defines both for what it uses, these are for
+   everything else, overrides included. */
+#define SYNC_OUT() do { } while (0)
+#define SYNC_IN() do { } while (0)
+
+/* leaving the function, with the registers where the caller finds them. */
+#define RETURN() do { SYNC_OUT(); return; } while (0)
+
+/* a short vector works on the VFP registers in the context. */
+#define VFP_VECTOR(c, ...) do { SYNC_OUT(); vfp_vector((c), __VA_ARGS__); SYNC_IN(); } while (0)
+
 /* a guest call, leaving the caller too when the host has to take over. */
 #define CALL(code) do { \
+    SYNC_OUT(); \
     if (UNLIKELY(++ctx->depth > RECOMP_DEPTH_LIMIT)) { ctx->depth--; ctx->exit = EXIT_UNWIND; return; } \
     code(ctx); \
     ctx->depth--; \
     if (UNLIKELY(ctx->exit)) return; \
+    SYNC_IN(); \
 } while (0)
 
 /* runs whatever code the host has for r15. */
@@ -468,28 +556,72 @@ static inline void recomp_call(Context *ctx) {
 /* a return that may switch to Thumb. */
 #define RETURN_TO(value) do { \
     uint32_t v_ = (value); \
+    SYNC_OUT(); \
     ctx->thumb = v_ & 1; \
     ctx->r[15] = v_ & (ctx->thumb ? ~1u : ~3u); \
     return; \
 } while (0)
 
-/* a jump that may switch to Thumb. */
+/* a jump that may switch to Thumb. dispatch can lead anywhere, so the
+   context is complete first. */
 #define JUMP_TO(value) do { \
     uint32_t v_ = (value); \
+    SYNC_OUT(); \
     ctx->thumb = v_ & 1; \
     target = v_ & (ctx->thumb ? ~1u : ~3u); \
     goto dispatch; \
 } while (0)
 
+/* what BUDGET counts down, which a generated function keeps in a local
+   with the registers. */
+#define BUDGET_LEFT ctx->budget
+
+/* charges count instructions to the budget, and when they do not fit,
+   leaves for the host to come back at address. code written by hand can use
+   it as it is. */
 #define BUDGET(address, count) \
-    if (UNLIKELY((ctx->budget -= (count)) < 0)) { \
-        ctx->budget += (count); \
+    if (UNLIKELY((BUDGET_LEFT -= (count)) < 0)) { \
+        BUDGET_LEFT += (count); \
+        SYNC_OUT(); \
         ctx->r[15] = (address); \
         ctx->exit = EXIT_BUDGET; \
         return; \
     }
 
+/* the same at the start of each block of generated code, where the blocks
+   that stop share one way out at the end of the function, OUT_OF_BUDGET,
+   with resume where to go on from. the blocks that start with the context
+   complete share OUT_OF_BUDGET_CLEAN, which stores no register. */
+#define BLOCK(address, count) \
+    if (UNLIKELY((BUDGET_LEFT -= (count)) < 0)) { \
+        BUDGET_LEFT += (count); \
+        resume = (address); \
+        goto out_of_budget; \
+    }
+
+#define BLOCK_CLEAN(address, count) \
+    if (UNLIKELY((BUDGET_LEFT -= (count)) < 0)) { \
+        BUDGET_LEFT += (count); \
+        resume = (address); \
+        goto out_of_budget_clean; \
+    }
+
+#define OUT_OF_BUDGET() \
+    out_of_budget: \
+    SYNC_OUT(); \
+    ctx->r[15] = resume; \
+    ctx->exit = EXIT_BUDGET; \
+    return
+
+#define OUT_OF_BUDGET_CLEAN() \
+    out_of_budget_clean: \
+    SYNC_OUT(); \
+    ctx->r[15] = resume; \
+    ctx->exit = EXIT_BUDGET; \
+    return
+
 #define SVC(next, number) do { \
+    SYNC_OUT(); \
     ctx->r[15] = (next); \
     ctx->svc = (number); \
     ctx->exit = EXIT_SVC; \
@@ -497,8 +629,10 @@ static inline void recomp_call(Context *ctx) {
 } while (0)
 
 #define INTERPRET(address, opcode) do { \
+    SYNC_OUT(); \
     ctx->host->interpret(ctx, (address), (opcode)); \
     if (UNLIKELY(ctx->exit)) return; \
+    SYNC_IN(); \
 } while (0)
 
 /* a function written by hand to run instead of the one at address, odd for

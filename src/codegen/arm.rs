@@ -4,7 +4,7 @@
 
 use std::fmt::Write;
 
-use super::{Scope, call, jump, vfp};
+use super::{Scope, call, jump, vfp, words};
 
 macro_rules! emit {
     ($out:expr, $($arg:tt)*) => {
@@ -255,7 +255,7 @@ fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     } else if rd == 15 {
         // mov pc, lr returns, any other write to pc jumps
         if opcode == 13 && op & 0x0200_0FFF == 14 {
-            emit!(out, "    ctx->r[15] = r & ~3u; return;");
+            emit!(out, "    ctx->r[15] = r & ~3u; RETURN();");
         } else {
             emit!(out, "    target = r & ~3u; goto dispatch;");
         }
@@ -399,26 +399,32 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         if writeback && list & (1 << rn) == 0 {
             emit!(out, "    ctx->r[{rn}] = fin;");
         }
-        for &register in &registers {
-            if register == 15 {
-                let jump = if rn == 13 { "RETURN_TO" } else { "JUMP_TO" };
-                emit!(out, "    {jump}(mem_read32(ctx, p)); }}");
-                return false;
-            }
-            emit!(out, "    ctx->r[{register}] = mem_read32(ctx, p); p += 4;");
+        // r15 comes last, and where it leads is taken once the rest is in
+        let destinations: Vec<String> =
+            registers.iter().map(|&r| if r == 15 { "next".to_owned() } else { format!("ctx->r[{r}]") }).collect();
+        if list & (1 << 15) != 0 {
+            emit!(out, "    uint32_t next;");
+            words(out, true, &destinations);
+            let jump = if rn == 13 { "RETURN_TO" } else { "JUMP_TO" };
+            emit!(out, "    {jump}(next); }}");
+            return false;
         }
+        words(out, true, &destinations);
     } else {
-        for &register in &registers {
-            let value = if register == 15 {
-                scope.at(a + 12)
-            } else if register == rn && writeback && list & ((1 << rn) - 1) != 0 {
-                // the base when it is not the lowest register stores its new value
-                "fin".to_owned()
-            } else {
-                format!("ctx->r[{register}]")
-            };
-            emit!(out, "    mem_write32(ctx, p, {value}); p += 4;");
-        }
+        let values: Vec<String> = registers
+            .iter()
+            .map(|&register| {
+                if register == 15 {
+                    scope.at(a + 12)
+                } else if register == rn && writeback && list & ((1 << rn) - 1) != 0 {
+                    // the base when it is not the lowest register stores its new value
+                    "fin".to_owned()
+                } else {
+                    format!("ctx->r[{register}]")
+                }
+            })
+            .collect();
+        words(out, false, &values);
         if writeback {
             emit!(out, "    ctx->r[{rn}] = fin;");
         }

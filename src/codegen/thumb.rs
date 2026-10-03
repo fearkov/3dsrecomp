@@ -3,7 +3,7 @@
 
 use std::fmt::Write;
 
-use super::{Scope, call, jump};
+use super::{Scope, call, jump, words};
 
 macro_rules! emit {
     ($out:expr, $($arg:tt)*) => {
@@ -195,7 +195,7 @@ fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             true
         }
         2 if rd == 15 && rs == 14 => {
-            emit!(out, "    ctx->r[15] = ctx->r[14] & ~1u; return;");
+            emit!(out, "    ctx->r[15] = ctx->r[14] & ~1u; RETURN();");
             false
         }
         2 if rd == 15 => {
@@ -301,26 +301,27 @@ fn push_pop(out: &mut String, op: u32) -> bool {
     let list = op & 0xFF;
     let extra = op & (1 << 8) != 0;
     let count = list.count_ones() + extra as u32;
-    let registers: Vec<u32> = (0..8).filter(|i| list & (1 << i) != 0).collect();
+    let mut registers: Vec<String> = (0..8).filter(|i| list & (1 << i) != 0).map(|r| format!("ctx->r[{r}]")).collect();
     if op & (1 << 11) != 0 {
         emit!(out, "    {{ uint32_t p = ctx->r[13];");
-        for register in registers {
-            emit!(out, "    ctx->r[{register}] = mem_read32(ctx, p); p += 4;");
+        if extra {
+            // where pc leads is taken once the rest is in
+            emit!(out, "    uint32_t next;");
+            registers.push("next".to_owned());
         }
+        words(out, true, &registers);
         emit!(out, "    ctx->r[13] += {}u;", count * 4);
         if extra {
-            emit!(out, "    RETURN_TO(mem_read32(ctx, p)); }}");
+            emit!(out, "    RETURN_TO(next); }}");
             return false;
         }
         emit!(out, "    (void)p; }}");
     } else {
         emit!(out, "    {{ uint32_t start = ctx->r[13] - {}u, p = start;", count * 4);
-        for register in registers {
-            emit!(out, "    mem_write32(ctx, p, ctx->r[{register}]); p += 4;");
-        }
         if extra {
-            emit!(out, "    mem_write32(ctx, p, ctx->r[14]);");
+            registers.push("ctx->r[14]".to_owned());
         }
+        words(out, false, &registers);
         emit!(out, "    ctx->r[13] = start; (void)p; }}");
     }
     true
@@ -336,13 +337,8 @@ fn block_transfer(out: &mut String, op: u32) -> bool {
     }
     let load = op & (1 << 11) != 0;
     emit!(out, "    {{ uint32_t p = ctx->r[{rb}], fin = p + {}u;", list.count_ones() * 4);
-    for register in (0..8).filter(|i| list & (1 << i) != 0) {
-        if load {
-            emit!(out, "    ctx->r[{register}] = mem_read32(ctx, p); p += 4;");
-        } else {
-            emit!(out, "    mem_write32(ctx, p, ctx->r[{register}]); p += 4;");
-        }
-    }
+    let registers: Vec<String> = (0..8).filter(|i| list & (1 << i) != 0).map(|r| format!("ctx->r[{r}]")).collect();
+    words(out, load, &registers);
     if !(load && list & (1 << rb) != 0) {
         emit!(out, "    ctx->r[{rb}] = fin;");
     }

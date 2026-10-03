@@ -130,6 +130,10 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
 /// instructions per source file, so the files compile in parallel.
 const FILE_SIZE: usize = 20_000;
 
+/// the instructions up to which a function another one holds is still
+/// written as a function of its own.
+const OWN_FUNCTION: usize = 128;
+
 /// whether a function becomes C, which it does unless its entry turned
 /// out not to be code.
 pub fn recompiles(entry: u32, function: &Function) -> bool {
@@ -210,7 +214,13 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let header = format!("{}functions.h", prefix);
         let mut functions: BTreeMap<u32, &Function> =
             unit.analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&e, f)| (e, f)).collect();
-        let containers = containers(&functions);
+        // a small function another one holds still gets a C function of its
+        // own, so that calls to it skip the bigger one's way in, its loads
+        // and its dispatch
+        let containers: BTreeMap<u32, u32> = containers(&functions)
+            .into_iter()
+            .filter(|(entry, _)| functions[entry].instructions.len() > OWN_FUNCTION)
+            .collect();
         let mut names: BTreeMap<u32, String> = functions
             .iter()
             .map(|(&entry, f)| {
@@ -360,7 +370,9 @@ fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, fu
         emit!(out, "    const uint32_t module_base = {}base;", scope.prefix);
     }
     emit!(out, "    uint32_t target = ctx->r[15], resume = 0;");
-    emit!(out, "    if (LIKELY(target == {} && {state})) goto L_{entry:08X};", scope.at(entry));
+    // a function is only ever entered in its own state, callers and the
+    // host's lookups see to that, so the entry needs no look at thumb
+    emit!(out, "    if (LIKELY(target == {})) goto L_{entry:08X};", scope.at(entry));
     emit!(out, "dispatch:");
     let offset = if scope.relative { "target - module_base" } else { "target" };
     emit!(out, "    if ({state}) switch ({offset}) {{");
@@ -435,7 +447,7 @@ mod tests {
         assert!(code.contains("mem_write_span(ctx, p, 8u)"));
         assert!(code.contains("mem_read_span(ctx, p, 12u)"));
         assert!(code.contains("next = load32(span + 8);"));
-        assert!(code.contains("RETURN_TO(next);"));
+        assert!(code.contains("RETURN_TO_A(next);"));
 
         compiles("transfers", &files, &["code000.c"]);
     }

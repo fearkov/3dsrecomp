@@ -218,7 +218,7 @@ fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             true
         }
         _ if rs == 14 => {
-            emit!(out, "    RETURN_TO(ctx->r[14]);");
+            emit!(out, "    RETURN_TO_T(ctx->r[14]);");
             false
         }
         _ => {
@@ -312,7 +312,7 @@ fn push_pop(out: &mut String, op: u32) -> bool {
         words(out, true, &registers);
         emit!(out, "    ctx->r[13] += {}u;", count * 4);
         if extra {
-            emit!(out, "    RETURN_TO(next); }}");
+            emit!(out, "    RETURN_TO_T(next); }}");
             return false;
         }
         emit!(out, "    (void)p; }}");

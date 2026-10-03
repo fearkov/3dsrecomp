@@ -149,7 +149,11 @@ static ALWAYS_INLINE void mem_write32_in(Context *ctx, uint8_t *const *pages, ui
 static ALWAYS_INLINE uint8_t *mem_span_in(uint8_t *const *pages, uint32_t address, uint32_t bytes) {
     uint8_t *page = pages[address >> 12];
     uint32_t offset = address & 0xFFF;
-    return LIKELY(page && offset <= 0x1000 - bytes) ? page + offset : 0;
+    /* two tests rather than one with &&, which gcc and clang turn into a
+       setcc and a test in big functions */
+    if (UNLIKELY(offset > 0x1000 - bytes)) return 0;
+    if (UNLIKELY(!page)) return 0;
+    return page + offset;
 }
 
 #define mem_read8(c, address) mem_read8_in((c), READ_PAGES(c), (address))
@@ -378,6 +382,33 @@ static ALWAYS_INLINE double vfp_from_d(uint32_t low, uint32_t high) {
 
 /* a result's bits, a subnormal flushed to zero when the guest asked. a
    zero keeps its sign either way, so the exponent alone decides. */
+#if defined(__GNUC__) && !defined(__clang__)
+/* gcc turns a flush written inline into conditional moves on an integer
+   copy of every result, which keeps the results out of the float registers.
+   out of line it stays a branch, taken only for a zero or a subnormal. clang
+   does better with the plain form. */
+static __attribute__((noinline, cold)) uint32_t vfp_flushed_s(uint32_t bits) {
+    return bits & 0x80000000u;
+}
+
+static __attribute__((noinline, cold)) uint64_t vfp_flushed_d(uint64_t bits) {
+    return bits & 0x8000000000000000ull;
+}
+
+static ALWAYS_INLINE uint32_t vfp_to_s_in(uint32_t fpscr, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, 4);
+    if ((fpscr & FPSCR_FZ) && UNLIKELY(!(bits & 0x7F800000u))) bits = vfp_flushed_s(bits);
+    return bits;
+}
+
+static ALWAYS_INLINE uint64_t vfp_to_d_in(uint32_t fpscr, double value) {
+    uint64_t bits;
+    memcpy(&bits, &value, 8);
+    if ((fpscr & FPSCR_FZ) && UNLIKELY(!(bits & 0x7FF0000000000000ull))) bits = vfp_flushed_d(bits);
+    return bits;
+}
+#else
 static ALWAYS_INLINE uint32_t vfp_to_s_in(uint32_t fpscr, float value) {
     uint32_t bits;
     memcpy(&bits, &value, 4);
@@ -391,6 +422,7 @@ static ALWAYS_INLINE uint64_t vfp_to_d_in(uint32_t fpscr, double value) {
     if ((fpscr & FPSCR_FZ) && !(bits & 0x7FF0000000000000ull)) bits &= 0x8000000000000000ull;
     return bits;
 }
+#endif
 
 #define vfp_to_s(c, value) vfp_to_s_in(FPSCR(c), (value))
 #define vfp_to_d(c, value) vfp_to_d_in(FPSCR(c), (value))
@@ -562,6 +594,24 @@ static inline void recomp_call(Context *ctx) {
     return; \
 } while (0)
 
+/* the same from ARM code, where thumb is 0 already, and from Thumb code,
+   where it is 1, so only a switch of state has to write it. */
+#define RETURN_TO_A(value) do { \
+    uint32_t v_ = (value); \
+    SYNC_OUT(); \
+    if (UNLIKELY(v_ & 1)) { ctx->thumb = 1; ctx->r[15] = v_ & ~1u; } \
+    else ctx->r[15] = v_ & ~3u; \
+    return; \
+} while (0)
+
+#define RETURN_TO_T(value) do { \
+    uint32_t v_ = (value); \
+    SYNC_OUT(); \
+    if (UNLIKELY(!(v_ & 1))) { ctx->thumb = 0; ctx->r[15] = v_ & ~3u; } \
+    else ctx->r[15] = v_ & ~1u; \
+    return; \
+} while (0)
+
 /* a jump that may switch to Thumb. dispatch can lead anywhere, so the
    context is complete first. */
 #define JUMP_TO(value) do { \
@@ -589,36 +639,26 @@ static inline void recomp_call(Context *ctx) {
     }
 
 /* the same at the start of each block of generated code, where the blocks
-   that stop share one way out at the end of the function, OUT_OF_BUDGET,
-   with resume where to go on from. the blocks that start with the context
-   complete share OUT_OF_BUDGET_CLEAN, which stores no register. */
-#define BLOCK(address, count) \
+   that stop share ways out at the end of the function, with resume where
+   to go on from. each way out stores what its blocks need, and BLOCK goes
+   to the one that stores everything. */
+#define BLOCK_TO(address, count, way) \
     if (UNLIKELY((BUDGET_LEFT -= (count)) < 0)) { \
         BUDGET_LEFT += (count); \
         resume = (address); \
-        goto out_of_budget; \
+        goto way; \
     }
 
-#define BLOCK_CLEAN(address, count) \
-    if (UNLIKELY((BUDGET_LEFT -= (count)) < 0)) { \
-        BUDGET_LEFT += (count); \
-        resume = (address); \
-        goto out_of_budget_clean; \
-    }
+#define BLOCK(address, count) BLOCK_TO(address, count, out_of_budget)
 
-#define OUT_OF_BUDGET() \
-    out_of_budget: \
+#define OUT_OF_BUDGET_AT(way) \
+    way: \
     SYNC_OUT(); \
     ctx->r[15] = resume; \
     ctx->exit = EXIT_BUDGET; \
     return
 
-#define OUT_OF_BUDGET_CLEAN() \
-    out_of_budget_clean: \
-    SYNC_OUT(); \
-    ctx->r[15] = resume; \
-    ctx->exit = EXIT_BUDGET; \
-    return
+#define OUT_OF_BUDGET() OUT_OF_BUDGET_AT(out_of_budget)
 
 #define SVC(next, number) do { \
     SYNC_OUT(); \

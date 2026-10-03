@@ -56,6 +56,10 @@ const FPSCR: usize = 52;
 /// a set of locals, a bit for each.
 type Set = u64;
 
+/// the ways out of a function for the budget, one for each of the most
+/// common sets of locals to store, and one more for all the others.
+const EXITS: usize = 16;
+
 fn identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -87,22 +91,32 @@ fn sync_out(set: Set, budget: bool) -> String {
     format!("#undef SYNC_OUT\n#define SYNC_OUT() do {{ {stores}}} while (0)\n")
 }
 
-/// whether the token ending at end, and starting at start, is written, by an
-/// assignment after it, an increment around it, or its address taken.
-fn written(text: &[u8], start: usize, end: usize) -> bool {
+/// how a local is used where it appears.
+#[derive(Clone, Copy, PartialEq)]
+enum Use {
+    Read,
+    /// an assignment, which replaces the value.
+    Assign,
+    /// a compound assignment, an increment or its address taken, which read
+    /// the value and may change it.
+    Modify,
+}
+
+/// how the token ending at end, and starting at start, is used.
+fn usage(text: &[u8], start: usize, end: usize) -> Use {
     let after = &text[end..];
     let skipped = after.iter().take_while(|b| **b == b' ').count();
     let after = &after[skipped..];
     if after.first() == Some(&b'=') && after.get(1) != Some(&b'=') {
-        return true;
+        return Use::Assign;
     }
     if ASSIGNMENTS.iter().any(|op| after.starts_with(op.as_bytes())) {
-        return true;
+        return Use::Modify;
     }
     let before = &text[..start];
     let before = &before[..before.len() - before.iter().rev().take_while(|b| **b == b' ').count()];
     let address = before.last() == Some(&b'&') && before.get(before.len().wrapping_sub(2)) != Some(&b'&');
-    address || before.ends_with(b"++") || before.ends_with(b"--")
+    if address || before.ends_with(b"++") || before.ends_with(b"--") { Use::Modify } else { Use::Read }
 }
 
 /// the number text starts with, and how many digits it has.
@@ -120,10 +134,15 @@ fn indexed(text: &[u8], prefix: &str, close: &str) -> Option<(u32, usize)> {
     rest[digits..].starts_with(close.as_bytes()).then_some((value, prefix.len() + digits + close.len()))
 }
 
-/// what a line does that matters to which locals the context is behind on.
+/// what a line does that matters to which locals the context is behind on,
+/// and to which ones the code still reads.
 enum Event {
-    /// a local takes a new value.
-    Write(usize),
+    /// a local's value is used.
+    Read(usize),
+    /// a local takes a new value, the whole of it when true.
+    Write(usize, bool),
+    /// the end of a statement, the reads in it come before its writes.
+    Boundary,
     /// the context has to be complete for a call, the interpreter or a
     /// short vector, and the locals are taken again after it.
     Sync,
@@ -188,9 +207,27 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             continue;
         }};
     }
-    macro_rules! write_to {
+    macro_rules! read {
         ($index:expr) => {
-            events.push((Event::Write($index), blocks.guarded()))
+            events.push((Event::Read($index), blocks.guarded()))
+        };
+    }
+    macro_rules! assign {
+        ($index:expr) => {
+            events.push((Event::Write($index, true), blocks.guarded()))
+        };
+    }
+    // a local used as usage says
+    macro_rules! touch {
+        ($index:expr, $usage:expr) => {
+            match $usage {
+                Use::Read => read!($index),
+                Use::Assign => assign!($index),
+                Use::Modify => {
+                    read!($index);
+                    events.push((Event::Write($index, false), blocks.guarded()));
+                }
+            }
         };
     }
     while i < text.len() {
@@ -202,36 +239,35 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
         }
         match rest[0] {
             b'{' => {
+                events.push((Event::Boundary, false));
                 blocks.open.push(blocks.statement);
                 blocks.statement = false;
             }
             b'}' => {
+                events.push((Event::Boundary, false));
                 blocks.open.pop();
                 blocks.statement = false;
             }
-            b';' => blocks.statement = false,
+            b';' => {
+                events.push((Event::Boundary, false));
+                blocks.statement = false;
+            }
             b'?' => blocks.statement = true,
             _ => {}
         }
         if let Some((n, length)) = indexed(rest, "ctx->r[", "]") {
             *used |= 1 << n;
-            if written(text, i, i + length) {
-                write_to!(n as usize);
-            }
+            touch!(n as usize, usage(text, i, i + length));
             swap!(i + length, "reg{n}_");
         }
         if let Some((n, length)) = indexed(rest, "ctx->vfp[", "]") {
             *used |= 1 << (VFP + n as usize);
-            if written(text, i, i + length) {
-                write_to!(VFP + n as usize);
-            }
+            touch!(VFP + n as usize, usage(text, i, i + length));
             swap!(i + length, "vfp{n}_");
         }
         if rest.starts_with(b"*ctx->fpscr") && !rest.get(11).is_some_and(|b| identifier(*b)) {
             *used |= 1 << FPSCR;
-            if written(text, i, i + 11) {
-                write_to!(FPSCR);
-            }
+            touch!(FPSCR, usage(text, i, i + 11));
             swap!(i + 11, "fpscr_");
         }
         if i > 0 && identifier(text[i - 1]) {
@@ -247,15 +283,15 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             let single = !rest.get(6).is_some_and(|b| identifier(*b));
             if let Some(flag) = FLAGS.iter().position(|f| *f as u8 == name).filter(|_| single) {
                 *used |= 1 << (FLAG + flag);
-                if written(text, i, i + 6) {
-                    write_to!(FLAG + flag);
-                }
+                touch!(FLAG + flag, usage(text, i, i + 6));
                 swap!(i + 6, "flag_{}_", name as char);
             }
         }
         if let Some((_, expansion, flags)) = CONDITIONS.iter().find(|(name, ..)| name.as_bytes() == &rest[..word]) {
             for flag in flags.chars() {
-                *used |= 1 << (FLAG + FLAGS.iter().position(|f| *f == flag).expect("a flag"));
+                let index = FLAG + FLAGS.iter().position(|f| *f == flag).expect("a flag");
+                *used |= 1 << index;
+                read!(index);
             }
             swap!(i + word, "{expansion}");
         }
@@ -263,22 +299,28 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             // a double is two singles, 2N and 2N + 1
             if let Some((n, length)) = indexed(rest, "vfp_s(ctx, ", ")") {
                 *used |= 1 << (VFP + n as usize);
+                read!(VFP + n as usize);
                 swap!(i + length, "vfp_from_s(vfp{n}_)");
             }
             if let Some((d, length)) = indexed(rest, "vfp_d(ctx, ", ")") {
                 *used |= 3 << (VFP + 2 * d as usize);
+                read!(VFP + 2 * d as usize);
+                read!(VFP + 2 * d as usize + 1);
                 swap!(i + length, "vfp_from_d(vfp{}_, vfp{}_)", 2 * d, 2 * d + 1);
             }
-            // the value that follows closes what replaces the start
+            // the value that follows closes what replaces the start, and
+            // the flush reads fpscr
             if let Some((n, length)) = indexed(rest, "vfp_set_s(ctx, ", ", ") {
                 *used |= 1 << (VFP + n as usize) | 1 << FPSCR;
-                write_to!(VFP + n as usize);
+                read!(FPSCR);
+                assign!(VFP + n as usize);
                 swap!(i + length, "vfp{n}_ = vfp_to_s(ctx, ");
             }
             if let Some((d, length)) = indexed(rest, "vfp_set_d(ctx, ", ", ") {
                 *used |= 3 << (VFP + 2 * d as usize) | 1 << FPSCR;
-                write_to!(VFP + 2 * d as usize);
-                write_to!(VFP + 2 * d as usize + 1);
+                read!(FPSCR);
+                assign!(VFP + 2 * d as usize);
+                assign!(VFP + 2 * d as usize + 1);
                 swap!(i + length, "VFP_SET_D(vfp{}_, vfp{}_, ", 2 * d, 2 * d + 1);
             }
             if rest.starts_with(b"vfp_vector(") {
@@ -287,13 +329,14 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             }
             if rest.starts_with(b"vfp_compare(") {
                 *used |= 1 << FPSCR;
-                write_to!(FPSCR);
+                read!(FPSCR);
+                events.push((Event::Write(FPSCR, false), blocks.guarded()));
             }
         }
         let guarded = blocks.guarded();
         match &rest[..word] {
             b"CALL" | b"INTERPRET" => events.push((Event::Sync, guarded)),
-            b"RETURN" | b"RETURN_TO" | b"SVC" => events.push((Event::Leave, guarded)),
+            b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" | b"SVC" => events.push((Event::Leave, guarded)),
             b"JUMP_TO" => events.push((Event::Dispatch, guarded)),
             b"BLOCK" => events.push((Event::Budget, guarded)),
             b"goto" if rest.starts_with(b"goto dispatch;") => {
@@ -333,6 +376,8 @@ pub fn keep(body: &str) -> String {
     let mut jumped = vec![0 as Set; lines.len()];
     let mut stores: Vec<Option<Set>> = vec![None; lines.len()];
     let mut budgets: Vec<Option<Set>> = vec![None; lines.len()];
+    // whether execution can go on from the end of each line to the next
+    let mut falls = vec![true; lines.len()];
     loop {
         let mut changed = false;
         // the function starts with the context complete
@@ -343,7 +388,8 @@ pub fn keep(body: &str) -> String {
             let mut ends = false;
             for (event, guarded) in &line.events {
                 match event {
-                    Event::Write(index) => behind |= 1 << index,
+                    Event::Read(_) | Event::Boundary => {}
+                    Event::Write(index, _) => behind |= 1 << index,
                     Event::Sync => {
                         *syncs.get_or_insert(0) |= behind;
                         if !guarded {
@@ -368,7 +414,54 @@ pub fn keep(body: &str) -> String {
                 }
             }
             stores[i] = syncs;
+            falls[i] = !ends;
             falling = (!ends).then_some(behind);
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // which locals the code may still read where each line starts, going
+    // backwards. everything that syncs reads them all, a jump reads what its
+    // label does, and a write only ends a value's life when nothing guards
+    // it and it replaces the whole of it. a budget check notes what is live
+    // just after it, all its way out has to store.
+    let all = used;
+    let mut live_in = vec![0 as Set; lines.len()];
+    let mut live_at_budget = vec![all; lines.len()];
+    loop {
+        let mut changed = false;
+        for (i, line) in lines.iter().enumerate().rev() {
+            let mut live = if falls[i] { live_in.get(i + 1).copied().unwrap_or(0) } else { 0 };
+            let (mut reads, mut kills): (Set, Set) = (0, 0);
+            for (event, guarded) in line.events.iter().rev() {
+                // a statement's reads come before its writes
+                if !matches!(event, Event::Read(_) | Event::Write(..)) {
+                    live = (live & !kills) | reads;
+                    (reads, kills) = (0, 0);
+                }
+                match event {
+                    Event::Read(index) => reads |= 1 << index,
+                    Event::Write(index, whole) => {
+                        if *whole && !guarded {
+                            kills |= 1 << index;
+                        }
+                    }
+                    Event::Boundary => {}
+                    Event::Sync | Event::Leave | Event::Dispatch => live = all,
+                    Event::Goto(label) => {
+                        let there = labels.get(label.as_str()).map_or(all, |&target| live_in[target]);
+                        live = if *guarded { live | there } else { there };
+                    }
+                    Event::Budget => live_at_budget[i] = live,
+                }
+            }
+            live = (live & !kills) | reads;
+            if live_in[i] | live != live_in[i] {
+                live_in[i] |= live;
+                changed = true;
+            }
         }
         if !changed {
             break;
@@ -405,31 +498,50 @@ pub fn keep(body: &str) -> String {
     }
     writeln!(prologue, "#define SYNC_IN() do {{ {} }} while (0)", loads.join(" ")).unwrap();
 
-    // the blocks the budget can stop with nothing behind leave without
-    // storing anything, the others store what any of them can be behind on
-    let behind_at_budgets = budgets.iter().flatten().fold(0, |all, behind| all | behind);
+    // a block the budget stops stores what is behind there and still read
+    // from there on, r15 aside, which the way out sets. the blocks share a
+    // way out for each such set, the most common ones, and the rest share
+    // one that stores what any of them needs
+    let exits: Vec<Option<Set>> =
+        (0..lines.len()).map(|i| budgets[i].map(|behind| behind & live_at_budget[i] & !(1 << 15))).collect();
+    let mut counts: BTreeMap<Set, usize> = BTreeMap::new();
+    for set in exits.iter().flatten() {
+        *counts.entry(*set).or_default() += 1;
+    }
+    let mut common: Vec<(Set, usize)> = counts.into_iter().collect();
+    common.sort_by_key(|&(set, count)| (std::cmp::Reverse(count), set));
+    let mut ways: Vec<Set> = common.iter().take(EXITS).map(|&(set, _)| set).collect();
+    let rest = common.iter().skip(EXITS).fold(0, |all, &(set, _)| all | set);
+    if common.len() > EXITS {
+        ways.push(rest);
+    }
+    let way = |set: Set| ways.iter().position(|way| *way == set).unwrap_or(ways.len() - 1);
+
     let mut out = prologue;
     let mut defined = 0;
     out.push_str(&sync_out(0, budget));
     for (i, line) in lines.iter().enumerate() {
         if line.text.trim() == "OUT_OF_BUDGET();" {
-            out.push_str(&sync_out(0, budget));
-            out.push_str("    OUT_OF_BUDGET_CLEAN();\n");
-            out.push_str(&sync_out(behind_at_budgets, budget));
-            out.push_str("    OUT_OF_BUDGET();\n");
-            defined = behind_at_budgets;
+            for (k, set) in ways.iter().enumerate() {
+                out.push_str(&sync_out(*set, budget));
+                writeln!(out, "    OUT_OF_BUDGET_AT(out_of_budget_{k});").unwrap();
+            }
             continue;
         }
         if let Some(set) = stores[i].filter(|set| *set != defined) {
             out.push_str(&sync_out(set, budget));
             defined = set;
         }
-        if budgets[i] == Some(0) {
-            out.push_str(&line.text.replacen("BLOCK(", "BLOCK_CLEAN(", 1));
-        } else {
-            out.push_str(&line.text);
+        match exits[i] {
+            Some(set) => {
+                let text = line.text.trim_end().strip_suffix(");").expect("a block's check");
+                writeln!(out, "{}, out_of_budget_{});", text.replacen("BLOCK(", "BLOCK_TO(", 1), way(set)).unwrap();
+            }
+            None => {
+                out.push_str(&line.text);
+                out.push('\n');
+            }
         }
-        out.push('\n');
     }
     out
 }
@@ -473,8 +585,8 @@ mod tests {
         assert_eq!(sync_before(&kept, "CALL(f_00300000)"), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
         assert_eq!(sync_before(&kept, "RETURN();"), "#define SYNC_OUT() do { ctx->r[15] = reg15_; ctx->budget = budget_; } while (0)");
         // nothing changed yet where the budget is checked
-        assert!(kept.contains("BLOCK_CLEAN(0x00100000u, 6);"));
-        assert!(kept.contains("OUT_OF_BUDGET_CLEAN();"));
+        assert!(kept.contains("BLOCK_TO(0x00100000u, 6, out_of_budget_0);"));
+        assert_eq!(sync_before(&kept, "OUT_OF_BUDGET_AT(out_of_budget_0);"), "#define SYNC_OUT() do { ctx->budget = budget_; } while (0)");
     }
 
     #[test]
@@ -493,8 +605,31 @@ mod tests {
             L_00100000:\n    BLOCK(0x00100000u, 2);\n    /* 00100000 E2800001 */\n    ctx->r[0] = ctx->r[0] + 1;\n\
             \x20   /* 00100004 EAFFFFFD */\n    goto L_00100000;\n    OUT_OF_BUDGET();\n";
         let kept = keep(body);
-        assert!(kept.contains("    BLOCK(0x00100000u, 2);"));
-        assert_eq!(sync_before(&kept, "    OUT_OF_BUDGET();"), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
+        assert!(kept.contains("    BLOCK_TO(0x00100000u, 2, out_of_budget_0);"));
+        assert_eq!(
+            sync_before(&kept, "OUT_OF_BUDGET_AT(out_of_budget_0);"),
+            "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)"
+        );
+    }
+
+    #[test]
+    fn the_budget_leaves_out_what_the_block_writes_before_reading() {
+        // a loop whose compare sets the flags the next turn sets again first
+        let body = "    uint32_t target = ctx->r[15], resume = 0;\n    if (LIKELY(target == 0x00100000u && !ctx->thumb)) goto L_00100000;\n\
+            L_00100000:\n    BLOCK(0x00100000u, 3);\n    ctx->r[0] = ctx->r[0] + 1;\n\
+            \x20   { uint32_t r = ctx->r[0] - 10u; ctx->n = r >> 31; ctx->z = r == 0; }\n\
+            \x20   if (C_NE) {\n    goto L_00100000;\n    }\n    ctx->r[15] = ctx->r[14] & ~3u; RETURN();\n    OUT_OF_BUDGET();\n";
+        let kept = keep(body);
+        assert!(kept.contains("    BLOCK_TO(0x00100000u, 3, out_of_budget_0);"));
+        assert_eq!(
+            sync_before(&kept, "OUT_OF_BUDGET_AT(out_of_budget_0);"),
+            "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)"
+        );
+        // the return still stores them
+        assert_eq!(
+            sync_before(&kept, "RETURN();"),
+            "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->r[15] = reg15_; ctx->n = flag_n_; ctx->z = flag_z_; ctx->budget = budget_; } while (0)"
+        );
     }
 
     #[test]

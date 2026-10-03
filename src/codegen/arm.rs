@@ -305,7 +305,7 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         if rd == 15 {
             // ldr pc, [sp], 4 is a pop
             let pop = rn == 13 && !pre && sign == '+' && op & (1 << 25) == 0 && op & 0xFFF == 4;
-            emit!(out, "    {}(v); }}", if pop { "RETURN_TO" } else { "JUMP_TO" });
+            emit!(out, "    {}(v); }}", if pop { "RETURN_TO_A" } else { "JUMP_TO" });
             return false;
         }
         emit!(out, "    ctx->r[{rd}] = v; }}");
@@ -405,7 +405,7 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         if list & (1 << 15) != 0 {
             emit!(out, "    uint32_t next;");
             words(out, true, &destinations);
-            let jump = if rn == 13 { "RETURN_TO" } else { "JUMP_TO" };
+            let jump = if rn == 13 { "RETURN_TO_A" } else { "JUMP_TO" };
             emit!(out, "    {jump}(next); }}");
             return false;
         }
@@ -598,7 +598,7 @@ fn branch_exchange(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         return true;
     }
     if rm == 14 {
-        emit!(out, "    RETURN_TO(ctx->r[14]);");
+        emit!(out, "    RETURN_TO_A(ctx->r[14]);");
     } else {
         emit!(out, "    JUMP_TO({});", reg(scope, rm, a + 8));
     }

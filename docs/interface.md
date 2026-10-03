@@ -208,9 +208,12 @@ execution continues.
 | `EXIT_BUDGET` | The budget ran out. | The first instruction that did not run. |
 | `EXIT_UNWIND` | Anything else: an `interpret` that branched, a failed `lookup`, or calls nested too deep. | Where to continue. |
 
-In every case the guest state in the context is complete. The host can go on
-from `r[15]`: with the code when `lookup` finds any, and with its interpreter
-otherwise.
+In every case the host can go on from `r[15]`: with the code when `lookup`
+finds any, and with its interpreter otherwise, and the guest runs exactly as
+it would have. The guest state in the context is complete, with one
+exception. After `EXIT_BUDGET`, a register or flag that the code at `r[15]`
+sets before it reads it can still hold an older value, since nothing will
+ever read that one.
 
 ## Calls
 

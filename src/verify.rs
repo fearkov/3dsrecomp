@@ -287,50 +287,57 @@ fn interpreted(run: &mut Run) -> Stop {
 }
 
 /// runs the recompiled code the way a host would, falling back to the
-/// interpreter wherever there is none.
+/// interpreter wherever there is none. slice is the budget each run of the
+/// code gets, out of LIMIT in all. a short one makes the code stop at block
+/// starts and go on from there, which is what a host does at the end of a
+/// timeslice, and when a block does not fit, one instruction goes through
+/// the interpreter instead, as in Zakuro. budget holds what is left after.
 ///
 /// # Safety
 ///
 /// run and ctx have to stay valid and unaliased for the whole run, the
 /// callbacks reach run through ctx.
-unsafe fn recompiled(run: *mut Run, ctx: *mut Context) -> Stop {
+unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
     unsafe {
-        (*ctx).budget = LIMIT;
-        loop {
+        let mut left = LIMIT;
+        let stop = loop {
             if (*ctx).r[15] == RETURN && (*ctx).thumb == 0 {
-                return Stop::Returned;
+                break Stop::Returned;
             }
-            if (*ctx).budget <= 0 {
-                return Stop::Limit;
+            if left <= 0 {
+                break Stop::Limit;
             }
-            match (*(*run).library).lookup((*ctx).r[15] | (*ctx).thumb as u32) {
-                Some(code) => {
-                    (*ctx).exit = abi::EXIT_NONE;
-                    (*ctx).depth = 0;
-                    code(ctx);
-                    if let Some(exit) = (*run).pending.take() {
-                        return stop(exit);
-                    }
-                    match (*ctx).exit {
-                        abi::EXIT_SVC => return Stop::Svc((*ctx).svc),
-                        abi::EXIT_BUDGET => return Stop::Limit,
-                        _ => {}
-                    }
+            if let Some(code) = (*(*run).library).lookup((*ctx).r[15] | (*ctx).thumb as u32) {
+                let budget = slice.min(left);
+                (*ctx).budget = budget;
+                (*ctx).exit = abi::EXIT_NONE;
+                (*ctx).depth = 0;
+                code(ctx);
+                let spent = budget - (*ctx).budget;
+                left -= spent;
+                if let Some(exit) = (*run).pending.take() {
+                    break stop(exit);
                 }
-                None => {
-                    let run = &mut *run;
-                    let ctx = &mut *ctx;
-                    load(ctx, &mut run.cpu);
-                    let exit = run.cpu.step(&mut run.memory);
-                    store(&run.cpu, ctx);
-                    ctx.budget -= 1;
-                    run.interpreted += 1;
-                    if let Some(exit) = exit {
-                        return stop(exit);
-                    }
+                match (*ctx).exit {
+                    abi::EXIT_SVC => break Stop::Svc((*ctx).svc),
+                    // the block did not fit, the interpreter takes a step
+                    abi::EXIT_BUDGET if spent == 0 => {}
+                    _ => continue,
                 }
             }
-        }
+            let run = &mut *run;
+            let ctx = &mut *ctx;
+            load(ctx, &mut run.cpu);
+            let exit = run.cpu.step(&mut run.memory);
+            store(&run.cpu, ctx);
+            left -= 1;
+            run.interpreted += 1;
+            if let Some(exit) = exit {
+                break stop(exit);
+            }
+        };
+        (*ctx).budget = left;
+        stop
     }
 }
 
@@ -515,8 +522,12 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         let expected = interpreted(&mut a);
         b.interpreted = 0;
         b.fallbacks = 0;
+        // half the functions run in short slices, stopping for the budget at
+        // block starts and going on from there
+        let mut slicing = Random(0x2545_F491_4F6C_DD1D ^ function as u64);
+        let slice = if slicing.next().is_multiple_of(2) { LIMIT } else { 1 + (slicing.next() % 48) as i32 };
         // SAFETY: b and ctx live through the run and nothing else touches them
-        let got = unsafe { recompiled(&mut b, &mut ctx) };
+        let got = unsafe { recompiled(&mut b, &mut ctx, slice) };
         report.tested += 1;
         let spent = (LIMIT - ctx.budget) as u64;
         report.native += spent.saturating_sub(b.interpreted + b.fallbacks);

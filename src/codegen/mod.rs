@@ -127,8 +127,9 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
     false
 }
 
-/// instructions per source file, so the files compile in parallel.
-const FILE_SIZE: usize = 20_000;
+/// instructions per source file, so the files compile in parallel. gcc
+/// keeps a whole file in memory, and files of 20,000 took it up to 7.8 GB.
+const FILE_SIZE: usize = 5_000;
 
 /// the instructions up to which a function another one holds is still
 /// written as a function of its own.

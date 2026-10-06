@@ -1,9 +1,10 @@
-//! compiling the generated C, one compiler per core, into a shared library
-//! a host loads or a static one a program links in.
+//! compiling the generated C, a compiler per core as long as the memory
+//! holds them, into a shared library a host loads or a static one a program
+//! links in.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// floating point has to round exactly the way the interpreter does, so
@@ -12,6 +13,19 @@ const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
 /// what only matters for ELF and Mach-O, and that compilers for Windows
 /// refuse or ignore.
 const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
+
+/// gcc collects its garbage far less often on a machine with a lot of
+/// memory, and with that a file of generated code took 7.8 GB at its peak
+/// instead of 4.8.
+const GCC_FLAGS: &[&str] = &["--param", "ggc-min-expand=20", "--param", "ggc-min-heapsize=65536"];
+
+/// about how many bytes a compiler takes at its peak for each byte of
+/// generated C it compiles, gcc 16 keeping a whole file of functions in
+/// memory took around 450 for one of 2.9 MB.
+const MEMORY_PER_BYTE: u64 = 600;
+
+/// what to leave of the memory there is for everything else.
+const RESERVE: u64 = 1 << 30;
 
 /// what progress hears after each file, how many are done and of how
 /// many, answering whether to go on.
@@ -29,6 +43,51 @@ fn tool(variable: &str, tools: &[&str]) -> String {
         .filter(|name| !name.is_empty())
         .or_else(|| tools.iter().find(|tool| runs(tool)).map(|tool| tool.to_string()))
         .unwrap_or_else(|| tools[0].to_owned())
+}
+
+/// whether compiler is gcc, whose options for its garbage the others refuse.
+fn is_gcc(compiler: &str) -> bool {
+    let output = Command::new(compiler).arg("--version").output();
+    output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("Free Software Foundation"))
+}
+
+/// the memory the system has to spare, MemAvailable on Linux and the free
+/// physical memory on Windows, or none when it can't tell.
+fn spare_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = info.lines().find(|line| line.starts_with("MemAvailable:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatus {
+            length: u32,
+            load: u32,
+            total_physical: u64,
+            available_physical: u64,
+            total_page_file: u64,
+            available_page_file: u64,
+            total_virtual: u64,
+            available_virtual: u64,
+            available_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalMemoryStatusEx(status: *mut MemoryStatus) -> i32;
+        }
+        // SAFETY: the struct is MEMORYSTATUSEX, with its length filled in
+        unsafe {
+            let mut status: MemoryStatus = std::mem::zeroed();
+            status.length = std::mem::size_of::<MemoryStatus>() as u32;
+            (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.available_physical)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    None
 }
 
 /// the C compiler, from CC or else the first there is. on Windows MinGW's
@@ -59,39 +118,70 @@ pub fn compile(dir: &Path, sources: &[String], library: &Path, progress: Progres
 }
 
 /// compiles sources, file names inside dir, each into an object beside it,
-/// stopping when progress says so.
+/// stopping when progress says so. a compiler starts once the memory there
+/// is to spare holds what it is likely to take, and there is always one
+/// running, so a machine with little memory builds slower instead of
+/// running out of it.
 pub fn objects(dir: &Path, sources: &[String], progress: Progress) -> Result<Vec<PathBuf>, String> {
     let compiler = compiler();
+    let gcc = is_gcc(&compiler);
     let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let next = AtomicUsize::new(0);
+    let budget = spare_memory().map(|spare| spare.saturating_sub(RESERVE));
+    let needs: Vec<u64> =
+        sources.iter().map(|source| std::fs::metadata(dir.join(source)).map_or(0, |m| m.len()) * MEMORY_PER_BYTE).collect();
+    // the biggest first, so that none of them starts last and holds the
+    // others up
+    let mut order: Vec<usize> = (0..sources.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(needs[i]));
+
+    // the next of order to start, and the memory and compilers in use
+    let state = Mutex::new((0usize, 0u64, 0usize));
+    let freed = Condvar::new();
     let done = AtomicUsize::new(0);
     let stopped = AtomicBool::new(false);
     let failures = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..jobs {
-            scope.spawn(|| {
-                while let Some(source) = sources.get(next.fetch_add(1, Ordering::Relaxed)) {
-                    if stopped.load(Ordering::Relaxed) {
-                        break;
+            scope.spawn(|| loop {
+                let index = {
+                    let mut state = state.lock().unwrap();
+                    loop {
+                        let (next, using, running) = *state;
+                        if stopped.load(Ordering::Relaxed) || next == order.len() {
+                            break None;
+                        }
+                        let index = order[next];
+                        if running == 0 || budget.is_none_or(|budget| using + needs[index] <= budget) {
+                            *state = (next + 1, using + needs[index], running + 1);
+                            break Some(index);
+                        }
+                        state = freed.wait(state).unwrap();
                     }
-                    let path = dir.join(source);
-                    let status = Command::new(&compiler)
-                        .args(FLAGS)
-                        .args(if cfg!(windows) { &[][..] } else { UNIX_FLAGS })
-                        .arg("-I")
-                        .arg(dir)
-                        .arg("-c")
-                        .arg(&path)
-                        .arg("-o")
-                        .arg(path.with_extension("o"))
-                        .status();
-                    if !status.is_ok_and(|s| s.success()) {
-                        failures.lock().unwrap().push(source.clone());
-                    }
-                    if !progress(done.fetch_add(1, Ordering::Relaxed) + 1, sources.len()) {
-                        stopped.store(true, Ordering::Relaxed);
-                    }
+                };
+                let Some(index) = index else { break };
+                let source = &sources[index];
+                let path = dir.join(source);
+                let status = Command::new(&compiler)
+                    .args(FLAGS)
+                    .args(if gcc { GCC_FLAGS } else { &[] })
+                    .args(if cfg!(windows) { &[][..] } else { UNIX_FLAGS })
+                    .arg("-I")
+                    .arg(dir)
+                    .arg("-c")
+                    .arg(&path)
+                    .arg("-o")
+                    .arg(path.with_extension("o"))
+                    .status();
+                if !status.is_ok_and(|s| s.success()) {
+                    failures.lock().unwrap().push(source.clone());
                 }
+                if !progress(done.fetch_add(1, Ordering::Relaxed) + 1, sources.len()) {
+                    stopped.store(true, Ordering::Relaxed);
+                }
+                let mut state = state.lock().unwrap();
+                state.1 -= needs[index];
+                state.2 -= 1;
+                freed.notify_all();
             });
         }
     });

@@ -38,6 +38,7 @@ Zakuro does it on its own.
 | Symbol | Type | Meaning |
 | --- | --- | --- |
 | `recomp_abi` | `const uint32_t` | The interface version, `RECOMP_ABI` |
+| `recomp_generation` | `const uint32_t` | The code generator's version, missing before it was added |
 | `recomp_entry_count` | `const uint32_t` | Number of entries in the executable |
 | `recomp_entries` | `const Entry[]` | The executable's entries |
 | `recomp_module_count` | `const uint32_t` | Number of modules |
@@ -46,6 +47,12 @@ Zakuro does it on its own.
 Check `recomp_abi` first, and refuse to run the library when it is not the
 version you were written for. The version goes up whenever the layout of any
 structure or the meaning of any field changes.
+
+`recomp_generation` goes up when the generated code gets much faster, without
+the interface changing. A library of an older generation, or one without the
+symbol, still runs. Building it again gives faster code, which a host can
+suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
+`recomp_abi::GENERATION` is the current one.
 
 ### Entries
 

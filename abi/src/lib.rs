@@ -13,6 +13,11 @@ pub const HEADER: &str = include_str!("../recomp.h");
 /// the interface version, which code has to match to be run.
 pub const ABI: u32 = 4;
 
+/// the code generator's version, raised when the code it makes runs much
+/// better than before. code of an older one still runs, and building it
+/// again makes it faster, which a host can suggest.
+pub const GENERATION: u32 = 1;
+
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
 pub const EXIT_SVC: u32 = 1;
@@ -159,6 +164,8 @@ pub struct Library {
     module_count: usize,
     /// the modules placed somewhere, as base, size and index.
     placed: Vec<(u32, u32, usize)>,
+    /// the code generator's version that made the code, see GENERATION.
+    generation: u32,
     /// the library the tables are in, none when they are linked in.
     #[cfg(feature = "load")]
     _library: Option<libloading::Library>,
@@ -187,6 +194,8 @@ impl Library {
                 module_count: *(symbol(b"recomp_module_count")? as *const u32),
             };
             let mut code = Library::linked(&linked)?;
+            // libraries made before it said have none
+            code.generation = symbol(b"recomp_generation").map_or(0, |generation| *(generation as *const u32));
             code._library = Some(library);
             Ok(code)
         }
@@ -203,9 +212,18 @@ impl Library {
             modules: linked.modules as *const Module,
             module_count: linked.module_count as usize,
             placed: Vec::new(),
+            // code linked in was made along with the program
+            generation: GENERATION,
             #[cfg(feature = "load")]
             _library: None,
         })
+    }
+
+    /// the version of the code generator that made the code, 0 for a
+    /// library made before libraries said. lower than GENERATION means
+    /// building it again gives faster code.
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     pub fn entries(&self) -> &[Entry] {

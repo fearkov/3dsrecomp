@@ -336,6 +336,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     }
 
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;");
+    emit!(tables, "RECOMP_EXPORT const uint32_t recomp_generation = {}u;", recomp_abi::GENERATION);
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_module_count = {};", units.len() - 1);
     emit!(tables, "RECOMP_EXPORT const Module recomp_modules[] = {{\n{modules}}};");
     files.push(("entries.c".to_owned(), tables));
@@ -514,6 +515,7 @@ RECOMP_OVERRIDE(0x00100008) {
         assert!(code.contains("CALL(override_0x00100008);"));
         assert!(files["functions.h"].contains("void override_0x00100008(Context *ctx);"));
         assert!(files["entries.c"].contains("{0x00100008u, override_0x00100008},"));
+        assert!(files["entries.c"].contains(&format!("recomp_generation = {}u;", recomp_abi::GENERATION)));
         let header = &files["overrides.h"];
         assert!(header.contains("static inline void original_0x00100008(Context *ctx) {"));
         assert!(header.contains("f_00100008(ctx);"));

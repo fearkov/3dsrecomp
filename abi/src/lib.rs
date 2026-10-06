@@ -14,9 +14,10 @@ pub const HEADER: &str = include_str!("../recomp.h");
 pub const ABI: u32 = 4;
 
 /// the code generator's version, raised when the code it makes runs much
-/// better than before. code of an older one still runs, and building it
-/// again makes it faster, which a host can suggest.
-pub const GENERATION: u32 = 1;
+/// better or does more than before, which checking itself against memory did
+/// at 2. code of an older one still runs, and building it again brings the
+/// improvements, which a host can suggest.
+pub const GENERATION: u32 = 2;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -117,6 +118,86 @@ impl Module {
     }
 }
 
+/// a stretch of guest code, as addresses, or offsets in a module.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+}
+
+/// what a function was made from, its spans in its unit's table and a
+/// hash of their bytes, see CodeHash.
+#[repr(C)]
+pub struct Origin {
+    pub hash: u64,
+    pub first: u32,
+    pub count: u32,
+}
+
+/// the functions of the executable or a module, the function each entry
+/// runs, and a flag per function the host sets when its code changed.
+#[repr(C)]
+pub struct Origins {
+    count: u32,
+    functions: *const Origin,
+    spans: *const Span,
+    owners: *const u32,
+    stale: *mut u8,
+}
+
+/// an entry's owner when code written by hand runs it.
+pub const NO_ORIGIN: u32 = u32::MAX;
+
+/// the hash of the bytes a function was made from, 64-bit FNV-1a over its
+/// spans one after another.
+#[derive(Debug, Clone, Copy)]
+pub struct CodeHash(u64);
+
+impl Default for CodeHash {
+    fn default() -> Self {
+        CodeHash(0xCBF2_9CE4_8422_2325)
+    }
+}
+
+impl CodeHash {
+    pub fn add(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 ^ byte as u64).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    pub fn value(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Origins {
+    pub fn functions(&self) -> &[Origin] {
+        // SAFETY: the generated table has count functions
+        unsafe { std::slice::from_raw_parts(self.functions, self.count as usize) }
+    }
+
+    pub fn spans(&self) -> &[Span] {
+        let count = self.functions().iter().map(|f| (f.first + f.count) as usize).max().unwrap_or(0);
+        // SAFETY: the functions' spans are all in the table
+        unsafe { std::slice::from_raw_parts(self.spans, count) }
+    }
+
+    /// whether the function that runs entry i is stale.
+    fn owner_is_stale(&self, entry: usize) -> bool {
+        // SAFETY: there is an owner for each of the unit's entries, and a
+        // flag for each function
+        if self.owners.is_null() {
+            return false;
+        }
+        unsafe {
+            let owner = *self.owners.add(entry);
+            owner != NO_ORIGIN && *self.stale.add(owner as usize) != 0
+        }
+    }
+}
+
 /// the tables of code linked into the program itself rather than loaded
 /// from a library, which is how a program 3dsrecomp port made runs.
 #[derive(Debug, Clone, Copy)]
@@ -166,6 +247,9 @@ pub struct Library {
     placed: Vec<(u32, u32, usize)>,
     /// the code generator's version that made the code, see GENERATION.
     generation: u32,
+    /// what the executable's functions and then each module's were made
+    /// from, none for code of the generations before.
+    origins: *const Origins,
     /// the library the tables are in, none when they are linked in.
     #[cfg(feature = "load")]
     _library: Option<libloading::Library>,
@@ -196,6 +280,7 @@ impl Library {
             let mut code = Library::linked(&linked)?;
             // libraries made before it said have none
             code.generation = symbol(b"recomp_generation").map_or(0, |generation| *(generation as *const u32));
+            code.origins = symbol(b"recomp_origins").map_or(std::ptr::null(), |origins| origins as *const Origins);
             code._library = Some(library);
             Ok(code)
         }
@@ -214,6 +299,8 @@ impl Library {
             placed: Vec::new(),
             // code linked in was made along with the program
             generation: GENERATION,
+            // and is not checked against what the program has in memory
+            origins: std::ptr::null(),
             #[cfg(feature = "load")]
             _library: None,
         })
@@ -242,15 +329,52 @@ impl Library {
     }
 
     /// the code that can run from address, bit 0 set for Thumb, in the
-    /// executable or in a module that is placed.
+    /// executable or in a module that is placed. none for a function whose
+    /// code changed since it was made.
     pub fn lookup(&self, address: u32) -> Option<Code> {
-        let find = |entries: &[Entry], address: u32| {
-            entries.binary_search_by_key(&address, |entry| entry.address).ok().map(|i| entries[i].code)
+        let find = |entries: &[Entry], unit: usize, address: u32| {
+            let i = entries.binary_search_by_key(&address, |entry| entry.address).ok()?;
+            let stale = self.origins(unit).is_some_and(|origins| origins.owner_is_stale(i));
+            (!stale).then_some(entries[i].code)
         };
-        find(self.entries(), address).or_else(|| {
+        find(self.entries(), 0, address).or_else(|| {
             let &(base, _, index) = self.placed.iter().find(|&&(base, size, _)| address.wrapping_sub(base) < size)?;
-            find(self.modules()[index].entries(), address - base)
+            find(self.modules()[index].entries(), index + 1, address - base)
         })
+    }
+
+    /// what the functions of unit were made from, the executable's for 0
+    /// and module i's for i + 1, when the code says.
+    pub fn origins(&self, unit: usize) -> Option<&Origins> {
+        if self.origins.is_null() || unit > self.module_count {
+            return None;
+        }
+        // SAFETY: the code has a table for the executable and each module
+        Some(unsafe { &*self.origins.add(unit) })
+    }
+
+    /// checks the functions of unit against the code in memory, which read
+    /// fills in from an address, the unit's offsets added to base. those
+    /// whose bytes changed are marked stale and run no more, and how many
+    /// there are comes back.
+    pub fn check(&mut self, unit: usize, base: u32, mut read: impl FnMut(u32, &mut [u8])) -> usize {
+        let Some(origins) = self.origins(unit) else { return 0 };
+        let mut stale = 0;
+        let mut bytes = Vec::new();
+        for (index, function) in origins.functions().iter().enumerate() {
+            let mut hash = CodeHash::default();
+            for span in &origins.spans()[function.first as usize..(function.first + function.count) as usize] {
+                bytes.resize(span.end.wrapping_sub(span.start) as usize, 0);
+                read(base.wrapping_add(span.start), &mut bytes);
+                hash.add(&bytes);
+            }
+            let changed = hash.value() != function.hash;
+            // SAFETY: the flags are the code's own, one per function, which
+            // only the thread running it reads
+            unsafe { *origins.stale.add(index) = changed as u8 };
+            stale += changed as usize;
+        }
+        stale
     }
 
     /// the module called name.
@@ -303,6 +427,13 @@ int main(void) {
     AT(Entry, address); AT(Entry, code);
     SIZE(Module);
     AT(Module, name); AT(Module, base); AT(Module, size); AT(Module, count); AT(Module, entries);
+    SIZE(Span);
+    AT(Span, start); AT(Span, end);
+    SIZE(Origin);
+    AT(Origin, hash); AT(Origin, first); AT(Origin, count);
+    SIZE(Origins);
+    AT(Origins, count); AT(Origins, functions); AT(Origins, spans); AT(Origins, owners); AT(Origins, stale);
+    printf("NO_ORIGIN %u\n", NO_ORIGIN);
     printf("RECOMP_ABI %d\n", RECOMP_ABI);
     printf("EXIT_NONE %d\nEXIT_SVC %d\nEXIT_BUDGET %d\nEXIT_UNWIND %d\n", EXIT_NONE, EXIT_SVC, EXIT_BUDGET, EXIT_UNWIND);
     return 0;
@@ -349,6 +480,10 @@ int main(void) {
         at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
+        at!(lines, Span, start, end);
+        at!(lines, Origin, hash, first, count);
+        at!(lines, Origins, count, functions, spans, owners, stale);
+        lines.push(format!("NO_ORIGIN {NO_ORIGIN}"));
         lines.push(format!("RECOMP_ABI {ABI}"));
         for (name, value) in
             [("EXIT_NONE", EXIT_NONE), ("EXIT_SVC", EXIT_SVC), ("EXIT_BUDGET", EXIT_BUDGET), ("EXIT_UNWIND", EXIT_UNWIND)]

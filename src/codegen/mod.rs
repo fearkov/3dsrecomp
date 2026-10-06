@@ -206,6 +206,8 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     let mut size = 0;
     let mut tables = String::from("#include \"recomp.h\"\n");
     let mut modules = String::new();
+    // each unit's Origins, the executable's first
+    let mut origins = String::new();
     let mut originals = String::new();
     let mut original_headers = BTreeSet::new();
 
@@ -250,6 +252,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         if unit.module.is_some() {
             emit!(prototypes, "extern uint32_t {prefix}base;");
         }
+        emit!(prototypes, "extern RECOMP_HIDDEN uint8_t {prefix}recomp_stale[];");
         for item in &replaced {
             emit!(prototypes, "void {}(Context *ctx);", item.name);
         }
@@ -261,7 +264,8 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let include = format!("#include \"{header}\"\n\n");
         // each function's labels with those after what it interprets
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-        for (&entry, function) in &functions {
+        for (number, (&entry, function)) in functions.iter().enumerate() {
+            let stale = format!("{prefix}recomp_stale[{number}]");
             if source.is_empty() {
                 source.push_str("#include \"recomp.h\"\n");
             }
@@ -274,7 +278,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             let interpreted = std::cell::RefCell::new(Vec::new());
             let relative = unit.module.is_some();
             let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut String::new(), unit.program, &scope, entry, function);
+            write_function(&mut String::new(), unit.program, &scope, entry, function, &stale);
             let mut resumable = (*function).clone();
             for address in interpreted.take() {
                 let at = function.instructions.iter().position(|&a| a == address);
@@ -283,7 +287,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                 }
             }
             let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut source, unit.program, &scope, entry, &resumable);
+            write_function(&mut source, unit.program, &scope, entry, &resumable, &stale);
             resumed.insert(entry, resumable.labels);
             size += function.instructions.len();
             if size >= FILE_SIZE {
@@ -295,9 +299,9 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
 
         // every label the host can resume at, preferring the function that
         // starts there
-        let mut entries: BTreeMap<u32, String> = BTreeMap::new();
-        for (&entry, function) in &functions {
-            let owner = name(&prefix, entry, function.mode == Mode::Thumb);
+        let mut entries: BTreeMap<u32, (String, u32)> = BTreeMap::new();
+        for (number, (&entry, function)) in functions.iter().enumerate() {
+            let owner = (name(&prefix, entry, function.mode == Mode::Thumb), number as u32);
             for &label in resumed.get(&entry).unwrap_or(&function.labels) {
                 let slot = entries.entry(key(label, function.mode)).or_insert_with(|| owner.clone());
                 if label == entry {
@@ -306,7 +310,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             }
         }
         for item in &replaced {
-            entries.insert(item.address, item.name.clone());
+            entries.insert(item.address, (item.name.clone(), recomp_abi::NO_ORIGIN));
         }
         tables.push_str(&include);
         let table = match unit.module {
@@ -326,10 +330,11 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             }
         };
         emit!(tables, "{table} = {{");
-        for (label, owner) in entries {
+        for (label, (owner, _)) in &entries {
             emit!(tables, "    {{0x{label:08X}u, {owner}}},");
         }
         emit!(tables, "}};\n");
+        write_origins(&mut tables, &mut origins, &prefix, unit.program, &functions, &entries);
     }
     if !source.is_empty() {
         sources.push(source);
@@ -339,6 +344,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_generation = {}u;", recomp_abi::GENERATION);
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_module_count = {};", units.len() - 1);
     emit!(tables, "RECOMP_EXPORT const Module recomp_modules[] = {{\n{modules}}};");
+    emit!(tables, "RECOMP_EXPORT const Origins recomp_origins[] = {{\n{origins}}};");
     files.push(("entries.c".to_owned(), tables));
     if !overrides.is_empty() {
         let mut header = String::from("/* what overrides include, see docs/overrides.md. */\n\n#include \"recomp.h\"\n");
@@ -352,9 +358,73 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     files
 }
 
-fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
+/// the stretches of code a function was made from, as runs of instructions
+/// one right after another.
+fn spans(program: &Program, function: &Function) -> Vec<(u32, u32)> {
+    let mut spans: Vec<(u32, u32)> = Vec::new();
+    for &address in &function.instructions {
+        let size = if function.mode == Mode::Thumb {
+            let op = program.text.read16(address).unwrap_or(0);
+            crate::thumb::decode(op, program.text.read16(address + 2), address).1
+        } else {
+            4
+        };
+        match spans.last_mut() {
+            Some(last) if last.1 == address => last.1 = address + size,
+            _ => spans.push((address, address + size)),
+        }
+    }
+    spans
+}
+
+/// a unit's stale flags and the tables saying what its functions were
+/// made from, with its Origins added to origins.
+fn write_origins(
+    tables: &mut String,
+    origins: &mut String,
+    prefix: &str,
+    program: &Program,
+    functions: &BTreeMap<u32, &Function>,
+    entries: &BTreeMap<u32, (String, u32)>,
+) {
+    let count = functions.len();
+    emit!(tables, "RECOMP_HIDDEN uint8_t {prefix}recomp_stale[{}];", count.max(1));
+    let mut all = Vec::new();
+    let mut made = String::new();
+    for function in functions.values() {
+        let mut hash = recomp_abi::CodeHash::default();
+        let spans = spans(program, function);
+        let at = |address: u32| address.wrapping_sub(program.text.base) as usize;
+        for &(start, end) in &spans {
+            hash.add(program.text.bytes.get(at(start)..at(end)).unwrap_or_default());
+        }
+        emit!(made, "    {{0x{:016X}ull, {}, {}}},", hash.value(), all.len(), spans.len());
+        all.extend(spans);
+    }
+    if count == 0 {
+        emit!(origins, "    {{0, 0, 0, 0, {prefix}recomp_stale}},");
+        return;
+    }
+    emit!(tables, "static const Origin {prefix}origin_functions[] = {{\n{made}}};");
+    emit!(tables, "static const Span {prefix}origin_spans[] = {{");
+    for (start, end) in all {
+        emit!(tables, "    {{0x{start:08X}u, 0x{end:08X}u}},");
+    }
+    emit!(tables, "}};");
+    emit!(tables, "static const uint32_t {prefix}origin_owners[] = {{");
+    for (_, owner) in entries.values() {
+        emit!(tables, "    {owner}u,");
+    }
+    emit!(tables, "}};\n");
+    emit!(origins, "    {{{count}, {prefix}origin_functions, {prefix}origin_spans, {prefix}origin_owners, {prefix}recomp_stale}},");
+}
+
+fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, stale: &str) {
     let thumb = function.mode == Mode::Thumb;
     emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
+    // before the registers are taken into locals, a stale function has
+    // nothing to put back
+    emit!(out, "    STALE_CHECK({stale})");
     let mut body = String::new();
     write_body(&mut body, program, scope, entry, function);
     out.push_str(&locals::keep(&body));
@@ -465,6 +535,51 @@ mod tests {
         let built = crate::compile::objects(&dir, &sources, &|_, _| true);
         std::fs::remove_dir_all(&dir).ok();
         built.unwrap();
+    }
+
+    /// every function starts by checking its stale flag, and the tables say
+    /// what it was made from, a span for each run of its instructions and
+    /// the hash of their bytes.
+    #[test]
+    fn functions_say_what_they_were_made_from() {
+        // bl BASE + 8, bx lr, then the callee, bx lr
+        let files = generated(&[]);
+        let code = &files["code000.c"];
+        assert!(code.contains("STALE_CHECK(recomp_stale[0])"));
+        assert!(code.contains("STALE_CHECK(recomp_stale[1])"));
+        let tables = &files["entries.c"];
+        let mut caller = recomp_abi::CodeHash::default();
+        caller.add(&[0x00, 0x00, 0x00, 0xEB, 0x1E, 0xFF, 0x2F, 0xE1]);
+        assert!(tables.contains(&format!("{{0x{:016X}ull, 0, 1}},", caller.value())), "{tables}");
+        assert!(tables.contains("{0x00100000u, 0x00100008u},"));
+        assert!(tables.contains("{0x00100008u, 0x0010000Cu},"));
+        assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, origin_functions, origin_spans, origin_owners, recomp_stale},"));
+
+        compiles("origins", &files, &["code000.c", "entries.c"]);
+    }
+
+    /// a file holding functions of the executable and of a module declares
+    /// what both use.
+    #[test]
+    fn units_that_share_a_file_compile() {
+        let program = Program {
+            text: Segment { base: BASE, bytes: [0xEB00_0000u32, 0xE12F_FF1E, 0xE12F_FF1E].iter().flat_map(|w| w.to_le_bytes()).collect() },
+            seeds: vec![(BASE, Source::Entry)],
+            slots: None,
+        };
+        let analysis = discover::analyze(&program);
+        let units = [
+            Unit { module: None, program: &program, analysis: &analysis },
+            Unit { module: Some("First"), program: &program, analysis: &analysis },
+            Unit { module: Some("Second"), program: &program, analysis: &analysis },
+        ];
+        let files: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
+        let code = &files["code000.c"];
+        assert!(code.contains("#include \"m001_functions.h\"") && code.contains("#include \"m002_functions.h\""));
+        assert!(code.contains("STALE_CHECK(m002_recomp_stale[1])"));
+        assert!(files["entries.c"].contains("{2, m002_origin_functions, m002_origin_spans, m002_origin_owners, m002_recomp_stale},"));
+
+        compiles("units", &files, &["code000.c", "entries.c"]);
     }
 
     #[test]

@@ -78,10 +78,47 @@ typedef struct Module {
     const Entry *entries;
 } Module;
 
+/* a stretch of guest code, from start up to end, as addresses, or as
+   offsets in a module. */
+typedef struct Span {
+    uint32_t start;
+    uint32_t end;
+} Span;
+
+/* what a function was made from: its first span in its unit's spans, how
+   many it has, and a hash of their bytes, 64-bit FNV-1a over the spans one
+   after another. */
+typedef struct Origin {
+    uint64_t hash;
+    uint32_t first;
+    uint32_t count;
+} Origin;
+
+/* the functions of the executable or of a module, the entry each of its
+   entries runs, and a flag for each function. a host sets a function's flag
+   when the code in memory is no longer what it was made from, a mod changed
+   it say, and from then on entering the function hands the host its
+   address instead of running it. */
+typedef struct Origins {
+    uint32_t count;
+    const Origin *functions;
+    const Span *spans;
+    /* for each entry, the function that runs it, or NO_ORIGIN for code
+       written by hand. */
+    const uint32_t *owners;
+    uint8_t *stale;
+} Origins;
+
+#define NO_ORIGIN 0xFFFFFFFFu
+
 #ifdef _WIN32
 #define RECOMP_EXPORT __declspec(dllexport)
+#define RECOMP_HIDDEN
 #else
 #define RECOMP_EXPORT __attribute__((visibility("default")))
+/* shared between the generated files and nobody else, which keeps a read
+   of it to a single instruction. */
+#define RECOMP_HIDDEN __attribute__((visibility("hidden")))
 #endif
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
@@ -674,6 +711,12 @@ static inline void recomp_call(Context *ctx) {
     if (UNLIKELY(ctx->exit)) return; \
     SYNC_IN(); \
 } while (0)
+
+/* the start of every generated function: one whose code changed gives the
+   host its address, which r15 holds on the way in, for the host to run some
+   other way. */
+#define STALE_CHECK(flag) \
+    if (UNLIKELY(flag)) { ctx->exit = EXIT_UNWIND; return; }
 
 /* a function written by hand to run instead of the one at address, odd for
    Thumb, or at an offset in a module. see docs/overrides.md. */

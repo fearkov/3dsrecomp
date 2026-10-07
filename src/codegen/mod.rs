@@ -254,6 +254,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             emit!(prototypes, "extern uint32_t {prefix}base;");
         }
         emit!(prototypes, "extern RECOMP_HIDDEN uint8_t {prefix}recomp_stale[];");
+        emit!(prototypes, "extern RECOMP_HIDDEN uint32_t {prefix}recomp_starts[];");
         for item in &replaced {
             emit!(prototypes, "void {}(Context *ctx);", item.name);
         }
@@ -266,7 +267,6 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         // each function's labels with those after what it interprets
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for (number, (&entry, function)) in functions.iter().enumerate() {
-            let stale = format!("{prefix}recomp_stale[{number}]");
             if source.is_empty() {
                 source.push_str("#include \"recomp.h\"\n");
             }
@@ -279,7 +279,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             let interpreted = std::cell::RefCell::new(Vec::new());
             let relative = unit.module.is_some();
             let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut String::new(), unit.program, &scope, entry, function, &stale);
+            write_function(&mut String::new(), unit.program, &scope, entry, function, number);
             let mut resumable = (*function).clone();
             for address in interpreted.take() {
                 let at = function.instructions.iter().position(|&a| a == address);
@@ -288,7 +288,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                 }
             }
             let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut source, unit.program, &scope, entry, &resumable, &stale);
+            write_function(&mut source, unit.program, &scope, entry, &resumable, number);
             resumed.insert(entry, resumable.labels);
             size += function.instructions.len();
             if size >= FILE_SIZE {
@@ -379,7 +379,9 @@ fn spans(program: &Program, function: &Function) -> Vec<(u32, u32)> {
 }
 
 /// a unit's stale flags and the tables saying what its functions were
-/// made from, with its Origins added to origins.
+/// made from, with its Origins added to origins. the code is cut into pieces
+/// wherever a function's code starts or ends, so that the host hashes every
+/// byte once, functions holding the code of others as they do.
 fn write_origins(
     tables: &mut String,
     origins: &mut String,
@@ -390,26 +392,36 @@ fn write_origins(
 ) {
     let count = functions.len();
     emit!(tables, "RECOMP_HIDDEN uint8_t {prefix}recomp_stale[{}];", count.max(1));
-    let mut all = Vec::new();
-    let mut made = String::new();
-    for function in functions.values() {
-        let mut hash = recomp_abi::CodeHash::default();
-        let spans = spans(program, function);
-        let at = |address: u32| address.wrapping_sub(program.text.base) as usize;
-        for &(start, end) in &spans {
-            hash.add(program.text.bytes.get(at(start)..at(end)).unwrap_or_default());
-        }
-        emit!(made, "    {{0x{:016X}ull, {}, {}}},", hash.value(), all.len(), spans.len());
-        all.extend(spans);
-    }
-    if count == 0 {
-        emit!(origins, "    {{0, 0, 0, 0, {prefix}recomp_stale}},");
+    let starts: Vec<String> = functions.keys().map(|entry| format!("0x{entry:08X}u")).collect();
+    emit!(tables, "RECOMP_HIDDEN uint32_t {prefix}recomp_starts[{}] = {{{}}};", count.max(1), starts.join(", "));
+    let spans: Vec<Vec<(u32, u32)>> = functions.values().map(|function| spans(program, function)).collect();
+    let pieces = pieces(spans.iter().flatten().copied());
+    if pieces.is_empty() {
+        emit!(origins, "    {{0, 0, 0, 0, 0, 0, {prefix}recomp_stale, {prefix}recomp_starts}},");
         return;
     }
+
+    emit!(tables, "static const Piece {prefix}origin_pieces[] = {{");
+    let at = |address: u32| address.wrapping_sub(program.text.base) as usize;
+    for &(start, end) in &pieces {
+        let mut hash = recomp_abi::CodeHash::default();
+        hash.add(program.text.bytes.get(at(start)..at(end)).unwrap_or_default());
+        emit!(tables, "    {{0x{start:08X}u, 0x{end:08X}u, 0x{:016X}ull}},", hash.value());
+    }
+    emit!(tables, "}};");
+    let (mut made, mut runs) = (String::new(), Vec::new());
+    for (spans, entry) in spans.iter().zip(functions.keys()) {
+        emit!(made, "    {{{}, {}, 0x{entry:08X}u}},", runs.len(), spans.len());
+        for &(start, end) in spans {
+            let first = pieces.partition_point(|&(piece, _)| piece < start);
+            let last = pieces.partition_point(|&(piece, _)| piece < end);
+            runs.push((first, last));
+        }
+    }
     emit!(tables, "static const Origin {prefix}origin_functions[] = {{\n{made}}};");
-    emit!(tables, "static const Span {prefix}origin_spans[] = {{");
-    for (start, end) in all {
-        emit!(tables, "    {{0x{start:08X}u, 0x{end:08X}u}},");
+    emit!(tables, "static const Run {prefix}origin_runs[] = {{");
+    for (first, end) in runs {
+        emit!(tables, "    {{{first}, {end}}},");
     }
     emit!(tables, "}};");
     emit!(tables, "static const uint32_t {prefix}origin_owners[] = {{");
@@ -417,17 +429,53 @@ fn write_origins(
         emit!(tables, "    {owner}u,");
     }
     emit!(tables, "}};\n");
-    emit!(origins, "    {{{count}, {prefix}origin_functions, {prefix}origin_spans, {prefix}origin_owners, {prefix}recomp_stale}},");
+    emit!(
+        origins,
+        "    {{{count}, {}, {prefix}origin_pieces, {prefix}origin_functions, {prefix}origin_runs, {prefix}origin_owners, {prefix}recomp_stale, {prefix}recomp_starts}},",
+        pieces.len()
+    );
 }
 
-fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, stale: &str) {
+/// the pieces spans cut the code into, in order and without overlaps: the
+/// code some span covers, cut wherever any of them starts or ends.
+fn pieces(spans: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
+    let mut spans: Vec<(u32, u32)> = spans.collect();
+    spans.sort_unstable();
+    let cuts: BTreeSet<u32> = spans.iter().flat_map(|&(start, end)| [start, end]).collect();
+    let mut pieces = Vec::new();
+    let mut covered: Option<(u32, u32)> = None;
+    // each stretch covered without a gap, cut at every start and end in it
+    let cut = |(start, end): (u32, u32), pieces: &mut Vec<(u32, u32)>| {
+        let mut from = start;
+        for &at in cuts.range(start + 1..end) {
+            pieces.push((from, at));
+            from = at;
+        }
+        pieces.push((from, end));
+    };
+    for (start, end) in spans {
+        match covered {
+            Some((from, to)) if start <= to => covered = Some((from, to.max(end))),
+            _ => {
+                if let Some(stretch) = covered {
+                    cut(stretch, &mut pieces);
+                }
+                covered = Some((start, end));
+            }
+        }
+    }
+    if let Some(stretch) = covered {
+        cut(stretch, &mut pieces);
+    }
+    pieces
+}
+
+/// a function, the number-th of its unit.
+fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
     let thumb = function.mode == Mode::Thumb;
     emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
-    // before the registers are taken into locals, a stale function has
-    // nothing to put back
-    emit!(out, "    STALE_CHECK({stale})");
     let mut body = String::new();
-    write_body(&mut body, program, scope, entry, function);
+    write_body(&mut body, program, scope, entry, function, number);
     out.push_str(&locals::keep(&body));
     emit!(out, "}}");
     out.push_str(locals::RESET);
@@ -435,7 +483,7 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
 }
 
 /// what a function does, between its braces.
-fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
+fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
     let thumb = function.mode == Mode::Thumb;
     let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
     if scope.relative {
@@ -444,7 +492,14 @@ fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, fu
     emit!(out, "    uint32_t target = ctx->r[15], resume = 0;");
     // a function is only ever entered in its own state, callers and the
     // host's lookups see to that, so the entry needs no look at thumb
-    emit!(out, "    if (LIKELY(target == {})) goto L_{entry:08X};", scope.at(entry));
+    // its start comes from memory, where the host puts an address nothing
+    // starts at once the function is stale, so that calls pay for the check
+    // with nothing more than the compare they make anyway, and whatever
+    // misses goes past the flag
+    let prefix = scope.prefix;
+    let start = if scope.relative { format!("(module_base + {prefix}recomp_starts[{number}])") } else { format!("{prefix}recomp_starts[{number}]") };
+    emit!(out, "    if (LIKELY(target == {start})) goto L_{entry:08X};");
+    emit!(out, "    STALE_CHECK({prefix}recomp_stale[{number}])");
     emit!(out, "dispatch:");
     let offset = if scope.relative { "target - module_base" } else { "target" };
     emit!(out, "    if ({state}) switch ({offset}) {{");
@@ -546,17 +601,27 @@ mod tests {
         // bl BASE + 8, bx lr, then the callee, bx lr
         let files = generated(&[]);
         let code = &files["code000.c"];
-        assert!(code.contains("STALE_CHECK(recomp_stale[0])"));
+        assert!(code.contains("if (LIKELY(target == recomp_starts[0])) goto L_00100000;\n    STALE_CHECK(recomp_stale[0])"));
         assert!(code.contains("STALE_CHECK(recomp_stale[1])"));
+        assert!(files["entries.c"].contains("uint32_t recomp_starts[2] = {0x00100000u, 0x00100008u};"));
         let tables = &files["entries.c"];
         let mut caller = recomp_abi::CodeHash::default();
         caller.add(&[0x00, 0x00, 0x00, 0xEB, 0x1E, 0xFF, 0x2F, 0xE1]);
-        assert!(tables.contains(&format!("{{0x{:016X}ull, 0, 1}},", caller.value())), "{tables}");
-        assert!(tables.contains("{0x00100000u, 0x00100008u},"));
-        assert!(tables.contains("{0x00100008u, 0x0010000Cu},"));
-        assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, origin_functions, origin_spans, origin_owners, recomp_stale},"));
+        assert!(tables.contains(&format!("{{0x00100000u, 0x00100008u, 0x{:016X}ull}},", caller.value())), "{tables}");
+        assert!(tables.contains("{0x00100008u, 0x0010000Cu, 0x"));
+        // a function each, a run of one piece each
+        assert!(tables.contains("static const Run origin_runs[] = {\n    {0, 1},\n    {1, 2},\n};"), "{tables}");
+        assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, 2, origin_pieces, origin_functions, origin_runs, origin_owners, recomp_stale, recomp_starts},"));
 
         compiles("origins", &files, &["code000.c", "entries.c"]);
+    }
+
+    /// code several functions hold is cut where any of them starts or ends,
+    /// and each function's code is whole pieces.
+    #[test]
+    fn overlapping_code_is_cut_into_pieces() {
+        let pieces = pieces([(0x100, 0x120), (0x110, 0x118), (0x118, 0x130), (0x200, 0x204)].into_iter());
+        assert_eq!(pieces, [(0x100, 0x110), (0x110, 0x118), (0x118, 0x120), (0x120, 0x130), (0x200, 0x204)]);
     }
 
     /// a file holding functions of the executable and of a module declares
@@ -578,7 +643,8 @@ mod tests {
         let code = &files["code000.c"];
         assert!(code.contains("#include \"m001_functions.h\"") && code.contains("#include \"m002_functions.h\""));
         assert!(code.contains("STALE_CHECK(m002_recomp_stale[1])"));
-        assert!(files["entries.c"].contains("{2, m002_origin_functions, m002_origin_spans, m002_origin_owners, m002_recomp_stale},"));
+        assert!(code.contains("if (LIKELY(target == (module_base + m002_recomp_starts[1])))"));
+        assert!(files["entries.c"].contains("{2, 2, m002_origin_pieces, m002_origin_functions, m002_origin_runs, m002_origin_owners, m002_recomp_stale, m002_recomp_starts},"));
 
         compiles("units", &files, &["code000.c", "entries.c"]);
     }

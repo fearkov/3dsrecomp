@@ -78,38 +78,54 @@ typedef struct Module {
     const Entry *entries;
 } Module;
 
-/* a stretch of guest code, from start up to end, as addresses, or as
-   offsets in a module. */
-typedef struct Span {
+/* a piece of guest code, from start up to end, as addresses or as offsets
+   in a module, and a hash of its bytes, 64-bit FNV-1a. a unit's pieces come
+   in order and never overlap, they are cut wherever a function's code starts
+   or ends, so each function's code is a few runs of whole pieces and every
+   byte is hashed once however many functions hold it. */
+typedef struct Piece {
     uint32_t start;
     uint32_t end;
-} Span;
-
-/* what a function was made from: its first span in its unit's spans, how
-   many it has, and a hash of their bytes, 64-bit FNV-1a over the spans one
-   after another. */
-typedef struct Origin {
     uint64_t hash;
+} Piece;
+
+/* a run of a unit's pieces, from first up to end, as indices. */
+typedef struct Run {
+    uint32_t first;
+    uint32_t end;
+} Run;
+
+/* a function's code, count runs from the unit's runs[first], and where it
+   starts, as an address or an offset in its module. */
+typedef struct Origin {
     uint32_t first;
     uint32_t count;
+    uint32_t start;
 } Origin;
 
-/* the functions of the executable or of a module, the entry each of its
-   entries runs, and a flag for each function. a host sets a function's flag
-   when the code in memory is no longer what it was made from, a mod changed
-   it say, and from then on entering the function hands the host its
-   address instead of running it. */
+/* the code of the executable or of a module, its functions, the entry each
+   of its entries runs, and a flag for each function. a host sets a
+   function's flag when the code in memory is no longer what it was made
+   from, a mod changed it say, and from then on entering the function hands
+   the host its address instead of running it. */
 typedef struct Origins {
     uint32_t count;
+    uint32_t piece_count;
+    const Piece *pieces;
     const Origin *functions;
-    const Span *spans;
+    const Run *runs;
     /* for each entry, the function that runs it, or NO_ORIGIN for code
        written by hand. */
     const uint32_t *owners;
     uint8_t *stale;
+    /* the start each function compares r15 with on the way in, which a host
+       sets to NO_START for a stale one, along with its flag. */
+    uint32_t *starts;
 } Origins;
 
 #define NO_ORIGIN 0xFFFFFFFFu
+/* an address no code starts at, odd and past everything. */
+#define NO_START 0xFFFFFFFFu
 
 #ifdef _WIN32
 #define RECOMP_EXPORT __declspec(dllexport)
@@ -712,9 +728,10 @@ static inline void recomp_call(Context *ctx) {
     SYNC_IN(); \
 } while (0)
 
-/* the start of every generated function: one whose code changed gives the
-   host its address, which r15 holds on the way in, for the host to run some
-   other way. */
+/* where a generated function goes when r15 is not its start, which a stale
+   function's never is: one whose code changed gives the host the address it
+   was entered at, which r15 holds, for the host to run some other way. its
+   registers only went into locals, nothing has to be put back. */
 #define STALE_CHECK(flag) \
     if (UNLIKELY(flag)) { ctx->exit = EXIT_UNWIND; return; }
 

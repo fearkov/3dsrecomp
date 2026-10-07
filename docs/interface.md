@@ -43,14 +43,14 @@ Zakuro does it on its own.
 | `recomp_entries` | `const Entry[]` | The executable's entries |
 | `recomp_module_count` | `const uint32_t` | Number of modules |
 | `recomp_modules` | `const Module[]` | One per CRO module |
-| `recomp_origins` | `const Origins[]` | What the code was made from, the executable's and then one per module, missing before generation 2 |
+| `recomp_origins` | `const Origins[]` | What the code was made from, the executable's and then one per module, read from generation 3 on |
 
 Check `recomp_abi` first, and refuse to run the library when it is not the
 version you were written for. The version goes up whenever the layout of any
 structure or the meaning of any field changes.
 
 `recomp_generation` goes up when the generated code gets much faster or does
-more, without the interface changing. Generation 2 added `recomp_origins`. A
+more, without the interface changing. Generation 3 added `recomp_origins`. A
 library of an older generation, or one without the symbol, still runs.
 Building it again brings the improvements, which a host can suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
 `recomp_abi::GENERATION` is the current one.
@@ -110,22 +110,30 @@ module's `entries` for the offset, keeping bit 0 for Thumb.
 ### Origins
 
 ```c
-typedef struct Span {
+typedef struct Piece {
     uint32_t start, end;
-} Span;
+    uint64_t hash;
+} Piece;
+
+typedef struct Run {
+    uint32_t first, end;
+} Run;
 
 typedef struct Origin {
-    uint64_t hash;
     uint32_t first;
     uint32_t count;
+    uint32_t start;
 } Origin;
 
 typedef struct Origins {
     uint32_t count;
+    uint32_t piece_count;
+    const Piece *pieces;
     const Origin *functions;
-    const Span *spans;
+    const Run *runs;
     const uint32_t *owners;
     uint8_t *stale;
+    uint32_t *starts;
 } Origins;
 ```
 
@@ -135,33 +143,43 @@ version than the one recompiled. `recomp_origins` lets a host find the
 functions that no longer match and keep them from running.
 
 There is one `Origins` for the executable, then one for each module, in the
-order of `recomp_modules`. For each function of its unit:
+order of `recomp_modules`.
 
-- `functions[i]` gives the function's spans, `count` of them from
-  `spans[first]`, and `hash`, the 64-bit FNV-1a hash of the bytes of its spans
-  one after another. A span covers instructions that follow each other, from
-  `start` up to `end`, as addresses, or offsets in a module, like the entries.
-- `stale[i]` is the function's flag. It starts at zero.
+- `pieces` cut the unit's code, the instructions its functions were made from,
+  into `piece_count` pieces, in order and without overlaps. A piece is cut
+  wherever any function's code starts or ends, so each function's code is
+  made of whole pieces, and a byte several functions hold is in one piece.
+  `start` and `end` are addresses, or offsets in a module like the entries,
+  and `hash` is the 64-bit FNV-1a hash of the piece's bytes.
+- `functions[i]` is function `i`'s code, `count` runs from `runs[first]`, and
+  `start`, where it starts. A run covers the pieces from index `first` up to
+  `end`.
+- `stale[i]` is function `i`'s flag. It starts at zero.
+- `starts[i]` is the start function `i` compares `r[15]` with on the way in.
+  It starts as `functions[i].start`.
+- `owners` has one value for each of the unit's entries, in the same order:
+  the function that runs the entry, or `NO_ORIGIN` for an override.
 
-`owners` has one value for each of the unit's entries, in the same order: the
-function that runs the entry, or `NO_ORIGIN` for an override.
+To check a unit, hash each piece's bytes now in memory, adding the load
+address for a module. For every function with a run that holds a piece whose
+hash differs, set `stale[i]` to 1 and `starts[i]` to `NO_START`, and for the
+others set them back to 0 and `functions[i].start`. Do it once the executable's code is in
+memory, and for a module each time it is loaded, after its relocations are
+applied. Those only change data, never the pieces. From then on:
 
-To check a unit, hash the bytes now in memory at each function's spans, adding
-the load address for a module, and set `stale[i]` to 1 where the hash differs.
-Do it once the executable's code is in memory, and for a module each time it
-is loaded, after its relocations are applied. Those only change data, never the
-spans. From then on:
-
-- every generated function starts by checking its flag, and a stale one leaves
-  with `EXIT_UNWIND` without doing anything, `r[15]` still holding the address
-  it was entered at. Calls between functions are C calls, which is why the
-  check has to be in the function and not in the host's lookups alone;
+- every generated function compares `r[15]` with `starts[i]` on the way in, a
+  compare it makes anyway to go straight to its start, and checks its flag
+  only when they differ. A stale one leaves with `EXIT_UNWIND` without doing
+  anything, `r[15]` still holding the address it was entered at. Calls between
+  functions are C calls, which is why the check has to be in the function and
+  not in the host's lookups alone;
 - the host's own lookups have to skip entries whose owner is stale, or it would
   enter the function again right away. It runs that code some other way
   instead, with an interpreter.
 
 In Rust, `Library::check` does the hashing and sets the flags, and
-`Library::lookup` skips the stale entries.
+`Library::lookup` skips the stale entries. Generation 2 had another layout for
+these tables, which no host reads.
 
 ## The context
 

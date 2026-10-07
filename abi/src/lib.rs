@@ -15,9 +15,9 @@ pub const ABI: u32 = 4;
 
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
-/// at 2. code of an older one still runs, and building it again brings the
+/// at 2, and doing that much faster at 3. code of an older one still runs, and building it again brings the
 /// improvements, which a host can suggest.
-pub const GENERATION: u32 = 2;
+pub const GENERATION: u32 = 3;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -118,36 +118,53 @@ impl Module {
     }
 }
 
-/// a stretch of guest code, as addresses, or offsets in a module.
+/// a piece of guest code, as addresses or offsets in a module, and the hash
+/// of its bytes. a unit's pieces are in order and never overlap.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub struct Span {
+pub struct Piece {
     pub start: u32,
+    pub end: u32,
+    pub hash: u64,
+}
+
+/// a run of a unit's pieces, as indices.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Run {
+    pub first: u32,
     pub end: u32,
 }
 
-/// what a function was made from, its spans in its unit's table and a
-/// hash of their bytes, see CodeHash.
+/// a function's code, count runs from the unit's runs[first], and where it
+/// starts.
 #[repr(C)]
 pub struct Origin {
-    pub hash: u64,
     pub first: u32,
     pub count: u32,
+    pub start: u32,
 }
 
-/// the functions of the executable or a module, the function each entry
-/// runs, and a flag per function the host sets when its code changed.
+/// the code of the executable or a module, its functions, the function
+/// each entry runs, and a flag per function the host sets when its code
+/// changed.
 #[repr(C)]
 pub struct Origins {
     count: u32,
+    piece_count: u32,
+    pieces: *const Piece,
     functions: *const Origin,
-    spans: *const Span,
+    runs: *const Run,
     owners: *const u32,
     stale: *mut u8,
+    starts: *mut u32,
 }
 
 /// an entry's owner when code written by hand runs it.
 pub const NO_ORIGIN: u32 = u32::MAX;
+
+/// the start a stale function gets, which nothing starts at.
+pub const NO_START: u32 = u32::MAX;
 
 /// the hash of the bytes a function was made from, 64-bit FNV-1a over its
 /// spans one after another.
@@ -173,15 +190,29 @@ impl CodeHash {
 }
 
 impl Origins {
+    pub fn pieces(&self) -> &[Piece] {
+        if self.pieces.is_null() {
+            return &[];
+        }
+        // SAFETY: the generated table has piece_count pieces
+        unsafe { std::slice::from_raw_parts(self.pieces, self.piece_count as usize) }
+    }
+
     pub fn functions(&self) -> &[Origin] {
+        if self.functions.is_null() {
+            return &[];
+        }
         // SAFETY: the generated table has count functions
         unsafe { std::slice::from_raw_parts(self.functions, self.count as usize) }
     }
 
-    pub fn spans(&self) -> &[Span] {
+    pub fn runs(&self) -> &[Run] {
         let count = self.functions().iter().map(|f| (f.first + f.count) as usize).max().unwrap_or(0);
-        // SAFETY: the functions' spans are all in the table
-        unsafe { std::slice::from_raw_parts(self.spans, count) }
+        if count == 0 {
+            return &[];
+        }
+        // SAFETY: the functions' runs are all in the table
+        unsafe { std::slice::from_raw_parts(self.runs, count) }
     }
 
     /// whether the function that runs entry i is stale.
@@ -280,7 +311,11 @@ impl Library {
             let mut code = Library::linked(&linked)?;
             // libraries made before it said have none
             code.generation = symbol(b"recomp_generation").map_or(0, |generation| *(generation as *const u32));
-            code.origins = symbol(b"recomp_origins").map_or(std::ptr::null(), |origins| origins as *const Origins);
+            // generation 2 laid the table out differently, nothing was made
+            // with it but tests
+            if code.generation >= 3 {
+                code.origins = symbol(b"recomp_origins").map_or(std::ptr::null(), |origins| origins as *const Origins);
+            }
             code._library = Some(library);
             Ok(code)
         }
@@ -356,22 +391,33 @@ impl Library {
     /// checks the functions of unit against the code in memory, which read
     /// fills in from an address, the unit's offsets added to base. those
     /// whose bytes changed are marked stale and run no more, and how many
-    /// there are comes back.
+    /// there are comes back. each piece of code is read and hashed once.
     pub fn check(&mut self, unit: usize, base: u32, mut read: impl FnMut(u32, &mut [u8])) -> usize {
         let Some(origins) = self.origins(unit) else { return 0 };
-        let mut stale = 0;
-        let mut bytes = Vec::new();
-        for (index, function) in origins.functions().iter().enumerate() {
+        let pieces = origins.pieces();
+        let (Some(first), Some(last)) = (pieces.first(), pieces.last()) else { return 0 };
+        let mut code = vec![0; (last.end - first.start) as usize];
+        read(base.wrapping_add(first.start), &mut code);
+        // how many of the pieces before each one changed
+        let mut changed_before = Vec::with_capacity(pieces.len() + 1);
+        changed_before.push(0u32);
+        for piece in pieces {
             let mut hash = CodeHash::default();
-            for span in &origins.spans()[function.first as usize..(function.first + function.count) as usize] {
-                bytes.resize(span.end.wrapping_sub(span.start) as usize, 0);
-                read(base.wrapping_add(span.start), &mut bytes);
-                hash.add(&bytes);
+            hash.add(&code[(piece.start - first.start) as usize..(piece.end - first.start) as usize]);
+            let changed = (hash.value() != piece.hash) as u32;
+            changed_before.push(changed_before.last().unwrap() + changed);
+        }
+        let runs = origins.runs();
+        let mut stale = 0;
+        for (index, function) in origins.functions().iter().enumerate() {
+            let runs = &runs[function.first as usize..(function.first + function.count) as usize];
+            let changed = runs.iter().any(|run| changed_before[run.end as usize] > changed_before[run.first as usize]);
+            // SAFETY: the flags and starts are the code's own, one of each
+            // per function, which only the thread running it reads
+            unsafe {
+                *origins.stale.add(index) = changed as u8;
+                *origins.starts.add(index) = if changed { NO_START } else { function.start };
             }
-            let changed = hash.value() != function.hash;
-            // SAFETY: the flags are the code's own, one per function, which
-            // only the thread running it reads
-            unsafe { *origins.stale.add(index) = changed as u8 };
             stale += changed as usize;
         }
         stale
@@ -427,13 +473,16 @@ int main(void) {
     AT(Entry, address); AT(Entry, code);
     SIZE(Module);
     AT(Module, name); AT(Module, base); AT(Module, size); AT(Module, count); AT(Module, entries);
-    SIZE(Span);
-    AT(Span, start); AT(Span, end);
+    SIZE(Piece);
+    AT(Piece, start); AT(Piece, end); AT(Piece, hash);
+    SIZE(Run);
+    AT(Run, first); AT(Run, end);
     SIZE(Origin);
-    AT(Origin, hash); AT(Origin, first); AT(Origin, count);
+    AT(Origin, first); AT(Origin, count); AT(Origin, start);
     SIZE(Origins);
-    AT(Origins, count); AT(Origins, functions); AT(Origins, spans); AT(Origins, owners); AT(Origins, stale);
-    printf("NO_ORIGIN %u\n", NO_ORIGIN);
+    AT(Origins, count); AT(Origins, piece_count); AT(Origins, pieces); AT(Origins, functions); AT(Origins, runs);
+    AT(Origins, owners); AT(Origins, stale); AT(Origins, starts);
+    printf("NO_ORIGIN %u\nNO_START %u\n", NO_ORIGIN, NO_START);
     printf("RECOMP_ABI %d\n", RECOMP_ABI);
     printf("EXIT_NONE %d\nEXIT_SVC %d\nEXIT_BUDGET %d\nEXIT_UNWIND %d\n", EXIT_NONE, EXIT_SVC, EXIT_BUDGET, EXIT_UNWIND);
     return 0;
@@ -445,6 +494,60 @@ int main(void) {
             $lines.push(format!("{} {}", stringify!($type), size_of::<$type>()));
             $($lines.push(format!("{}.{} {}", stringify!($type), stringify!($field), offset_of!($type, $field)));)*
         };
+    }
+
+    /// a changed byte marks the functions whose code holds it, and only
+    /// those, each piece hashed once whichever functions share it.
+    #[test]
+    fn a_changed_byte_marks_the_functions_holding_it() {
+        let mut memory = vec![0u8; 0x40];
+        for (i, byte) in memory.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let hash = |memory: &[u8], start: u32, end: u32| {
+            let mut hash = CodeHash::default();
+            hash.add(&memory[(start - 0x10) as usize..(end - 0x10) as usize]);
+            hash.value()
+        };
+        let pieces = [(0x10, 0x20), (0x20, 0x28), (0x28, 0x30)]
+            .map(|(start, end)| Piece { start, end, hash: hash(&memory, start, end) });
+        // one function holds all the code, one the middle piece, one the last
+        let runs = [Run { first: 0, end: 3 }, Run { first: 1, end: 2 }, Run { first: 2, end: 3 }];
+        let functions = [Origin { first: 0, count: 1, start: 0x10 }, Origin { first: 1, count: 1, start: 0x20 }, Origin { first: 2, count: 1, start: 0x28 }];
+        let owners = [0u32, 1, 2];
+        let mut stale = [0u8; 3];
+        let mut starts = [0x10u32, 0x20, 0x28];
+        let origins = Origins {
+            count: 3,
+            piece_count: 3,
+            pieces: pieces.as_ptr(),
+            functions: functions.as_ptr(),
+            runs: runs.as_ptr(),
+            owners: owners.as_ptr(),
+            stale: stale.as_mut_ptr(),
+            starts: starts.as_mut_ptr(),
+        };
+        let mut library = Library {
+            entries: std::ptr::null(),
+            count: 0,
+            modules: std::ptr::null(),
+            module_count: 0,
+            placed: Vec::new(),
+            generation: GENERATION,
+            origins: &origins,
+            #[cfg(feature = "load")]
+            _library: None,
+        };
+        let read = |memory: &[u8]| {
+            let memory = memory.to_vec();
+            move |address: u32, out: &mut [u8]| out.copy_from_slice(&memory[(address - 0x10) as usize..][..out.len()])
+        };
+        assert_eq!(library.check(0, 0, read(&memory)), 0);
+        memory[0x2A - 0x10] ^= 1;
+        assert_eq!(library.check(0, 0, read(&memory)), 2);
+        assert_eq!(stale, [1, 0, 1]);
+        assert_eq!(starts, [NO_START, 0x20, NO_START]);
+        assert!(origins.owner_is_stale(0) && !origins.owner_is_stale(1));
     }
 
     /// recomp.h and the structs here describe the same memory, which a C
@@ -480,10 +583,12 @@ int main(void) {
         at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
-        at!(lines, Span, start, end);
-        at!(lines, Origin, hash, first, count);
-        at!(lines, Origins, count, functions, spans, owners, stale);
+        at!(lines, Piece, start, end, hash);
+        at!(lines, Run, first, end);
+        at!(lines, Origin, first, count, start);
+        at!(lines, Origins, count, piece_count, pieces, functions, runs, owners, stale, starts);
         lines.push(format!("NO_ORIGIN {NO_ORIGIN}"));
+        lines.push(format!("NO_START {NO_START}"));
         lines.push(format!("RECOMP_ABI {ABI}"));
         for (name, value) in
             [("EXIT_NONE", EXIT_NONE), ("EXIT_SVC", EXIT_SVC), ("EXIT_BUDGET", EXIT_BUDGET), ("EXIT_UNWIND", EXIT_UNWIND)]

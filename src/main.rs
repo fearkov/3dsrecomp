@@ -13,7 +13,7 @@ use std::process::exit;
 use recomp3ds::build::{self, Event};
 use recomp3ds::discover::{self, Analysis, Byte, Mode, Program, Source};
 use recomp3ds::rom::Title;
-use recomp3ds::{compile, port};
+use recomp3ds::{compile, port, Mods};
 #[cfg(feature = "verify")]
 use recomp3ds::{abi, codegen, image, imported, module_files, static_module, verify};
 
@@ -86,7 +86,7 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
         eprintln!("could not load {path}, {error}");
         exit(1);
     });
-    let programs = recomp3ds::programs(&title).unwrap_or_else(|error| {
+    let programs = recomp3ds::programs(&title, Mods::default()).unwrap_or_else(|error| {
         eprintln!("could not read the code, {error}");
         exit(1);
     });
@@ -96,7 +96,7 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
 /// builds the library in dir, or when there is none in the cache, and then
 /// installs it where hosts look for it.
 fn build(path: &str, given: Option<&Path>, options: &Options) {
-    let build_options = build::Options { dir: given, overrides: options.overrides.as_deref(), cancel: None };
+    let build_options = build::Options { dir: given, overrides: options.overrides.as_deref(), ..build::Options::default() };
     if let Err(error) = build::build(Path::new(path), &build_options, &print_event) {
         eprintln!("{error}");
         exit(1);
@@ -123,7 +123,7 @@ fn print_event(event: Event) {
 
 /// a Cargo project at dir that builds the title into a program of its own.
 fn port(path: &str, dir: &Path, options: &Options) {
-    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), &print_event)
+    let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), Mods::default(), &print_event)
         .unwrap_or_else(|error| {
             eprintln!("{error}");
             exit(1);
@@ -182,8 +182,8 @@ fn check(path: &str, library: &Path, count: usize) {
     print_report("executable", &executable);
 
     let mut modules = verify::Report::default();
-    let files = module_files(&title);
-    let crs = static_module(&title);
+    let files = module_files(&title, Mods::default());
+    let crs = static_module(&title, Mods::default());
     for (module, bytes) in &files {
         let Some(index) = library.module_index(&module.name) else { continue };
         let Some(program) = module.program(bytes, &imported(&files, crs.as_ref(), module)) else { continue };

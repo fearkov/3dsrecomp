@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::discover::{self, Analysis, Mode, Program, Source};
 use crate::overrides::{self, Override};
 use crate::rom::Title;
-use crate::{abi, codegen, compile};
+use crate::{abi, codegen, compile, Mods};
 
 /// what happens along the way.
 #[derive(Debug, Clone, PartialEq)]
@@ -34,6 +34,9 @@ pub struct Options<'a> {
     pub overrides: Option<&'a Path>,
     /// set from elsewhere to stop it.
     pub cancel: Option<&'a AtomicBool>,
+    /// the code and modules a mod changes, recompiled in place of the
+    /// title's own.
+    pub mods: Mods<'a>,
 }
 
 /// the title's code written as C.
@@ -45,15 +48,16 @@ pub struct Generated {
 }
 
 /// writes the title at rom as C in the dir pick chooses, the overrides with
-/// it.
+/// it, and what the mods change in place of the title's own code and files.
 pub fn generate(
     rom: &Path,
     pick: impl FnOnce(&Title) -> PathBuf,
     overrides: Option<&Path>,
+    mods: Mods,
     events: &(dyn Fn(Event) + Sync),
 ) -> Result<Generated, String> {
     let title = Title::load(rom).map_err(|error| format!("could not load {}, {error}", rom.display()))?;
-    let mut programs = crate::programs(&title).map_err(|error| format!("could not read the code, {error}"))?;
+    let mut programs = crate::programs(&title, mods).map_err(|error| format!("could not read the code, {error}"))?;
     let dir = pick(&title);
     let files = match overrides {
         Some(path) => overrides::load(path)?,
@@ -121,7 +125,7 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
     compile::check()?;
     let stopped = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
     let pick = |title: &Title| options.dir.map(Path::to_owned).unwrap_or_else(|| cache_dir(title.program_id()));
-    let generated = generate(rom, pick, options.overrides, events)?;
+    let generated = generate(rom, pick, options.overrides, options.mods, events)?;
     if stopped() {
         return Err("stopped".to_owned());
     }
@@ -215,4 +219,48 @@ pub fn install(library: &Path, program_id: u64) -> Result<PathBuf, String> {
         .and_then(|_| std::fs::rename(&partial, &target))
         .map_err(|error| format!("could not install {}, {error}", target.display()))?;
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cro::tests::named;
+    use crate::rom::tests::rom;
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// a piece of code as the tables write it, with the hash of its bytes.
+    fn piece(start: u32, end: u32, bytes: &[u8]) -> String {
+        let mut hash = abi::CodeHash::default();
+        hash.add(bytes);
+        format!("{{0x{start:08X}u, 0x{end:08X}u, 0x{:016X}ull}},", hash.value())
+    }
+
+    /// the code made with a mod's code and modules says it was made from
+    /// them, so a host running the mod finds none of it stale.
+    #[test]
+    fn generating_with_mods_makes_code_of_what_they_change() {
+        let (own, modded) = ([0xE3A0_0000, 0xE12F_FF1E], [0xE3A0_0001, 0xE12F_FF1E]);
+        let path = rom("generate-mods", &bytes(&own), &[("cro/Battle.cro", &named("Battle", &own))]);
+        let dir = std::env::temp_dir().join(format!("3dsrecomp-generate-mods-{}", std::process::id()));
+        let (code, module) = (bytes(&modded), named("Battle", &modded));
+        let romfs = |path: &str| (path == "cro/Battle.cro").then(|| module.clone());
+        let tables = |mods: Mods| {
+            generate(&path, |_| dir.clone(), None, mods, &|_| {}).unwrap();
+            std::fs::read_to_string(dir.join("entries.c")).unwrap()
+        };
+
+        let tables_modded = tables(Mods { code: Some(&code), romfs: Some(&romfs) });
+        // the executable's function and the module's, a piece each
+        assert!(tables_modded.contains(&piece(0x0010_0000, 0x0010_0008, &code)), "{tables_modded}");
+        assert!(tables_modded.contains(&piece(0x200, 0x208, &code)), "{tables_modded}");
+        let plain = tables(Mods::default());
+        assert!(plain.contains(&piece(0x0010_0000, 0x0010_0008, &bytes(&own))), "{plain}");
+        assert!(plain.contains(&piece(0x200, 0x208, &bytes(&own))), "{plain}");
+
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
 }

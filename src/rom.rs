@@ -430,8 +430,145 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// the id of the titles tests make, which no real title has.
+    const PROGRAM_ID: u64 = 0x0004_0000_0FF3_DE00;
+
+    fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+        out[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// writes a decrypted .cxi to a file named after test and returns its
+    /// path. code is all text, at 0x00100000, and a RomFS holds files at
+    /// their paths when there are any.
+    pub(crate) fn rom(test: &str, code: &[u8], files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        // the NCCH header, never encrypted, the exheader after it, and the
+        // ExeFS at 0x600 with .code its only file
+        let mut out = vec![0; 0x800];
+        put(&mut out, 0x100, b"NCCH");
+        put(&mut out, 0x118, &PROGRAM_ID.to_le_bytes());
+        out[0x18F] = 0x04;
+        put(&mut out, 0x1A0, &3u32.to_le_bytes());
+        put(&mut out, 0x200, b"test");
+        let text = [0x0010_0000, code.len().div_ceil(0x1000) as u32, code.len() as u32];
+        put(&mut out, 0x210, &text.map(u32::to_le_bytes).concat());
+        put(&mut out, 0x600, b".code");
+        put(&mut out, 0x60C, &(code.len() as u32).to_le_bytes());
+        out.extend_from_slice(code);
+        if !files.is_empty() {
+            let (at, romfs) = (out.len().next_multiple_of(MEDIA_UNIT as usize), romfs(files));
+            put(&mut out, 0x1B0, &((at as u64 / MEDIA_UNIT) as u32).to_le_bytes());
+            put(&mut out, 0x1B4, &((romfs.len() as u64).div_ceil(MEDIA_UNIT) as u32).to_le_bytes());
+            out.resize(at, 0);
+            out.extend(romfs);
+        }
+        let path = std::env::temp_dir().join(format!("3dsrecomp-{test}-{}.cxi", std::process::id()));
+        std::fs::write(&path, out).unwrap();
+        path
+    }
+
+    /// a RomFS without hashes, its IVFC header and then level 3, holding
+    /// files at their paths in the folders those need.
+    fn romfs(files: &[(&str, &[u8])]) -> Vec<u8> {
+        // every folder's path and its parent, the root first, and every
+        // file's folder, name and bytes
+        let mut dirs: Vec<(String, usize)> = vec![(String::new(), 0)];
+        let mut leaves = Vec::new();
+        for &(path, bytes) in files {
+            let (folder, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let (mut parent, mut at) = (0, String::new());
+            for part in folder.split('/').filter(|part| !part.is_empty()) {
+                at = if at.is_empty() { part.to_owned() } else { format!("{at}/{part}") };
+                parent = match dirs.iter().position(|(known, _)| *known == at) {
+                    Some(index) => index,
+                    None => {
+                        dirs.push((at.clone(), parent));
+                        dirs.len() - 1
+                    }
+                };
+            }
+            leaves.push((parent, name, bytes));
+        }
+        let utf16 = |name: &str| -> Vec<u8> { name.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let dir_names: Vec<Vec<u8>> = dirs.iter().map(|(path, _)| utf16(path.rsplit('/').next().unwrap_or(""))).collect();
+        let file_names: Vec<Vec<u8>> = leaves.iter().map(|(_, name, _)| utf16(name)).collect();
+        // where each entry starts in its table
+        let offsets = |names: &[Vec<u8>], header: usize| -> Vec<u32> {
+            let mut end = 0;
+            names
+                .iter()
+                .map(|name| {
+                    let at = end;
+                    end += header + name.len().next_multiple_of(4);
+                    at as u32
+                })
+                .collect()
+        };
+        let (dir_at, file_at) = (offsets(&dir_names, 0x18), offsets(&file_names, 0x20));
+        let first = |found: Option<usize>, at: &[u32]| found.map_or(NONE, |index| at[index]);
+
+        let mut dir_table = Vec::new();
+        for (index, &(_, parent)) in dirs.iter().enumerate() {
+            let next = if index == 0 { None } else { (index + 1..dirs.len()).find(|&other| dirs[other].1 == parent) };
+            let child = (1..dirs.len()).find(|&other| dirs[other].1 == index);
+            let file = (0..leaves.len()).find(|&other| leaves[other].0 == index);
+            let name = &dir_names[index];
+            let words = [dir_at[parent], first(next, &dir_at), first(child, &dir_at), first(file, &file_at), NONE, name.len() as u32];
+            dir_table.extend(words.iter().flat_map(|word| word.to_le_bytes()));
+            dir_table.extend_from_slice(name);
+            dir_table.resize(dir_table.len().next_multiple_of(4), 0);
+        }
+        let (mut file_table, mut data) = (Vec::new(), Vec::new());
+        for (index, &(parent, _, bytes)) in leaves.iter().enumerate() {
+            data.resize(data.len().next_multiple_of(16), 0);
+            let next = (index + 1..leaves.len()).find(|&other| leaves[other].0 == parent);
+            let name = &file_names[index];
+            file_table.extend([dir_at[parent], first(next, &file_at)].iter().flat_map(|word| word.to_le_bytes()));
+            file_table.extend([data.len() as u64, bytes.len() as u64].iter().flat_map(|word| word.to_le_bytes()));
+            file_table.extend([NONE, name.len() as u32].iter().flat_map(|word| word.to_le_bytes()));
+            file_table.extend_from_slice(name);
+            file_table.resize(file_table.len().next_multiple_of(4), 0);
+            data.extend_from_slice(bytes);
+        }
+
+        // the IVFC header, no master hash and level 3 in blocks of 16 bytes
+        // right after it, then level 3, its header, the tables without the
+        // hash tables, and the file data
+        let mut out = vec![0; 0x60];
+        put(&mut out, 0, b"IVFC");
+        out[0x4C] = 4;
+        let (dirs_at, files_at) = (0x28, 0x28 + dir_table.len());
+        let data_at = (files_at + file_table.len()).next_multiple_of(16);
+        let header = [0x28, dirs_at, 0, dirs_at, dir_table.len(), files_at, 0, files_at, file_table.len(), data_at];
+        out.extend(header.iter().flat_map(|&word| (word as u32).to_le_bytes()));
+        out.extend(dir_table);
+        out.extend(file_table);
+        out.resize(0x60 + data_at, 0);
+        out.extend(data);
+        out
+    }
+
+    /// the fixture reads back as the title it describes.
+    #[test]
+    fn a_title_made_for_tests_reads_back() {
+        let path = rom("fixture", &[1, 2, 3, 4], &[("static.crs", b"crs"), ("cro/Battle.cro", b"battle"), ("cro/Field.cro", b"field")]);
+        let title = Title::load(&path).unwrap();
+        assert_eq!(title.program_id(), PROGRAM_ID);
+        assert_eq!(title.code().unwrap(), [1, 2, 3, 4]);
+        assert_eq!(title.exheader.text.address, 0x0010_0000);
+        let romfs = title.romfs.as_ref().unwrap();
+        let read = |path: &str| {
+            let file = romfs.lookup(path).unwrap();
+            title.read_romfs(&file, 0, file.data_size as usize).unwrap()
+        };
+        assert_eq!(read("static.crs"), b"crs");
+        assert_eq!(read("cro/Battle.cro"), b"battle");
+        assert_eq!(read("CRO/field.cro"), b"field");
+        drop(title);
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// a literal and a run, the smallest stream that exercises both.
     #[test]

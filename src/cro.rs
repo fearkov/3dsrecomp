@@ -201,9 +201,30 @@ impl Module {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::discover;
+
+    /// a module called name, its code the words at 0x200, exporting where
+    /// that starts.
+    pub(crate) fn named(name: &str, code: &[u32]) -> Vec<u8> {
+        let mut bytes = vec![0; 0x200 + code.len() * 4];
+        let mut put = |at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        put(0x80, u32::from_le_bytes(*b"CRO0"));
+        put(0xC0, 0x180);
+        // one segment, the code, and one export by index, its start
+        put(0xC8, 0x138);
+        put(0xCC, 1);
+        put(0x138, 0x200);
+        put(0x13C, code.len() as u32 * 4);
+        put(0xD8, 0x150);
+        put(0xDC, 1);
+        for (i, &word) in code.iter().enumerate() {
+            put(0x200 + i * 4, word);
+        }
+        bytes[0x180..0x180 + name.len()].copy_from_slice(name.as_bytes());
+        bytes
+    }
 
     /// a module with a header, a code segment at 0x200 and a data segment
     /// at 0x300, holding the code words and one relocation per pointer, each

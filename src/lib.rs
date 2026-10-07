@@ -41,8 +41,12 @@ use rom::{DirEntry, Error, FileEntry, RomFs, Title};
 #[derive(Clone, Copy, Default)]
 pub struct Mods<'a> {
     /// the executable's code, decompressed, its segments one after another
-    /// the way the title's own has them.
+    /// the way the title's own has them, or the way exheader says.
     pub code: Option<&'a [u8]>,
+    /// the extended header the mod gives in place of the title's, at least
+    /// its first 0x400 bytes, which says where the segments of code lie
+    /// when the mod's code moves them.
+    pub exheader: Option<&'a [u8]>,
     /// the RomFS files the mod replaces. the modules and static.crs are
     /// read through it, by their paths from the RomFS's root, / separated
     /// and spelled the way the title has them, like static.crs or
@@ -67,7 +71,10 @@ impl Mods<'_> {
 /// the title's own.
 pub fn programs(title: &Title, mods: Mods) -> Result<Vec<(String, Program)>, Error> {
     let image = match mods.code {
-        Some(code) => image::Image::from_code(&title.exheader, code),
+        Some(code) => {
+            let exheader = mods.exheader.filter(|ex| ex.len() >= 0x400).map(rom::ExHeader::read);
+            image::Image::from_code(exheader.as_ref().unwrap_or(&title.exheader), code)
+        }
         None => image::Image::from_title(title)?,
     };
     let files = module_files(title, mods);
@@ -160,7 +167,24 @@ mod tests {
         let title = Title::load(&path).unwrap();
         let text = |mods: Mods| programs(&title, mods).unwrap()[0].1.text.bytes.clone();
         assert_eq!(text(Mods::default()), own);
-        assert_eq!(text(Mods { code: Some(&modded), romfs: None }), modded);
+        assert_eq!(text(Mods { code: Some(&modded), ..Mods::default() }), modded);
+        drop(title);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// a mod that makes the code longer gives an exheader saying so, and
+    /// its text is all of it, where the title's own exheader would cut it.
+    #[test]
+    fn a_mods_exheader_says_how_much_of_its_code_is_text() {
+        let own = bytes(&[0xE3A0_0000, 0xE12F_FF1E]);
+        let longer = bytes(&[0xE3A0_0000, 0xE12F_FF1E, 0xE12F_FF1E]);
+        let path = rom("exheader-mod", &own, &[]);
+        let title = Title::load(&path).unwrap();
+        let mut exheader = vec![0; 0x400];
+        exheader[0x10..0x1C].copy_from_slice(&[0x0010_0000u32, 1, 12].map(u32::to_le_bytes).concat());
+        let text = |mods: Mods| programs(&title, mods).unwrap()[0].1.text.bytes.clone();
+        assert_eq!(text(Mods { code: Some(&longer), ..Mods::default() }), own);
+        assert_eq!(text(Mods { code: Some(&longer), exheader: Some(&exheader), ..Mods::default() }), longer);
         drop(title);
         std::fs::remove_file(path).unwrap();
     }
@@ -191,7 +215,7 @@ mod tests {
             let programs = programs(&title, mods).unwrap();
             programs.into_iter().find(|(name, _)| name == module).unwrap().1.text.bytes
         };
-        let mods = Mods { code: None, romfs: Some(&romfs) };
+        let mods = Mods { romfs: Some(&romfs), ..Mods::default() };
         assert_eq!(text(mods, "Battle"), bytes(&modded));
         assert_eq!(text(mods, "Field"), bytes(&[0xE12F_FF1E]));
         assert_eq!(static_module(&title, mods).unwrap().name, "|modded|");

@@ -87,6 +87,20 @@ pub struct ExHeader {
     pub bss_size: u32,
 }
 
+impl ExHeader {
+    /// the parts of an extended header read from its first 0x400 bytes.
+    pub fn read(ex: &[u8]) -> ExHeader {
+        ExHeader {
+            title: ascii(&ex[..8]),
+            compress_code: ex[0x0D] & 1 != 0,
+            text: CodeSetInfo::read(ex, 0x10),
+            rodata: CodeSetInfo::read(ex, 0x20),
+            data: CodeSetInfo::read(ex, 0x30),
+            bss_size: u32_at(ex, 0x3C),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     first_child: u32,
@@ -288,15 +302,7 @@ impl Title {
         let romfs_offset = ncch + u32_at(&header, 0x1B0) as u64 * MEDIA_UNIT;
         let has_romfs = u32_at(&header, 0x1B4) != 0 && flags[7] & 0x02 == 0;
 
-        let ex = read(&mut file, ncch + NCCH_HEADER_SIZE, 0x400)?;
-        let exheader = ExHeader {
-            title: ascii(&ex[..8]),
-            compress_code: ex[0x0D] & 1 != 0,
-            text: CodeSetInfo::read(&ex, 0x10),
-            rodata: CodeSetInfo::read(&ex, 0x20),
-            data: CodeSetInfo::read(&ex, 0x30),
-            bss_size: u32_at(&ex, 0x3C),
-        };
+        let exheader = ExHeader::read(&read(&mut file, ncch + NCCH_HEADER_SIZE, 0x400)?);
 
         // ten files, a name, an offset past the header and a size each
         let table = read(&mut file, exefs, EXEFS_HEADER_SIZE as usize)?;

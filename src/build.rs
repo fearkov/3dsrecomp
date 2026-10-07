@@ -275,7 +275,7 @@ mod tests {
             std::fs::read_to_string(dir.join("entries.c")).unwrap()
         };
 
-        let tables_modded = tables(Mods { code: Some(&code), romfs: Some(&romfs) });
+        let tables_modded = tables(Mods { code: Some(&code), romfs: Some(&romfs), ..Mods::default() });
         // the executable's function and the module's, a piece each
         assert!(tables_modded.contains(&piece(0x0010_0000, 0x0010_0008, &code)), "{tables_modded}");
         assert!(tables_modded.contains(&piece(0x200, 0x208, &code)), "{tables_modded}");

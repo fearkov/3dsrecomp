@@ -134,7 +134,8 @@ fn port(path: &str, dir: &Path, options: &Options) {
         print_event(Event::Compiled { done, total });
         true
     };
-    let archived = compile::objects(code, &generated.sources, &progress)
+    let archived = compile::check(None)
+        .and_then(|compiler| compile::objects(&compiler, code, &generated.sources, &progress, false))
         .and_then(|objects| compile::archive(&objects, &code.join("librecomp.a")));
     if let Err(error) = archived {
         eprintln!("{error}");

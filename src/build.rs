@@ -37,6 +37,11 @@ pub struct Options<'a> {
     /// the code and modules a mod changes, recompiled in place of the
     /// title's own.
     pub mods: Mods<'a>,
+    /// the C compiler, the one CC names or the first there is when none.
+    pub compiler: Option<compile::Compiler>,
+    /// compile below normal priority and leave a core, for a game being
+    /// played meanwhile.
+    pub background: bool,
 }
 
 /// the title's code written as C.
@@ -122,7 +127,7 @@ pub fn generate(
 /// recompiles the title at rom into a library and returns where it ended
 /// up, installed when the options name no dir.
 pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> Result<PathBuf, String> {
-    compile::check()?;
+    let compiler = compile::check(options.compiler.as_ref())?;
     let stopped = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
     let pick = |title: &Title| options.dir.map(Path::to_owned).unwrap_or_else(|| cache_dir(title.program_id()));
     let generated = generate(rom, pick, options.overrides, options.mods, events)?;
@@ -136,7 +141,7 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
         events(Event::Compiled { done, total });
         !stopped()
     };
-    compile::compile(&generated.dir, &generated.sources, &library, &progress)?;
+    compile::compile(&compiler, &generated.dir, &generated.sources, &library, &progress, options.background)?;
     events(Event::Built { library: library.clone(), took: start.elapsed() });
     if options.dir.is_some() {
         return Ok(library);
@@ -216,9 +221,27 @@ pub fn install(library: &Path, program_id: u64) -> Result<PathBuf, String> {
     let partial = target.with_extension(format!("{}.new", std::env::consts::DLL_EXTENSION));
     std::fs::create_dir_all(&dir)
         .and_then(|()| std::fs::copy(library, &partial))
-        .and_then(|_| std::fs::rename(&partial, &target))
+        .and_then(|_| step_aside(&target))
+        .and_then(|()| std::fs::rename(&partial, &target))
         .map_err(|error| format!("could not install {}, {error}", target.display()))?;
     Ok(target)
+}
+
+/// moves the library at target out of the way, when there is one. Windows
+/// refuses to replace a library a game being played has loaded, but lets it
+/// be renamed, and the game keeps running it until it loads the new one.
+/// those moved away earlier go when nothing holds them any more.
+fn step_aside(target: &Path) -> std::io::Result<()> {
+    if !cfg!(windows) || !target.exists() {
+        return Ok(());
+    }
+    let aside = |n: u32| target.with_extension(format!("{}.old{n}", std::env::consts::DLL_EXTENSION));
+    for n in 0..16 {
+        // still loaded, or not there
+        let _ = std::fs::remove_file(aside(n));
+    }
+    let free = (0..16).map(aside).find(|path| !path.exists()).unwrap_or_else(|| aside(16));
+    std::fs::rename(target, free)
 }
 
 #[cfg(test)]

@@ -31,25 +31,88 @@ const RESERVE: u64 = 1 << 30;
 /// many, answering whether to go on.
 pub type Progress<'a> = &'a (dyn Fn(usize, usize) -> bool + Sync);
 
-/// whether a program runs, asked for its version.
-fn runs(program: &str) -> bool {
-    Command::new(program).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+/// a C compiler: a program, and the arguments that go before the rest,
+/// none for gcc, cc for zig, whose compiler is zig cc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compiler {
+    pub program: PathBuf,
+    pub leading: Vec<String>,
 }
 
-/// the first of the tools that runs, or the one named in variable.
-fn tool(variable: &str, tools: &[&str]) -> String {
-    std::env::var(variable)
-        .ok()
-        .filter(|name| !name.is_empty())
-        .or_else(|| tools.iter().find(|tool| runs(tool)).map(|tool| tool.to_string()))
-        .unwrap_or_else(|| tools[0].to_owned())
+impl Compiler {
+    pub fn new(program: impl Into<PathBuf>, leading: &[&str]) -> Compiler {
+        Compiler { program: program.into(), leading: leading.iter().map(|arg| arg.to_string()).collect() }
+    }
+
+    /// the compiler CC names, or else the first of the usual ones that runs.
+    /// on Windows MinGW's gcc comes first, it links a DLL with nothing else
+    /// installed.
+    pub fn find() -> Option<Compiler> {
+        if let Some(named) = std::env::var("CC").ok().filter(|named| !named.trim().is_empty()) {
+            return Some(Compiler::named(&named));
+        }
+        let compilers: &[&str] = if cfg!(windows) { &["gcc", "clang", "cc"] } else { &["cc", "gcc", "clang"] };
+        compilers.iter().map(|name| Compiler::new(name, &[])).find(Compiler::runs)
+    }
+
+    /// what CC holds: a program, or a program and the arguments that go
+    /// first, separated by spaces, like zig cc.
+    fn named(value: &str) -> Compiler {
+        if Path::new(value).exists() {
+            return Compiler::new(value, &[]);
+        }
+        let mut words = value.split_whitespace();
+        let program = words.next().unwrap_or(value);
+        Compiler { program: program.into(), leading: words.map(str::to_owned).collect() }
+    }
+
+    /// whether it runs, asked for its version.
+    pub fn runs(&self) -> bool {
+        self.command().arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    }
+
+    /// a command that runs it, its leading arguments given.
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.leading);
+        command
+    }
+
+    /// whether it is gcc, whose options for its garbage the others refuse.
+    fn is_gcc(&self) -> bool {
+        let output = self.command().arg("--version").output();
+        output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("Free Software Foundation"))
+    }
+
+    /// how it is called, for messages.
+    pub fn describe(&self) -> String {
+        std::iter::once(self.program.display().to_string()).chain(self.leading.iter().cloned()).collect::<Vec<_>>().join(" ")
+    }
 }
 
-/// whether compiler is gcc, whose options for its garbage the others refuse.
-fn is_gcc(compiler: &str) -> bool {
-    let output = Command::new(compiler).arg("--version").output();
-    output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("Free Software Foundation"))
+/// makes command run below normal priority, so that a game being played
+/// keeps the processor while it compiles.
+#[cfg(unix)]
+fn lower(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setpriority is safe to call between fork and exec
+    unsafe {
+        command.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            Ok(())
+        });
+    }
 }
+
+#[cfg(windows)]
+fn lower(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lower(_: &mut Command) {}
 
 /// the memory the system has to spare, MemAvailable on Linux and the free
 /// physical memory on Windows, or none when it can't tell.
@@ -90,31 +153,34 @@ fn spare_memory() -> Option<u64> {
     None
 }
 
-/// the C compiler, from CC or else the first there is. on Windows MinGW's
-/// gcc comes first, it links a DLL with nothing else installed.
-fn compiler() -> String {
-    let compilers: &[&str] = if cfg!(windows) { &["gcc", "clang", "cc"] } else { &["cc", "gcc", "clang"] };
-    tool("CC", compilers)
-}
-
-/// whether there is a C compiler to build with.
-pub fn check() -> Result<(), String> {
-    let compiler = compiler();
-    if runs(&compiler) {
-        return Ok(());
+/// the compiler to build with, the one given or else the one find() picks,
+/// when it runs.
+pub fn check(given: Option<&Compiler>) -> Result<Compiler, String> {
+    let compiler = given.cloned().or_else(Compiler::find);
+    if let Some(compiler) = compiler.as_ref().filter(|compiler| compiler.runs()) {
+        return Ok(compiler.clone());
     }
+    let name = compiler.map(|compiler| compiler.describe()).unwrap_or_else(|| if cfg!(windows) { "gcc" } else { "cc" }.to_owned());
     let suggestion = if cfg!(windows) {
         "install MinGW-w64's gcc, from MSYS2 or WinLibs, or LLVM's clang"
     } else {
         "install one such as gcc or clang"
     };
-    Err(format!("there is no C compiler ({compiler}), {suggestion}, or name it in CC"))
+    Err(format!("there is no C compiler ({name}), {suggestion}, or name it in CC"))
 }
 
 /// compiles sources, file names inside dir, and links them into library,
-/// telling progress how many of them are done after each one.
-pub fn compile(dir: &Path, sources: &[String], library: &Path, progress: Progress) -> Result<(), String> {
-    shared(&objects(dir, sources, progress)?, library)
+/// telling progress how many of them are done after each one. in the
+/// background the compilers run below normal priority and leave a core.
+pub fn compile(
+    compiler: &Compiler,
+    dir: &Path,
+    sources: &[String],
+    library: &Path,
+    progress: Progress,
+    background: bool,
+) -> Result<(), String> {
+    shared(compiler, &objects(compiler, dir, sources, progress, background)?, library)
 }
 
 /// compiles sources, file names inside dir, each into an object beside it,
@@ -122,10 +188,16 @@ pub fn compile(dir: &Path, sources: &[String], library: &Path, progress: Progres
 /// is to spare holds what it is likely to take, and there is always one
 /// running, so a machine with little memory builds slower instead of
 /// running out of it.
-pub fn objects(dir: &Path, sources: &[String], progress: Progress) -> Result<Vec<PathBuf>, String> {
-    let compiler = compiler();
-    let gcc = is_gcc(&compiler);
-    let jobs = std::thread::available_parallelism().map_or(4, |n| n.get());
+pub fn objects(
+    compiler: &Compiler,
+    dir: &Path,
+    sources: &[String],
+    progress: Progress,
+    background: bool,
+) -> Result<Vec<PathBuf>, String> {
+    let gcc = compiler.is_gcc();
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let jobs = if background { cores.saturating_sub(1).max(1) } else { cores };
     let budget = spare_memory().map(|spare| spare.saturating_sub(RESERVE));
     let needs: Vec<u64> =
         sources.iter().map(|source| std::fs::metadata(dir.join(source)).map_or(0, |m| m.len()) * MEMORY_PER_BYTE).collect();
@@ -161,7 +233,11 @@ pub fn objects(dir: &Path, sources: &[String], progress: Progress) -> Result<Vec
                 let Some(index) = index else { break };
                 let source = &sources[index];
                 let path = dir.join(source);
-                let status = Command::new(&compiler)
+                let mut command = compiler.command();
+                if background {
+                    lower(&mut command);
+                }
+                let status = command
                     .args(FLAGS)
                     .args(if gcc { GCC_FLAGS } else { &[] })
                     .args(if cfg!(windows) { &[][..] } else { UNIX_FLAGS })
@@ -197,10 +273,9 @@ pub fn objects(dir: &Path, sources: &[String], progress: Progress) -> Result<Vec
 
 /// links objects into a shared library. on Windows gcc's runtime goes in
 /// with it, so the DLL needs no other DLL beside it.
-pub fn shared(objects: &[PathBuf], library: &Path) -> Result<(), String> {
-    let compiler = compiler();
-    let mut command = Command::new(&compiler);
-    if cfg!(windows) && compiler.contains("gcc") {
+pub fn shared(compiler: &Compiler, objects: &[PathBuf], library: &Path) -> Result<(), String> {
+    let mut command = compiler.command();
+    if cfg!(windows) && compiler.is_gcc() {
         command.arg("-static-libgcc");
     }
     let status = command.arg("-shared").arg("-o").arg(library).args(objects).status();
@@ -216,10 +291,38 @@ pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
     if library.exists() {
         std::fs::remove_file(library).map_err(|e| format!("could not replace {}, {e}", library.display()))?;
     }
-    let ar = tool("AR", &["ar", "llvm-ar"]);
+    let ar = std::env::var("AR")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| ["ar", "llvm-ar"].into_iter().find(|tool| Compiler::new(tool, &[]).runs()).map(str::to_owned))
+        .unwrap_or_else(|| "ar".to_owned());
     let status = Command::new(&ar).arg("rcs").arg(library).args(objects).status();
     match status {
         Ok(status) if status.success() => Ok(()),
         _ => Err("archiving failed".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cc_names_a_program_and_what_goes_before_the_rest() {
+        assert_eq!(Compiler::named("zig cc"), Compiler::new("zig", &["cc"]));
+        assert_eq!(Compiler::named("gcc"), Compiler::new("gcc", &[]));
+        // a program that is there stays whole, spaces and all
+        let dir = std::env::temp_dir().join(format!("3dsrecomp cc {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("my cc");
+        std::fs::write(&program, b"").unwrap();
+        assert_eq!(Compiler::named(program.to_str().unwrap()), Compiler::new(&program, &[]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_compiler_that_does_not_run_is_turned_down() {
+        let error = check(Some(&Compiler::new("/nowhere/cc", &[]))).unwrap_err();
+        assert!(error.starts_with("there is no C compiler (/nowhere/cc)"), "{error}");
     }
 }

@@ -23,5 +23,8 @@ verify = ["host", "dep:zakuro-cpu"]
 recomp-abi = { path = "abi", default-features = false }
 zakuro-cpu = { git = "https://github.com/fearkov/zakuro", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 debug = 1

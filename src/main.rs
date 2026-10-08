@@ -276,6 +276,15 @@ fn analyze(path: &str) {
     let instructions: usize = functions().map(|f| f.instructions.len()).sum();
     println!("thumb       {thumb} functions");
     println!("decoded     {instructions} instructions, shared code once per function");
+    // a function far bigger than the rest takes the compiler most of the
+    // build, alone
+    let mut largest: Vec<(usize, u32)> = analyses
+        .iter()
+        .flat_map(|analysis| analysis.functions.iter().map(|(&entry, f)| (f.instructions.len(), entry)))
+        .collect();
+    largest.sort_unstable_by(|a, b| b.cmp(a));
+    let largest: Vec<String> = largest.iter().take(3).map(|(size, entry)| format!("{size} at {entry:08X}")).collect();
+    println!("largest     {}", largest.join(", "));
     println!("analysis    {elapsed:.2?}");
     println!();
 

@@ -113,10 +113,24 @@ pub struct Program {
     pub slots: Option<BTreeSet<u32>>,
 }
 
+/// instructions past which a function grew by following tail calls into
+/// other functions rather than by what one function holds. compilers make
+/// few near it, Monster Hunter 3 Ultimate's tail calls led one function
+/// through 62,000 instructions of others, which a C compiler then spent
+/// most of a build on.
+const HUGE: usize = 10_000;
+
+/// how far a branch of a huge function goes before it is taken for a tail
+/// call, a function's own branches stay closer.
+const FAR: u32 = 0x4000;
+
 struct Discovery<'a> {
     text: &'a Segment,
     slots: Option<&'a BTreeSet<u32>>,
     analysis: Analysis,
+    /// function entries a branch goes to as a tail call rather than as
+    /// more of the function, while huge ones are explored again.
+    entries: Option<BTreeSet<u32>>,
     queue: VecDeque<(u32, Mode, Source)>,
     /// pointers found in data, followed only once nothing surer is left.
     guesses: VecDeque<(u32, Mode, Source)>,
@@ -134,6 +148,7 @@ pub fn analyze(program: &Program) -> Analysis {
             svc_sites: 0,
             dead_ends: 0,
         },
+        entries: None,
         queue: VecDeque::new(),
         guesses: VecDeque::new(),
     };
@@ -155,10 +170,46 @@ pub fn analyze(program: &Program) -> Analysis {
         discovery.queue.extend(starts.into_iter().map(|address| (address, Mode::Arm, Source::Scan)));
         discovery.run();
     }
+    discovery.split_huge();
     discovery.analysis
 }
 
 impl Discovery<'_> {
+    /// explores the huge functions again, now that every function is known,
+    /// their branches to other functions' entries and far away going to
+    /// functions there as tail calls instead of taking their code in, and
+    /// the functions those are explored the same way.
+    fn split_huge(&mut self) {
+        let huge: Vec<(u32, Mode)> =
+            self.analysis.functions.iter().filter(|(_, f)| f.instructions.len() > HUGE).map(|(&entry, f)| (entry, f.mode)).collect();
+        if huge.is_empty() {
+            return;
+        }
+        // what exploring counts was counted the first time
+        let counts = (self.analysis.indirect_sites, self.analysis.jump_tables, self.analysis.svc_sites, self.analysis.dead_ends);
+        self.entries = Some(self.analysis.functions.keys().copied().collect());
+        let mut huge = huge;
+        for _ in 0..4 {
+            for &(entry, mode) in &huge {
+                let (instructions, labels) = self.explore(entry, mode);
+                if let Some(function) = self.analysis.functions.get_mut(&entry) {
+                    function.instructions = instructions;
+                    function.labels = labels;
+                }
+            }
+            // the functions the tail calls lead to, explored the same way
+            self.run();
+            let still: Vec<(u32, Mode)> =
+                self.analysis.functions.iter().filter(|(_, f)| f.instructions.len() > HUGE).map(|(&entry, f)| (entry, f.mode)).collect();
+            if still.is_empty() || still == huge {
+                break;
+            }
+            huge = still;
+        }
+        self.entries = None;
+        (self.analysis.indirect_sites, self.analysis.jump_tables, self.analysis.svc_sites, self.analysis.dead_ends) = counts;
+    }
+
     fn run(&mut self) {
         while let Some((entry, mode, source)) = self.queue.pop_front().or_else(|| self.guesses.pop_front()) {
             if !self.analysis.functions.contains_key(&entry) {
@@ -289,7 +340,16 @@ impl Discovery<'_> {
                     Flow::Branch { target, link: true } => self.call(target, mode),
                     Flow::CallOtherMode { target } => self.call(target, mode.other()),
                     Flow::Branch { target, link: false } => {
-                        if self.text.contains(target) {
+                        let far = target < entry || target.abs_diff(address) > FAR;
+                        let tail_call = target != entry
+                            && self.entries.as_ref().is_some_and(|entries| entries.contains(&target) || far);
+                        if tail_call && self.text.contains(target) {
+                            if let Some(entries) = self.entries.as_mut() {
+                                entries.insert(target);
+                            }
+                            self.call(target, mode);
+                        }
+                        if self.text.contains(target) && !tail_call {
                             blocks.push(target);
                         }
                         if !conditional {
@@ -430,6 +490,37 @@ mod tests {
         assert_eq!(analysis.count(Byte::Literal), 4);
         assert_eq!(analysis.largest_gaps(BASE, 1), [(BASE + 0xC, 4)]);
         assert_eq!(analysis.svc_sites, 1);
+    }
+
+    /// code reached only through branches far apart, the way tail calls
+    /// reach other functions, is one function while it is small, as it
+    /// always was. past what a function holds, each piece of it becomes a
+    /// function of its own, its branch a tail call.
+    #[test]
+    fn a_huge_chain_of_tail_calls_is_split_into_functions() {
+        const SPACING: u32 = 2 * FAR;
+        let chain = |links: u32, length: u32| {
+            let mut words = vec![0u32; (links * SPACING / 4) as usize];
+            for link in 0..links {
+                let start = link * SPACING / 4;
+                for i in 0..length {
+                    words[(start + i) as usize] = 0xE1A0_0000; // mov r0, r0
+                }
+                words[(start + length) as usize] = if link + 1 == links {
+                    0xE12F_FF1E // bx lr
+                } else {
+                    0xEA00_0000 | ((SPACING - length * 4 - 8) / 4) // b to the next piece
+                };
+            }
+            analyze_words(&words)
+        };
+        let small = chain(3, 100);
+        assert_eq!(small.functions.len(), 1);
+        assert_eq!(small.functions[&BASE].instructions.len(), 3 * 101);
+        let huge = chain(30, 400);
+        assert_eq!(huge.functions.len(), 30);
+        assert!(huge.functions.values().all(|f| f.instructions.len() == 401));
+        assert!(huge.functions.values().skip(1).all(|f| f.source == Source::Call));
     }
 
     #[test]

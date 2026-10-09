@@ -3,7 +3,7 @@
 //! links in.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -278,10 +278,32 @@ pub fn shared(compiler: &Compiler, objects: &[PathBuf], library: &Path) -> Resul
     if cfg!(windows) && compiler.is_gcc() {
         command.arg("-static-libgcc");
     }
-    let status = command.arg("-shared").arg("-o").arg(library).args(objects).status();
+    let library = std::path::absolute(library).map_err(|e| format!("linking failed, {e}"))?;
+    let objects = from_folder(&mut command, objects);
+    finished(command.arg("-shared").arg("-o").arg(library).args(objects).status(), "linking")
+}
+
+/// has command run in the folder objects are all in and gives their names
+/// from there, their whole paths when they are not in one. a command line
+/// on Windows holds 32767 characters, which the whole paths of the 600
+/// objects of Monster Hunter 3 Ultimate or Pokémon Sun pass.
+fn from_folder(command: &mut Command, objects: &[PathBuf]) -> Vec<PathBuf> {
+    let folder = objects.first().and_then(|object| object.parent()).filter(|folder| !folder.as_os_str().is_empty());
+    match folder.filter(|folder| objects.iter().all(|object| object.parent() == Some(*folder))) {
+        Some(folder) => {
+            command.current_dir(folder);
+            objects.iter().map(|object| object.file_name().map_or_else(|| object.clone(), PathBuf::from)).collect()
+        }
+        None => objects.to_vec(),
+    }
+}
+
+/// what a tool's run came to, an error saying why when it failed.
+fn finished(status: std::io::Result<ExitStatus>, what: &str) -> Result<(), String> {
     match status {
         Ok(status) if status.success() => Ok(()),
-        _ => Err("linking failed".to_owned()),
+        Ok(status) => Err(format!("{what} failed, {status}")),
+        Err(error) => Err(format!("{what} failed, {error}")),
     }
 }
 
@@ -296,11 +318,10 @@ pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
         .filter(|name| !name.is_empty())
         .or_else(|| ["ar", "llvm-ar"].into_iter().find(|tool| Compiler::new(tool, &[]).runs()).map(str::to_owned))
         .unwrap_or_else(|| "ar".to_owned());
-    let status = Command::new(&ar).arg("rcs").arg(library).args(objects).status();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        _ => Err("archiving failed".to_owned()),
-    }
+    let library = std::path::absolute(library).map_err(|e| format!("archiving failed, {e}"))?;
+    let mut command = Command::new(&ar);
+    let objects = from_folder(&mut command, objects);
+    finished(command.arg("rcs").arg(library).args(objects).status(), "archiving")
 }
 
 #[cfg(test)]
@@ -317,6 +338,26 @@ mod tests {
         let program = dir.join("my cc");
         std::fs::write(&program, b"").unwrap();
         assert_eq!(Compiler::named(program.to_str().unwrap()), Compiler::new(&program, &[]));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// a big game's objects link however long their paths are, on Windows
+    /// too, where a command line holds 32767 characters.
+    #[test]
+    fn objects_link_however_long_their_paths_are() {
+        let Some(compiler) = Compiler::find() else { return };
+        let folder = format!("3dsrecomp {}{}", "a folder with a long name ".repeat(3), std::process::id());
+        let dir = std::env::temp_dir().join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sources: Vec<String> = (0..400).map(|i| format!("code{i:03}.c")).collect();
+        for (i, source) in sources.iter().enumerate() {
+            std::fs::write(dir.join(source), format!("int f{i}(void) {{ return {i}; }}\n")).unwrap();
+        }
+        let length: usize = sources.iter().map(|source| dir.join(source).with_extension("o").as_os_str().len() + 1).sum();
+        assert!(length > 32_767, "the whole paths would not fit on a command line on Windows");
+        let library = dir.join(if cfg!(windows) { "many.dll" } else { "libmany.so" });
+        compile(&compiler, &dir, &sources, &library, &|_, _| true, false).unwrap();
+        assert!(library.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

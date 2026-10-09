@@ -162,24 +162,16 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return 0 };
     let program = &mut programs[index].1;
     let text = program.text.base..program.text.end();
-    let hinted: Vec<u32> = hints(title.program_id()).into_iter().filter(|&address| text.contains(&(address & !1))).collect();
+    // this player's and everyone's who ran the same code
+    let mut hinted = hints(title.program_id());
+    hinted.extend(bundled(title.program_id(), code_hash(program)));
+    hinted.retain(|&address| text.contains(&(address & !1)));
+    hinted.sort_unstable();
+    hinted.dedup();
     if hinted.is_empty() {
         return 0;
     }
-    let owners = |analysis: &Analysis| {
-        let mut owners = std::collections::HashMap::new();
-        for (&entry, function) in &analysis.functions {
-            let thumb = (function.mode == Mode::Thumb) as u32;
-            for &address in &function.instructions {
-                owners.entry(address | thumb).or_insert(entry);
-            }
-        }
-        owners
-    };
-    let outside: Vec<u32> = {
-        let owners = owners(&analyses[index]);
-        hinted.iter().copied().filter(|address| !owners.contains_key(address)).collect()
-    };
+    let outside = new_functions(&analyses[index], &hinted);
     if !outside.is_empty() {
         program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
@@ -187,17 +179,62 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     outside.len()
 }
 
+/// the hinted places none of the functions the analysis found holds, which
+/// start functions of their own, odd for Thumb.
+pub fn new_functions(analysis: &Analysis, hinted: &[u32]) -> Vec<u32> {
+    let mut owned = std::collections::HashSet::new();
+    for function in analysis.functions.values() {
+        let thumb = (function.mode == Mode::Thumb) as u32;
+        owned.extend(function.instructions.iter().map(|&address| address | thumb));
+    }
+    hinted.iter().copied().filter(|address| !owned.contains(address)).collect()
+}
+
 /// the addresses Zakuro wrote down next to a title's library, those it ran
 /// in its interpreter for want of code, odd for Thumb.
 pub fn hints(program_id: u64) -> Vec<u32> {
     let Some(dir) = abi::library_dir() else { return Vec::new() };
     let path = dir.join(abi::library_name(program_id)).with_extension("hints");
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    std::fs::read_to_string(path).map(|text| read_hints(&text)).unwrap_or_default()
+}
+
+/// the addresses in a file of hints.
+pub fn read_hints(text: &str) -> Vec<u32> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| u32::from_str_radix(line.trim_start_matches("0x"), 16).ok())
         .collect()
+}
+
+/// where players' runs went into code the analysis does not find, gathered
+/// from their hints, by game and by the code they are for.
+const BUNDLED: &str = include_str!("../hints.txt");
+
+/// a hash of the code of a title's executable, FNV-1a over its bytes, so
+/// the hints of one revision or update of a game stay out of another's.
+pub fn code_hash(program: &Program) -> u64 {
+    program.text.bytes.iter().fold(0xCBF2_9CE4_8422_2325, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
+}
+
+/// the hints the list has for a title's code.
+pub fn bundled(program_id: u64, hash: u64) -> Vec<u32> {
+    section(BUNDLED, program_id, hash)
+}
+
+/// the addresses under a list's header for a title's code.
+fn section(list: &str, program_id: u64, hash: u64) -> Vec<u32> {
+    let mut taking = false;
+    let mut found = Vec::new();
+    for line in list.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        if let Some(header) = line.strip_prefix('=') {
+            let mut fields = header.split_whitespace().map(|field| u64::from_str_radix(field, 16).ok());
+            taking = fields.next().flatten() == Some(program_id) && fields.next().flatten() == Some(hash);
+        } else if taking {
+            found.extend(u32::from_str_radix(line.trim_start_matches("0x"), 16).ok());
+        }
+    }
+    found
 }
 
 /// where build works on a title whose library it installs.
@@ -247,6 +284,31 @@ fn step_aside(target: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a game's hints in the list go to the code they were gathered on, a
+    /// revision or update of it with other code gets none of them.
+    #[test]
+    fn the_list_gives_hints_to_the_code_they_are_for() {
+        let list = "# a note\n= 0004000000033500 00000000000000AB\n00100000\n00100011\n\n= 0004000000033500 00000000000000AC\n00200000\n";
+        assert_eq!(section(list, 0x0004_0000_0003_3500, 0xAB), [0x0010_0000, 0x0010_0011]);
+        assert_eq!(section(list, 0x0004_0000_0003_3500, 0xAC), [0x0020_0000]);
+        assert!(section(list, 0x0004_0000_0003_3600, 0xAB).is_empty());
+        assert!(section(list, 0x0004_0000_0003_3500, 0xAD).is_empty());
+    }
+
+    #[test]
+    fn every_line_of_the_list_reads() {
+        for line in BUNDLED.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+            match line.strip_prefix('=') {
+                Some(header) => {
+                    let fields: Vec<&str> = header.split_whitespace().collect();
+                    assert!(fields.len() >= 2, "{line}");
+                    assert!(u64::from_str_radix(fields[0], 16).is_ok() && u64::from_str_radix(fields[1], 16).is_ok(), "{line}");
+                }
+                None => assert!(u32::from_str_radix(line, 16).is_ok(), "{line}"),
+            }
+        }
+    }
     use crate::cro::tests::named;
     use crate::rom::tests::rom;
 

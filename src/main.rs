@@ -22,9 +22,11 @@ usage, 3dsrecomp analyze <rom>
        3dsrecomp build <rom> [<dir>] [--overrides <file or dir>]
        3dsrecomp port <rom> <dir> [--overrides <file or dir>] [--name <name>] [--zakuro <checkout>]
        3dsrecomp verify <rom> <library> [count]
+       3dsrecomp hints <rom> [<hints file>]
 
 build without a dir works in the cache and installs the library where
-Zakuro finds it on its own.";
+Zakuro finds it on its own. hints prints the game's section for hints.txt,
+from the hints Zakuro wrote next to its library or the file given.";
 
 /// what the options on the command line ask for.
 #[derive(Default)]
@@ -64,6 +66,8 @@ fn main() {
         ["build", rom] => build(rom, None, &options),
         ["build", rom, dir] => build(rom, Some(Path::new(dir)), &options),
         ["port", rom, dir] => port(rom, Path::new(dir), &options),
+        ["hints", rom] => hints(rom, None),
+        ["hints", rom, file] => hints(rom, Some(Path::new(file))),
         #[cfg(feature = "verify")]
         ["verify", rom, library] => check(rom, Path::new(library), 500),
         #[cfg(feature = "verify")]
@@ -91,6 +95,38 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
         exit(1);
     });
     (title, programs)
+}
+
+/// prints the section of hints.txt for the game at path, the places in the
+/// hints Zakuro wrote next to its library, or in file, that start functions
+/// the analysis does not find, along with those the list has already.
+fn hints(path: &str, file: Option<&Path>) {
+    let (title, programs) = load(path);
+    let Some((_, program)) = programs.iter().find(|(name, _)| name == "executable") else {
+        eprintln!("{path} has no executable");
+        exit(1);
+    };
+    let mut hinted = match file {
+        Some(file) => match std::fs::read_to_string(file) {
+            Ok(text) => build::read_hints(&text),
+            Err(error) => {
+                eprintln!("could not read {}, {error}", file.display());
+                exit(1);
+            }
+        },
+        None => build::hints(title.program_id()),
+    };
+    let hash = build::code_hash(program);
+    hinted.extend(build::bundled(title.program_id(), hash));
+    let text = program.text.base..program.text.end();
+    hinted.retain(|&address| text.contains(&(address & !1)));
+    hinted.sort_unstable();
+    hinted.dedup();
+    let new = build::new_functions(&discover::analyze(program), &hinted);
+    println!("= {:016X} {hash:016X}", title.program_id());
+    for address in new {
+        println!("{address:08X}");
+    }
 }
 
 /// builds the library in dir, or when there is none in the cache, and then

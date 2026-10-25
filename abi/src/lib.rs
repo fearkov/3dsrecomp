@@ -239,6 +239,10 @@ pub struct Linked {
     count: u32,
     modules: *const c_void,
     module_count: u32,
+    /// the code generator's version and its recomp_origins, what the
+    /// functions were made from, none for a program that doesn't give them.
+    generation: u32,
+    origins: *const c_void,
 }
 
 impl Linked {
@@ -254,7 +258,20 @@ impl Linked {
         modules: *const c_void,
         module_count: u32,
     ) -> Linked {
-        Linked { program_id, abi, entries, count, modules, module_count }
+        Linked { program_id, abi, entries, count, modules, module_count, generation: 0, origins: std::ptr::null() }
+    }
+
+    /// the same code with what its functions were made from, so that it is
+    /// checked against what the program has in memory the way a library is,
+    /// and a function whose code a mod or another version of the game
+    /// changed runs no more.
+    ///
+    /// # Safety
+    ///
+    /// generation and origins have to be the recomp_generation and the
+    /// recomp_origins of the same code.
+    pub unsafe fn with_origins(self, generation: u32, origins: *const c_void) -> Linked {
+        Linked { generation, origins, ..self }
     }
 
     /// the title the code was recompiled from.
@@ -307,6 +324,8 @@ impl Library {
                 count: *(symbol(b"recomp_entry_count")? as *const u32),
                 modules: symbol(b"recomp_modules")?,
                 module_count: *(symbol(b"recomp_module_count")? as *const u32),
+                generation: 0,
+                origins: std::ptr::null(),
             };
             let mut code = Library::linked(&linked)?;
             // libraries made before it said have none
@@ -334,8 +353,10 @@ impl Library {
             placed: Vec::new(),
             // code linked in was made along with the program
             generation: GENERATION,
-            // and is not checked against what the program has in memory
-            origins: std::ptr::null(),
+            // and is checked against what the program has in memory when
+            // the program says what it was made from, which generation 3 on
+            // can, as a library is
+            origins: if linked.generation >= 3 { linked.origins as *const Origins } else { std::ptr::null() },
             #[cfg(feature = "load")]
             _library: None,
         })
@@ -548,6 +569,45 @@ int main(void) {
         assert_eq!(stale, [1, 0, 1]);
         assert_eq!(starts, [NO_START, 0x20, NO_START]);
         assert!(origins.owner_is_stale(0) && !origins.owner_is_stale(1));
+    }
+
+    /// code linked in is checked against memory when the program says what
+    /// it was made from, and not when it doesn't, or says it in a layout
+    /// from before generation 3.
+    #[test]
+    fn linked_code_is_checked_when_it_says_what_it_was_made_from() {
+        let memory: Vec<u8> = (0..0x10u8).collect();
+        let mut hash = CodeHash::default();
+        hash.add(&memory);
+        let pieces = [Piece { start: 0, end: 0x10, hash: hash.value() }];
+        let runs = [Run { first: 0, end: 1 }];
+        let functions = [Origin { first: 0, count: 1, start: 0 }];
+        let owners = [0u32];
+        let mut stale = [0u8; 1];
+        let mut starts = [0u32];
+        let origins = Origins {
+            count: 1,
+            piece_count: 1,
+            pieces: pieces.as_ptr(),
+            functions: functions.as_ptr(),
+            runs: runs.as_ptr(),
+            owners: owners.as_ptr(),
+            stale: stale.as_mut_ptr(),
+            starts: starts.as_mut_ptr(),
+        };
+        // SAFETY: empty tables, and origins that outlive the code
+        let plain = unsafe { Linked::new(1, ABI, std::ptr::null(), 0, std::ptr::null(), 0) };
+        let given = unsafe { plain.with_origins(GENERATION, &origins as *const Origins as *const c_void) };
+        let older = unsafe { plain.with_origins(2, &origins as *const Origins as *const c_void) };
+        assert!(Library::linked(&plain).unwrap().origins(0).is_none());
+        assert!(Library::linked(&older).unwrap().origins(0).is_none());
+        let mut library = Library::linked(&given).unwrap();
+        let mut changed = memory.clone();
+        changed[3] ^= 1;
+        assert_eq!(library.check(0, 0, |address, out| out.copy_from_slice(&memory[address as usize..][..out.len()])), 0);
+        assert_eq!(library.check(0, 0, |address, out| out.copy_from_slice(&changed[address as usize..][..out.len()])), 1);
+        assert_eq!(stale, [1]);
+        assert_eq!(starts, [NO_START]);
     }
 
     /// recomp.h and the structs here describe the same memory, which a C

@@ -45,6 +45,10 @@ The program still reads the game's files, save and everything but the code
 from your copy. So it takes the same path, and the same options, that
 Zakuro does. If it is given a different title, it notices from the title
 ID and interprets the code instead of running code meant for another game.
+When a mod or an update next to the game changed the code it was
+recompiled from, the functions that changed run in the interpreter and the
+rest stay recompiled. A program made before ports said what their code was
+made from can't tell those apart, so it interprets everything then.
 
 ## Sharing
 

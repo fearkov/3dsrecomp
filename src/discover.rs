@@ -350,11 +350,12 @@ impl Discovery<'_> {
         let from_entry = instructions.partition_point(|&address| address < entry);
         match mode {
             Mode::Arm => {
-                // blx to Thumb and pld sit where the condition would, as 0xF
+                // 0xF counts too: blx to Thumb and pld have it there, but so
+                // do the halves of Thumb's bl taken for ARM, far more often
                 let mostly_unconditional = |instructions: &[u32]| {
                     let conditional = instructions
                         .iter()
-                        .filter(|&&address| self.text.read32(address).is_some_and(|word| word >> 28 < arm::ALWAYS))
+                        .filter(|&&address| self.text.read32(address).is_some_and(|word| word >> 28 != arm::ALWAYS))
                         .count();
                     conditional * (MOST_CONDITIONAL + 1) <= instructions.len() * MOST_CONDITIONAL
                 };

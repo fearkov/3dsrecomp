@@ -444,6 +444,46 @@ impl Library {
         stale
     }
 
+    /// marks the function of unit that starts at start stale, as if its code
+    /// had changed, so that the interpreter runs it, for a host that has to
+    /// see it run instruction by instruction. whether there is one.
+    pub fn interpret(&mut self, unit: usize, start: u32) -> bool {
+        let Some(origins) = self.origins(unit) else { return false };
+        let Some(index) = origins.functions().iter().position(|function| function.start == start) else { return false };
+        // SAFETY: as in check, a flag and a start per function
+        unsafe {
+            *origins.stale.add(index) = 1;
+            *origins.starts.add(index) = NO_START;
+        }
+        true
+    }
+
+    /// marks every function of unit whose code takes in address stale, so
+    /// that the interpreter runs whatever reaches it, for a host that has to
+    /// stop there: code can be part of more than one function, and each one
+    /// would run it. how many there are.
+    pub fn interpret_at(&mut self, unit: usize, address: u32) -> usize {
+        let Some(origins) = self.origins(unit) else { return 0 };
+        let pieces = origins.pieces();
+        let runs = origins.runs();
+        let mut marked = 0;
+        for (index, function) in origins.functions().iter().enumerate() {
+            let runs = &runs[function.first as usize..(function.first + function.count) as usize];
+            let takes_in = runs.iter().any(|run| {
+                pieces[run.first as usize..run.end as usize].iter().any(|piece| (piece.start..piece.end).contains(&address))
+            });
+            if takes_in {
+                // SAFETY: as in check, a flag and a start per function
+                unsafe {
+                    *origins.stale.add(index) = 1;
+                    *origins.starts.add(index) = NO_START;
+                }
+                marked += 1;
+            }
+        }
+        marked
+    }
+
     /// the module called name.
     pub fn module_index(&self, name: &str) -> Option<usize> {
         self.modules().iter().position(|module| module.name() == name)

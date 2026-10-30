@@ -446,7 +446,9 @@ impl Library {
 
     /// marks the function of unit that starts at start stale, as if its code
     /// had changed, so that the interpreter runs it, for a host that has to
-    /// see it run instruction by instruction. whether there is one.
+    /// see it run instruction by instruction. start is an offset in a module,
+    /// as its pieces are, and a later check of the unit takes the mark back.
+    /// whether there is one.
     pub fn interpret(&mut self, unit: usize, start: u32) -> bool {
         let Some(origins) = self.origins(unit) else { return false };
         let Some(index) = origins.functions().iter().position(|function| function.start == start) else { return false };
@@ -461,7 +463,8 @@ impl Library {
     /// marks every function of unit whose code takes in address stale, so
     /// that the interpreter runs whatever reaches it, for a host that has to
     /// stop there: code can be part of more than one function, and each one
-    /// would run it. how many there are.
+    /// would run it. address is an offset in a module, and a later check
+    /// takes the marks back, as for interpret. how many there are.
     pub fn interpret_at(&mut self, unit: usize, address: u32) -> usize {
         let Some(origins) = self.origins(unit) else { return 0 };
         let pieces = origins.pieces();
@@ -609,6 +612,58 @@ int main(void) {
         assert_eq!(stale, [1, 0, 1]);
         assert_eq!(starts, [NO_START, 0x20, NO_START]);
         assert!(origins.owner_is_stale(0) && !origins.owner_is_stale(1));
+    }
+
+    /// a host has the interpreter run the function starting at an address,
+    /// or every function whose code holds one, until a check of the code
+    /// takes the marks back.
+    #[test]
+    fn a_host_marks_functions_for_the_interpreter() {
+        let pieces = [(0x10, 0x20), (0x20, 0x28), (0x28, 0x30)].map(|(start, end)| Piece { start, end, hash: 0 });
+        // one function holds all the code, one the middle piece, one the last
+        let runs = [Run { first: 0, end: 3 }, Run { first: 1, end: 2 }, Run { first: 2, end: 3 }];
+        let functions = [Origin { first: 0, count: 1, start: 0x10 }, Origin { first: 1, count: 1, start: 0x20 }, Origin { first: 2, count: 1, start: 0x28 }];
+        let owners = [0u32, 1, 2];
+        let mut stale = [0u8; 3];
+        let mut starts = [0x10u32, 0x20, 0x28];
+        let origins = Origins {
+            count: 3,
+            piece_count: 3,
+            pieces: pieces.as_ptr(),
+            functions: functions.as_ptr(),
+            runs: runs.as_ptr(),
+            owners: owners.as_ptr(),
+            stale: stale.as_mut_ptr(),
+            starts: starts.as_mut_ptr(),
+        };
+        let mut library = Library {
+            entries: std::ptr::null(),
+            count: 0,
+            modules: std::ptr::null(),
+            module_count: 0,
+            placed: Vec::new(),
+            generation: GENERATION,
+            origins: &origins,
+            #[cfg(feature = "load")]
+            _library: None,
+        };
+        assert!(library.interpret(0, 0x20));
+        assert!(!library.interpret(0, 0x24), "nothing starts there");
+        assert_eq!((stale, starts), ([0, 1, 0], [0x10, NO_START, 0x28]));
+        // the last piece is the first function's and the last one's
+        assert_eq!(library.interpret_at(0, 0x2A), 2);
+        assert_eq!((stale, starts), ([1, 1, 1], [NO_START; 3]));
+        // the code as it was made, every piece hashing to what it says
+        let mut hashed = pieces;
+        for piece in hashed.iter_mut() {
+            let mut hash = CodeHash::default();
+            hash.add(&vec![0; (piece.end - piece.start) as usize]);
+            piece.hash = hash.value();
+        }
+        let origins = Origins { pieces: hashed.as_ptr(), ..origins };
+        library.origins = &origins;
+        assert_eq!(library.check(0, 0, |_, out| out.fill(0)), 0);
+        assert_eq!((stale, starts), ([0; 3], [0x10, 0x20, 0x28]));
     }
 
     /// code linked in is checked against memory when the program says what

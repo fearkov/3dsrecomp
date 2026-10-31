@@ -743,6 +743,148 @@ static inline void recomp_call(Context *ctx) {
 #define STALE_CHECK(flag) \
     if (UNLIKELY(flag)) { ctx->exit = EXIT_UNWIND; return; }
 
+/* the C library's integer divisions, which natives.c runs on the host in
+   place of the title's copies of them, see src/natives.rs. each first checks
+   that it can, a divisor of zero, or the one quotient that overflows, going
+   to the library's own code instead, and so does a division the budget left
+   cannot hold all of, which that code charges a block at a time. then it
+   charges what that code would have, leaves the quotient and the remainder
+   where it does, and what it pushes on the stack below sp, which a function
+   reading a local it never set would see. the scratch registers, r12, lr
+   and the flags, which no caller reads after a call, it leaves alone. a host
+   sets recomp_natives to 0 to have the library's code run always. */
+extern uint8_t recomp_natives;
+
+static ALWAYS_INLINE int native_uidivmod_fits(const Context *ctx) {
+    return ctx->r[1] != 0;
+}
+
+static ALWAYS_INLINE void native_uidivmod(Context *ctx, uint32_t address) {
+    (void)address;
+    uint32_t n = ctx->r[0], d = ctx->r[1];
+    ctx->r[0] = n / d;
+    ctx->r[1] = n % d;
+}
+
+static ALWAYS_INLINE int native_idivmod_fits(const Context *ctx) {
+    return ctx->r[1] != 0 && !(ctx->r[0] == 0x80000000u && ctx->r[1] == 0xFFFFFFFFu);
+}
+
+static ALWAYS_INLINE void native_idivmod(Context *ctx, uint32_t address) {
+    (void)address;
+    int32_t n = (int32_t)ctx->r[0], d = (int32_t)ctx->r[1];
+    ctx->r[0] = (uint32_t)(n / d);
+    ctx->r[1] = (uint32_t)(n % d);
+}
+
+static ALWAYS_INLINE uint64_t native_pair(const Context *ctx, int low) {
+    return ctx->r[low] | (uint64_t)ctx->r[low + 1] << 32;
+}
+
+static ALWAYS_INLINE void native_set_pair(Context *ctx, int low, uint64_t value) {
+    ctx->r[low] = (uint32_t)value;
+    ctx->r[low + 1] = (uint32_t)(value >> 32);
+}
+
+static ALWAYS_INLINE int native_uldivmod_fits(const Context *ctx) {
+    return native_pair(ctx, 2) != 0;
+}
+
+/* what _ll_udiv pushes on its way in, push {r4, r5, r6, lr}, r4 as given. */
+static ALWAYS_INLINE void native_push_ll_udiv(Context *ctx, uint32_t sp, uint32_t r4, uint32_t lr) {
+    mem_write32(ctx, sp - 16, r4);
+    mem_write32(ctx, sp - 12, ctx->r[5]);
+    mem_write32(ctx, sp - 8, ctx->r[6]);
+    mem_write32(ctx, sp - 4, lr);
+}
+
+static ALWAYS_INLINE void native_uldivmod(Context *ctx, uint32_t address) {
+    (void)address;
+    native_push_ll_udiv(ctx, ctx->r[13], ctx->r[4], ctx->r[14]);
+    uint64_t n = native_pair(ctx, 0), d = native_pair(ctx, 2);
+    native_set_pair(ctx, 0, n / d);
+    native_set_pair(ctx, 2, n % d);
+}
+
+static ALWAYS_INLINE int native_ldivmod_fits(const Context *ctx) {
+    return native_pair(ctx, 2) != 0 && !(native_pair(ctx, 0) == 0x8000000000000000ull && native_pair(ctx, 2) == ~0ull);
+}
+
+/* _ll_sdiv pushes {r4, lr} and calls _ll_udiv with the signs in r4, the
+   call at 0x28 of it. */
+static ALWAYS_INLINE void native_ldivmod(Context *ctx, uint32_t address) {
+    uint32_t sp = ctx->r[13];
+    uint32_t signs = (uint32_t)((int32_t)ctx->r[1] >> 1) ^ (ctx->r[3] >> 1);
+    mem_write32(ctx, sp - 8, ctx->r[4]);
+    mem_write32(ctx, sp - 4, ctx->r[14]);
+    native_push_ll_udiv(ctx, sp - 8, signs, address + 0x2C);
+    int64_t n = (int64_t)native_pair(ctx, 0), d = (int64_t)native_pair(ctx, 2);
+    native_set_pair(ctx, 0, (uint64_t)(n / d));
+    native_set_pair(ctx, 2, (uint64_t)(n % d));
+}
+
+/* the bits of a quotient, which the library's loops take a few at a time. */
+static ALWAYS_INLINE int native_bits(uint64_t n, uint64_t d) {
+    uint64_t q = n / d;
+    return q ? 64 - __builtin_clzll(q) : 0;
+}
+
+/* what the library's code, recompiled, charges the budget for a division,
+   exactly: the 32-bit ones by the bits of the quotient, and the 64-bit ones
+   by how much longer n is than d, below. the signed 64-bit one charges 20
+   more, whatever the signs. */
+static const uint8_t native_uidivmod_costs[33] = {19, 19, 19, 28, 28, 28, 37, 37, 37, 50, 50, 50, 50, 62, 62, 62, 62,
+                                                  85, 85, 85, 85, 98, 98, 98, 98, 111, 111, 111, 111, 124, 124, 124, 124};
+static const uint8_t native_idivmod_costs[33] = {29, 26, 35, 35, 35, 47, 47, 47, 47, 60, 60, 60, 60, 72, 72, 72, 72,
+                                                 86, 86, 86, 86, 99, 99, 99, 99, 112, 112, 112, 112, 125, 125, 125, 125};
+/* the same with a sign set, either one */
+static const uint8_t native_idivmod_signed_costs[33] = {62, 62, 62, 62, 62, 74, 74, 74, 74, 104, 104, 104, 104, 104, 104, 134, 134,
+                                                        134, 134, 134, 134, 165, 165, 165, 165, 165, 165, 195, 195, 195, 195, 195, 195};
+
+static ALWAYS_INLINE int32_t native_uidivmod_cost(const Context *ctx) {
+    return native_uidivmod_costs[native_bits(ctx->r[0], ctx->r[1])];
+}
+
+static ALWAYS_INLINE int32_t native_idivmod_cost(const Context *ctx) {
+    int32_t n = (int32_t)ctx->r[0], d = (int32_t)ctx->r[1];
+    if (n >= 0 && d >= 0) return native_idivmod_costs[native_bits((uint32_t)n, (uint32_t)d)];
+    uint32_t un = n < 0 ? 0u - (uint32_t)n : (uint32_t)n, ud = d < 0 ? 0u - (uint32_t)d : (uint32_t)d;
+    return native_idivmod_signed_costs[native_bits(un, ud)];
+}
+
+/* the 64-bit division gives a quotient of 0 for an n shorter than d, goes a
+   bit at a time when n is up to 4 bits longer, and takes a reciprocal from
+   there on, with one more step for a d of more than 32 bits. */
+static ALWAYS_INLINE int32_t native_uldivmod_cost_of(uint64_t n, uint64_t d) {
+    int longer = __builtin_clzll(d) - (n ? __builtin_clzll(n) : 64);
+    if (longer < 0) return 62;
+    if (longer <= 4) return 75 + 10 * longer;
+    return d >> 32 ? 109 : 98;
+}
+
+static ALWAYS_INLINE int32_t native_uldivmod_cost(const Context *ctx) {
+    return native_uldivmod_cost_of(native_pair(ctx, 0), native_pair(ctx, 2));
+}
+
+static ALWAYS_INLINE int32_t native_ldivmod_cost(const Context *ctx) {
+    int64_t n = (int64_t)native_pair(ctx, 0), d = (int64_t)native_pair(ctx, 2);
+    uint64_t un = n < 0 ? 0ull - (uint64_t)n : (uint64_t)n, ud = d < 0 ? 0ull - (uint64_t)d : (uint64_t)d;
+    return 20 + native_uldivmod_cost_of(un, ud);
+}
+
+/* an override running a native, falling back on the original. */
+#define RECOMP_NATIVE(address, name, original) do { \
+    if (LIKELY(recomp_natives) && native_##name##_fits(ctx)) { \
+        int32_t cost_ = native_##name##_cost(ctx); \
+        if (LIKELY(BUDGET_LEFT >= cost_)) { \
+            BUDGET_LEFT -= cost_; \
+            native_##name(ctx, (address)); \
+            RETURN_TO(ctx->r[14]); \
+        } \
+    } \
+    CALL(original); \
+} while (0)
+
 /* a function written by hand to run instead of the one at address, odd for
    Thumb, or at an offset in a module. see docs/overrides.md. */
 #define RECOMP_OVERRIDE(address) void override_##address(Context *ctx)

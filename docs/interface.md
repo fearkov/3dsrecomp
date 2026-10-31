@@ -47,6 +47,7 @@ Zakuro does it on its own.
 | `recomp_module_count` | `const uint32_t` | Number of modules |
 | `recomp_modules` | `const Module[]` | One per CRO module |
 | `recomp_origins` | `const Origins[]` | What the code was made from, the executable's and then one per module, read from generation 3 on |
+| `recomp_natives` | `uint8_t` | 1 while the C library functions the code runs on the host do, see [natives](overrides.md#natives). Set it to 0 to have the title's own code run for them. Missing when there are none |
 
 Check `recomp_abi` first, and refuse to run the library when it is not a
 version you were written for. The version goes up whenever the layout of any
@@ -54,9 +55,9 @@ structure or the meaning of any field changes. A host written for version 5
 can also run code made for 4, which never calls `svc`.
 
 `recomp_generation` goes up when the generated code gets much faster or does
-more. Generation 3 added `recomp_origins`, and generation 4, made for
-version 5 of the interface, runs svcs in place. A library of an older
-generation, or one without the symbol, still runs.
+more. Generation 3 added `recomp_origins`, generation 4, made for version 5
+of the interface, runs svcs in place, and generation 5 divides on the host.
+A library of an older generation, or one without the symbol, still runs.
 Building it again brings the improvements, which a host can suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
 `recomp_abi::GENERATION` is the current one.
 

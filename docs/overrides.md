@@ -80,6 +80,29 @@ so the override can simply return too. `build` warns about an override
 whose address has no generated code. There is no original to call in that
 case.
 
+## Natives
+
+`build` writes overrides of its own for the integer divisions of ARM's C
+library, which every title built with armcc links and which the ARM11 does
+with a loop, having no divide instruction. It finds them by their bytes,
+RVCT 4.1's, and puts their overrides in `natives.c`:
+
+- `__aeabi_uidivmod` and `__aeabi_idivmod`, 32-bit unsigned and signed;
+- `__aeabi_uldivmod` and `__aeabi_ldivmod`, 64-bit.
+
+Each divides on the host and leaves the quotient and the remainder where the
+library does. A divisor of zero, and the one quotient that overflows, go to
+the library's own code, which is still there. Each charges the budget what
+that code would have: exactly for the 32-bit ones, and for the 64-bit ones
+once the quotient has 6 bits or more.
+
+An override written by hand for the same address takes the place of the
+native. A host can turn the natives off by setting the library's
+`recomp_natives` to 0, and Zakuro does that when `ZAKURO_NATIVES` is 0.
+`verify` compares the generated code with the natives off, and then each
+native against the title's own code in the interpreter, on numbers that go
+every way through it.
+
 ## What changes
 
 - **Calls.** Every call the recompiler can follow to the address goes to the

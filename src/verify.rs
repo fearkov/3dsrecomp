@@ -484,6 +484,34 @@ impl Report {
     }
 }
 
+/// the context the recompiled side of run works on, its registers left for
+/// store to fill in. run has to stay where it is while the code runs.
+fn context(run: &mut Run) -> Context {
+    Context {
+        r: [0; 16],
+        n: 0,
+        z: 0,
+        c: 0,
+        v: 0,
+        q: 0,
+        thumb: 0,
+        ge: 0,
+        exclusive: 0,
+        budget: 0,
+        exit: 0,
+        svc: 0,
+        depth: 0,
+        exclusive_address: 0,
+        tls: 0,
+        read_pages: run.memory.read_pages.as_ptr(),
+        write_pages: run.memory.write_pages.as_ptr(),
+        vfp: run.cpu.vfp.regs.as_mut_ptr(),
+        fpscr: &mut run.cpu.vfp.fpscr,
+        host: &HOST,
+        user: run as *mut Run as *mut c_void,
+    }
+}
+
 /// runs each function both ways, printing the first few mismatches. the
 /// functions are entries with bit 0 set for Thumb.
 pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
@@ -536,29 +564,7 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         a.cpu = cpu.clone();
         b.cpu = cpu.clone();
 
-        let mut ctx = Context {
-            r: [0; 16],
-            n: 0,
-            z: 0,
-            c: 0,
-            v: 0,
-            q: 0,
-            thumb: 0,
-            ge: 0,
-            exclusive: 0,
-            budget: 0,
-            exit: 0,
-            svc: 0,
-            depth: 0,
-            exclusive_address: 0,
-            tls: 0,
-            read_pages: b.memory.read_pages.as_ptr(),
-            write_pages: b.memory.write_pages.as_ptr(),
-            vfp: b.cpu.vfp.regs.as_mut_ptr(),
-            fpscr: &mut b.cpu.vfp.fpscr,
-            host: &HOST,
-            user: &mut b as *mut Run as *mut c_void,
-        };
+        let mut ctx = context(&mut b);
         store(&cpu, &mut ctx);
 
         // half the functions go on through their svcs, the other half end
@@ -629,5 +635,190 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             _ => report.other += 1,
         }
     }
+    report
+}
+
+/// a division's case, the bits of its quotient, whether a sign was set, and
+/// whether n and d had high words.
+type Case = (u32, bool, bool, bool);
+
+/// what the title's code charged in a case, the least, the most, the sum and
+/// how many times.
+type Charged = (u64, u64, u64, i32);
+
+/// how the natives fared against the title's own code for them.
+#[derive(Default)]
+pub struct NativesReport {
+    pub tested: usize,
+    pub mismatched: usize,
+    /// divisions the natives charged the budget for as the title's code
+    /// does, out of how many, and the most a native was off by.
+    pub charged_alike: usize,
+    pub charged: usize,
+    pub most_off: i32,
+}
+
+/// numbers to divide, n and d, of every size up to bits and both signs when
+/// signed, so that the library's code goes every way it can, and the cases
+/// at the edges, a divisor of zero and of one, and the quotient that
+/// overflows.
+fn dividends(random: &mut Random, bits: u32, signed: bool) -> Vec<(u64, u64)> {
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mut sized = |size: u32| {
+        let value = (random.next() as u64) << 32 | random.next() as u64;
+        if size == 0 { 0 } else { (value | 1 << (size - 1)) & (u64::MAX >> (64 - size)) }
+    };
+    let mut cases = Vec::new();
+    for n_bits in 0..=bits {
+        for d_bits in 1..=bits {
+            cases.push((sized(n_bits), sized(d_bits)));
+        }
+    }
+    let top = 1u64 << (bits - 1);
+    cases.extend([(12345, 0), (0, 7), (7, 1), (top, mask), (mask, 1), (mask, mask), (top, 3)]);
+    if signed {
+        let flipped: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n.wrapping_neg() & mask, d)).collect();
+        let both: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n.wrapping_neg() & mask, d.wrapping_neg() & mask)).collect();
+        let divisor: Vec<(u64, u64)> = cases.iter().map(|&(n, d)| (n, d.wrapping_neg() & mask)).collect();
+        cases.extend(flipped);
+        cases.extend(both);
+        cases.extend(divisor);
+    }
+    cases
+}
+
+/// runs each native the library has, and the title's own code for it in the
+/// interpreter, on the numbers dividends makes. the quotient and remainder
+/// have to agree, and every register a call keeps. it also runs the title's
+/// code recompiled, the natives off, and prints what that charges the
+/// budget against what the natives do, by the bits of the quotient.
+pub fn natives(pristine: &Memory, library: &mut Library, natives: &[crate::natives::Native]) -> NativesReport {
+    use crate::natives::Kind;
+    use std::collections::BTreeMap;
+    let library: *mut Library = library;
+    let fresh = || Run {
+        memory: pristine.duplicate(),
+        cpu: Cpu::new(),
+        library,
+        pending: None,
+        interpreted: 0,
+        fallbacks: 0,
+        through: false,
+        svcs: 0,
+    };
+    let mut report = NativesReport::default();
+    // the divisions only touch the stack, so the runs go on from where the
+    // last left memory
+    let mut expected = fresh();
+    let mut got = fresh();
+    for native in natives {
+        let (bits, signed, results) = match native.kind {
+            Kind::Uidivmod => (32, false, 2),
+            Kind::Idivmod => (32, true, 2),
+            Kind::Uldivmod => (64, false, 4),
+            Kind::Ldivmod => (64, true, 4),
+        };
+        let mut random = Random(0x5DEE_CE66_D000_0000 ^ native.address as u64);
+        // what each side charged, by the bits of the quotient and whether a
+        // sign or a high word was in it
+        let mut charges: BTreeMap<Case, Charged> = BTreeMap::new();
+        for (n, d) in dividends(&mut random, bits, signed) {
+            let mut cpu = Cpu::new();
+            for register in 4..13 {
+                cpu.regs[register] = random.next();
+            }
+            let (n_low, n_high, d_low, d_high) = (n as u32, (n >> 32) as u32, d as u32, (d >> 32) as u32);
+            if bits == 32 {
+                cpu.regs[0] = n_low;
+                cpu.regs[1] = d_low;
+            } else {
+                cpu.regs[..4].copy_from_slice(&[n_low, n_high, d_low, d_high]);
+            }
+            cpu.regs[13] = STACK_TOP - 0x1000;
+            cpu.regs[14] = RETURN;
+            cpu.regs[15] = native.address;
+            cpu.cp15.thread_id_ro = TLS;
+            // what the library's code leaves below sp is compared too, from
+            // nothing
+            let stack = STACK_TOP - 0x1000 - 32;
+            for at in (stack..stack + 32).step_by(4) {
+                expected.memory.write32(at, 0);
+            }
+            expected.cpu = cpu.clone();
+            let stopped = interpreted(&mut expected);
+            let mut spent = [0i32; 2];
+            for (side, natives_on) in [false, true].into_iter().enumerate() {
+                // SAFETY: nothing runs the library's code meanwhile
+                unsafe { (*library).set_natives(natives_on) };
+                for at in (stack..stack + 32).step_by(4) {
+                    got.memory.write32(at, 0);
+                }
+                got.cpu = cpu.clone();
+                let mut ctx = context(&mut got);
+                store(&cpu, &mut ctx);
+                // SAFETY: got and ctx live through the run and nothing else
+                // touches them
+                let stop = unsafe { recompiled(&mut got, &mut ctx, LIMIT) };
+                spent[side] = LIMIT - ctx.budget;
+                report.tested += 1;
+                let mut found = Vec::new();
+                if stop != stopped {
+                    found.push(format!("stopped with {stopped:?} against {stop:?}"));
+                }
+                for register in (0..results).chain(4..12).chain([13, 15]) {
+                    if expected.cpu.regs[register] != ctx.r[register] {
+                        found.push(format!("r{register} {:08X} against {:08X}", expected.cpu.regs[register], ctx.r[register]));
+                    }
+                }
+                for at in (stack..stack + 32).step_by(4) {
+                    let (want, have) = (expected.memory.read32(at), got.memory.read32(at));
+                    if want != have {
+                        found.push(format!("[{at:08X}] {want:08X} against {have:08X}"));
+                    }
+                }
+                if !found.is_empty() {
+                    report.mismatched += 1;
+                    if report.mismatched <= 20 {
+                        let side = if natives_on { "native" } else { "recompiled" };
+                        println!("  {:?} at {:08X}, {n:X} / {d:X}, {side}: {}", native.kind, native.address, found.join(", "));
+                    }
+                }
+            }
+            if d == 0 {
+                continue;
+            }
+            let negative = signed && ((n >> (bits - 1)) & 1 == 1 || (d >> (bits - 1)) & 1 == 1);
+            let magnitude = |value: u64| if negative && (value >> (bits - 1)) & 1 == 1 { value.wrapping_neg() & (u64::MAX >> (64 - bits)) } else { value };
+            let (un, ud) = if signed { (magnitude(n), magnitude(d)) } else { (n, d) };
+            // the 64-bit divisions go by how much longer n is than d, the
+            // 32-bit ones by the bits of the quotient
+            let quotient_bits = if bits == 64 {
+                (64 + ud.leading_zeros()).saturating_sub(un.leading_zeros())
+            } else if un / ud == 0 {
+                0
+            } else {
+                64 - (un / ud).leading_zeros()
+            };
+            let key = (quotient_bits, negative, un >> 32 != 0, ud >> 32 != 0);
+            let entry = charges.entry(key).or_insert((u64::MAX, 0, 0, 0));
+            let original = spent[0] as u64;
+            *entry = (entry.0.min(original), entry.1.max(original), entry.2 + original, entry.3 + 1);
+            report.charged += 1;
+            report.charged_alike += (spent[1] == spent[0]) as usize;
+            report.most_off = report.most_off.max((spent[1] - spent[0]).abs());
+        }
+        println!("  {:?} at {:08X}, what the title's code charges by quotient bits, sign, high n, high d:", native.kind, native.address);
+        for ((quotient_bits, negative, high_n, high_d), (min, max, sum, count)) in &charges {
+            println!(
+                "    {quotient_bits:2} {} {} {}  {min:4} to {max:4}, mean {:.1}",
+                *negative as u8,
+                *high_n as u8,
+                *high_d as u8,
+                *sum as f64 / *count as f64
+            );
+        }
+    }
+    // SAFETY: as above
+    unsafe { (*library).set_natives(true) };
     report
 }

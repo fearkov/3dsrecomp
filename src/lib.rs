@@ -26,6 +26,7 @@ pub mod compile;
 pub mod cro;
 pub mod discover;
 pub mod image;
+pub mod natives;
 pub mod overrides;
 pub mod port;
 pub mod rom;

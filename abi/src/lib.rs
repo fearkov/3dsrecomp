@@ -19,10 +19,10 @@ pub const OLDEST_ABI: u32 = 4;
 
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
-/// at 2, doing that much faster at 3, and running svcs without leaving the
-/// code at 4. code of an older one still runs, and building it again brings
-/// the improvements, which a host can suggest.
-pub const GENERATION: u32 = 4;
+/// at 2, doing that much faster at 3, running svcs without leaving the code
+/// at 4, and dividing on the host at 5. code of an older one still runs, and
+/// building it again brings the improvements, which a host can suggest.
+pub const GENERATION: u32 = 5;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -306,6 +306,9 @@ pub struct Library {
     /// what the executable's functions and then each module's were made
     /// from, none for code of the generations before.
     origins: *const Origins,
+    /// recomp_natives, which says whether the C library functions the code
+    /// runs on the host do, null when it has none.
+    natives: *mut u8,
     /// the library the tables are in, none when they are linked in.
     #[cfg(feature = "load")]
     _library: Option<libloading::Library>,
@@ -343,6 +346,7 @@ impl Library {
             if code.generation >= 3 {
                 code.origins = symbol(b"recomp_origins").map_or(std::ptr::null(), |origins| origins as *const Origins);
             }
+            code.natives = symbol(b"recomp_natives").map_or(std::ptr::null_mut(), |natives| natives as *mut u8);
             code._library = Some(library);
             Ok(code)
         }
@@ -366,6 +370,7 @@ impl Library {
             // the program says what it was made from, which generation 3 on
             // can, as a library is
             origins: if linked.generation >= 3 { linked.origins as *const Origins } else { std::ptr::null() },
+            natives: std::ptr::null_mut(),
             #[cfg(feature = "load")]
             _library: None,
         })
@@ -375,6 +380,19 @@ impl Library {
     /// to ABI. code made for 4 never calls Host::svc.
     pub fn abi(&self) -> u32 {
         self.abi
+    }
+
+    /// has the C library functions that the code runs on the host, its
+    /// natives, run as the title's own code instead when off, and says
+    /// whether the code has any. they are on until turned off.
+    pub fn set_natives(&mut self, on: bool) -> bool {
+        if self.natives.is_null() {
+            return false;
+        }
+        // SAFETY: recomp_natives is the code's own byte, which only the
+        // thread running it reads
+        unsafe { *self.natives = on as u8 };
+        true
     }
 
     /// the version of the code generator that made the code, 0 for a
@@ -615,6 +633,7 @@ int main(void) {
             abi: ABI,
             generation: GENERATION,
             origins: &origins,
+            natives: std::ptr::null_mut(),
             #[cfg(feature = "load")]
             _library: None,
         };
@@ -661,6 +680,7 @@ int main(void) {
             abi: ABI,
             generation: GENERATION,
             origins: &origins,
+            natives: std::ptr::null_mut(),
             #[cfg(feature = "load")]
             _library: None,
         };

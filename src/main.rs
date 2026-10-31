@@ -209,6 +209,8 @@ fn check(path: &str, library: &Path, count: usize) {
         title.exheader.bss_size,
     );
     let start = std::time::Instant::now();
+    // the generated code is what gets compared, the natives apart below
+    let has_natives = library.set_natives(false);
 
     let executable = verify::verify(
         "executable",
@@ -241,6 +243,17 @@ fn check(path: &str, library: &Path, count: usize) {
         modules.add(&report);
     }
     print_report("modules", &modules);
+    // a library without natives runs the title's code for them both ways
+    let natives = recomp3ds::natives::find(&programs[0].1.text);
+    if !natives.is_empty() {
+        let report = verify::natives(&verify::Memory::new(regions.clone()), &mut library, &natives);
+        let which = if has_natives { "natives" } else { "divisions, the library has no natives," };
+        println!("natives     {} runs of {} {which} {} mismatched", report.tested, natives.len(), report.mismatched);
+        println!(
+            "{:<11} charged as the title's code in {} of {} divisions, off by {} at most",
+            "", report.charged_alike, report.charged, report.most_off
+        );
+    }
     println!("took {:.1?}", start.elapsed());
 }
 

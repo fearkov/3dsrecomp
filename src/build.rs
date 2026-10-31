@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::discover::{self, Analysis, Mode, Program, Source};
+use crate::natives;
 use crate::overrides::{self, Override};
 use crate::rom::Title;
 use crate::{abi, codegen, compile, Mods};
@@ -68,7 +69,20 @@ pub fn generate(
         Some(path) => overrides::load(path)?,
         None => Vec::new(),
     };
-    let replaced: Vec<Override> = files.iter().flat_map(|file| file.overrides.iter().cloned()).collect();
+    let mut replaced: Vec<Override> = files.iter().flat_map(|file| file.overrides.iter().cloned()).collect();
+    let by_hand = replaced.len();
+    // the C library's divisions run on the host, as overrides of their own,
+    // unless one written by hand takes the address. the modules call the
+    // executable's
+    let natives: Vec<natives::Native> = natives::find(&programs[0].1.text)
+        .into_iter()
+        .filter(|native| !replaced.iter().any(|item| item.module.is_none() && item.address == native.address))
+        .collect();
+    let native_source = (!natives.is_empty()).then(|| natives::source(&natives));
+    if let Some(source) = &native_source {
+        replaced.extend(overrides::parse(source)?);
+        events(Event::Note(format!("{} of the C library's divisions run on the host", natives.len())));
+    }
     // whatever an override replaces has to be generated too, for it to call
     for item in &replaced {
         let name = item.module.as_deref().unwrap_or("executable");
@@ -119,8 +133,12 @@ pub fn generate(
         write(&dir.join(&name), file.source.as_bytes())?;
         sources.push(name);
     }
+    if let Some(source) = &native_source {
+        write(&dir.join("natives.c"), source.as_bytes())?;
+        sources.push("natives.c".to_owned());
+    }
     let bytes = generated.iter().map(|(_, contents)| contents.len()).sum();
-    events(Event::Generated { files: generated.len(), bytes, overrides: replaced.len() });
+    events(Event::Generated { files: generated.len(), bytes, overrides: by_hand });
     Ok(Generated { title, dir, sources })
 }
 

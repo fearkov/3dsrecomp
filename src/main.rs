@@ -265,8 +265,8 @@ fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
 #[cfg(feature = "verify")]
 fn print_report(name: &str, report: &verify::Report) {
     println!(
-        "{name:<11} {} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched",
-        report.tested, report.returned, report.svc, report.stuck, report.other, report.mismatched
+        "{name:<11} {} functions, {} returned, {} reached an svc, {} stuck, {} stopped otherwise, {} mismatched, {} svcs gone through",
+        report.tested, report.returned, report.svc, report.stuck, report.other, report.mismatched, report.through
     );
     println!(
         "{:<11} instructions {} recompiled, {} through the fallback, {} interpreted alone",

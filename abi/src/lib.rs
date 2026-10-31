@@ -11,13 +11,18 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 4;
+pub const ABI: u32 = 5;
+
+/// the oldest version code can be made for and still run: version 4 left
+/// every svc to the host's loop, and never calls Host::svc.
+pub const OLDEST_ABI: u32 = 4;
 
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
-/// at 2, and doing that much faster at 3. code of an older one still runs, and building it again brings the
-/// improvements, which a host can suggest.
-pub const GENERATION: u32 = 3;
+/// at 2, doing that much faster at 3, and running svcs without leaving the
+/// code at 4. code of an older one still runs, and building it again brings
+/// the improvements, which a host can suggest.
+pub const GENERATION: u32 = 4;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -63,6 +68,7 @@ pub struct Host {
     pub write32: unsafe extern "C" fn(*mut Context, u32, u32),
     pub interpret: unsafe extern "C" fn(*mut Context, u32, u32),
     pub lookup: unsafe extern "C" fn(*mut Context, u32) -> Option<Code>,
+    pub svc: unsafe extern "C" fn(*mut Context, u32),
 }
 
 #[repr(C)]
@@ -293,6 +299,8 @@ pub struct Library {
     module_count: usize,
     /// the modules placed somewhere, as base, size and index.
     placed: Vec<(u32, u32, usize)>,
+    /// the interface version the code was made for, see ABI.
+    abi: u32,
     /// the code generator's version that made the code, see GENERATION.
     generation: u32,
     /// what the executable's functions and then each module's were made
@@ -342,7 +350,7 @@ impl Library {
 
     /// the code linked into the program.
     pub fn linked(linked: &Linked) -> Result<Library, String> {
-        if linked.abi != ABI {
+        if !(OLDEST_ABI..=ABI).contains(&linked.abi) {
             return Err(format!("it was built for version {} of the interface, this is {ABI}", linked.abi));
         }
         Ok(Library {
@@ -351,6 +359,7 @@ impl Library {
             modules: linked.modules as *const Module,
             module_count: linked.module_count as usize,
             placed: Vec::new(),
+            abi: linked.abi,
             // code linked in was made along with the program
             generation: GENERATION,
             // and is checked against what the program has in memory when
@@ -360,6 +369,12 @@ impl Library {
             #[cfg(feature = "load")]
             _library: None,
         })
+    }
+
+    /// the version of the interface the code was made for, from OLDEST_ABI
+    /// to ABI. code made for 4 never calls Host::svc.
+    pub fn abi(&self) -> u32 {
+        self.abi
     }
 
     /// the version of the code generator that made the code, 0 for a
@@ -532,7 +547,7 @@ int main(void) {
     AT(Context, user);
     SIZE(Host);
     AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
-    AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup);
+    AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
     SIZE(Entry);
     AT(Entry, address); AT(Entry, code);
     SIZE(Module);
@@ -597,6 +612,7 @@ int main(void) {
             modules: std::ptr::null(),
             module_count: 0,
             placed: Vec::new(),
+            abi: ABI,
             generation: GENERATION,
             origins: &origins,
             #[cfg(feature = "load")]
@@ -642,6 +658,7 @@ int main(void) {
             modules: std::ptr::null(),
             module_count: 0,
             placed: Vec::new(),
+            abi: ABI,
             generation: GENERATION,
             origins: &origins,
             #[cfg(feature = "load")]
@@ -705,6 +722,18 @@ int main(void) {
         assert_eq!(starts, [NO_START]);
     }
 
+    /// code made for an older version runs down to the oldest one, which
+    /// leaves every svc to the host's loop, and code of any other doesn't.
+    #[test]
+    fn code_runs_down_to_the_oldest_version() {
+        // SAFETY: empty tables
+        let made = |abi| unsafe { Linked::new(1, abi, std::ptr::null(), 0, std::ptr::null(), 0) };
+        assert!(Library::linked(&made(ABI)).is_ok());
+        assert!(Library::linked(&made(OLDEST_ABI)).is_ok());
+        assert!(Library::linked(&made(OLDEST_ABI - 1)).is_err());
+        assert!(Library::linked(&made(ABI + 1)).is_err());
+    }
+
     /// recomp.h and the structs here describe the same memory, which a C
     /// program built from the header reports on.
     #[test]
@@ -735,7 +764,7 @@ int main(void) {
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
             read_pages, write_pages, vfp, fpscr, host, user);
-        at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup);
+        at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, svc);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
         at!(lines, Piece, start, end, hash);

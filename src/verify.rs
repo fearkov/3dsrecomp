@@ -174,6 +174,11 @@ struct Run {
     /// for the code.
     interpreted: u64,
     fallbacks: u64,
+    /// whether svcs change nothing and the run goes on after them, the way
+    /// it does with a host that runs them in place, rather than ending.
+    through: bool,
+    /// the svcs it went on through.
+    svcs: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -189,6 +194,14 @@ fn stop(exit: Exit) -> Stop {
         Exit::Supervisor(number) => Stop::Svc(number),
         other => Stop::Other(format!("{other:?}")),
     }
+}
+
+/// whether a run goes on after what the interpreter stopped with, an svc
+/// it goes on through, counting it.
+fn goes_through(run: &mut Run, exit: &Exit) -> bool {
+    let through = run.through && matches!(exit, Exit::Supervisor(_));
+    run.svcs += through as u64;
+    through
 }
 
 /// the run a callback belongs to.
@@ -246,7 +259,21 @@ unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
     unsafe { (*run_of(ctx).library).lookup(address) }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup };
+/// an svc, which the code goes on after when the run goes on through them,
+/// and which ends the run otherwise, as the interpreter's.
+unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
+    unsafe {
+        let run = run_of(ctx);
+        if run.through {
+            run.svcs += 1;
+        } else {
+            (*ctx).svc = number;
+            (*ctx).exit = abi::EXIT_SVC;
+        }
+    }
+}
+
+static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
 
 fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;
@@ -280,7 +307,9 @@ fn interpreted(run: &mut Run) -> Stop {
             return Stop::Returned;
         }
         if let Some(exit) = run.cpu.step(&mut run.memory) {
-            return stop(exit);
+            if !goes_through(run, &exit) {
+                return stop(exit);
+            }
         }
     }
     Stop::Limit
@@ -333,7 +362,9 @@ unsafe fn recompiled(run: *mut Run, ctx: *mut Context, slice: i32) -> Stop {
             left -= 1;
             run.interpreted += 1;
             if let Some(exit) = exit {
-                break stop(exit);
+                if !goes_through(run, &exit) {
+                    break stop(exit);
+                }
             }
         };
         (*ctx).budget = left;
@@ -431,6 +462,8 @@ pub struct Report {
     pub tested: usize,
     pub returned: usize,
     pub svc: usize,
+    /// svcs that runs went on through and still matched.
+    pub through: u64,
     pub stuck: usize,
     pub other: usize,
     pub mismatched: usize,
@@ -444,6 +477,7 @@ impl Report {
         self.tested += other.tested;
         self.returned += other.returned;
         self.svc += other.svc;
+        self.through += other.through;
         self.stuck += other.stuck;
         self.other += other.other;
         self.mismatched += other.mismatched;
@@ -453,8 +487,16 @@ impl Report {
 /// runs each function both ways, printing the first few mismatches. the
 /// functions are entries with bit 0 set for Thumb.
 pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32]) -> Report {
-    let fresh =
-        || Run { memory: pristine.duplicate(), cpu: Cpu::new(), library, pending: None, interpreted: 0, fallbacks: 0 };
+    let fresh = || Run {
+        memory: pristine.duplicate(),
+        cpu: Cpu::new(),
+        library,
+        pending: None,
+        interpreted: 0,
+        fallbacks: 0,
+        through: false,
+        svcs: 0,
+    };
     let mut a = fresh();
     let mut b = fresh();
     let mut report = Report::default();
@@ -519,6 +561,16 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
         };
         store(&cpu, &mut ctx);
 
+        // half the functions go on through their svcs, the other half end
+        // at the first one, as all of them do in code made for version 4 of
+        // the interface, which has no svc callback. the coin is a product's
+        // top bit, which xorshift's coin for the slices below, a sum of the
+        // address's bits, says nothing about
+        let through = library.abi() > 4 && (function as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 63 == 1;
+        for run in [&mut a, &mut b] {
+            run.through = through;
+            run.svcs = 0;
+        }
         let expected = interpreted(&mut a);
         b.interpreted = 0;
         b.fallbacks = 0;
@@ -557,6 +609,9 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             continue;
         }
         let mut found = differences(&a, &b, &ctx);
+        if a.svcs != b.svcs {
+            found.insert(0, format!("went through {} svcs against {}", a.svcs, b.svcs));
+        }
         if expected != got {
             found.insert(0, format!("stopped with {expected:?} against {got:?}"));
         }
@@ -567,6 +622,7 @@ pub fn verify(name: &str, pristine: &Memory, library: &Library, functions: &[u32
             }
             continue;
         }
+        report.through += a.svcs;
         match expected {
             Stop::Returned => report.returned += 1,
             Stop::Svc(_) => report.svc += 1,

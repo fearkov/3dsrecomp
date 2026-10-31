@@ -26,7 +26,11 @@ cargo build --release
 
 The program is called after the title unless `--name` says otherwise. By
 default the project builds against Zakuro from GitHub. `--zakuro` points it
-at a local checkout instead.
+at a local checkout instead. The project's `Cargo.lock` keeps the Zakuro it
+was first built with, so after `port` writes code from a newer 3dsrecomp
+into it, run `cargo update -p zakuro` there before building: an older Zakuro
+refuses code made for a newer version of the interface, and interprets the
+game instead.
 
 You need Rust, a C compiler and `ar`. Linking pulls in hundreds of megabytes
 of objects, so the first build takes a while.

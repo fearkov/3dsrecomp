@@ -1,9 +1,10 @@
 //! turning the functions discovery found into C.
 //!
 //! every function becomes a C function that can be entered at any of its
-//! labels. guest calls are C calls, and anything the code cannot follow on
-//! its own, an svc, an unknown target, a full budget, returns all the way
-//! out to the host, which picks up again from r15.
+//! labels. guest calls are C calls, an svc is a call to the host, and
+//! anything the code cannot follow on its own, an unknown target, a full
+//! budget, an svc the host has more to do for, returns all the way out to
+//! the host, which picks up again from r15.
 
 mod arm;
 mod locals;
@@ -577,6 +578,22 @@ mod tests {
         assert!(code.contains("RETURN_TO_A(next);"));
 
         compiles("transfers", &files, &["code000.c"]);
+    }
+
+    /// the code goes on after an svc, which the host ran, into the next
+    /// instruction, where the host comes back in when it stops instead.
+    #[test]
+    fn an_svc_goes_on_to_the_next_instruction() {
+        // svceq 0x28, svc 0x28, bx lr
+        let files = files(&[0x0F00_0028, 0xEF00_0028, 0xE12F_FF1E], &[]);
+        let code = &files["code000.c"];
+        let conditional = code.find("SVC(0x00100004u, 0x28u);").expect("the first svc");
+        let svc = code.find("SVC(0x00100008u, 0x28u);").expect("the second svc");
+        let next = code.find("L_00100008:").expect("a label after it");
+        assert!(conditional < svc && svc < next);
+        assert!(!code[svc..next].contains("goto"), "{}", &code[svc..next]);
+
+        compiles("svc", &files, &["code000.c"]);
     }
 
     /// compiles sources among files, in a folder of their own named after

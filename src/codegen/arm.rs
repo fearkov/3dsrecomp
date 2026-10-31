@@ -59,9 +59,10 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
         0b110 => vfp::load_store(out, scope, a, op),
+        // the host runs an svc in place, and the code goes on after it
         0b111 if op & (1 << 24) != 0 => {
             emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), op & 0x00FF_FFFF);
-            false
+            true
         }
         0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),
         // cp15, where reading the TLS address is common enough to do here,

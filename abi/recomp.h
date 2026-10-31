@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 4
+#define RECOMP_ABI 5
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
@@ -24,12 +24,18 @@ typedef struct Host {
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
     /* the code for an address, bit 0 set for Thumb, or null. */
     Code (*lookup)(Context *, uint32_t address);
+    /* runs an svc, r15 pointing after it, and the code goes on from there.
+       a host that has more to do first, switch threads say, sets exit to
+       EXIT_UNWIND, and one that runs it in its own loop instead sets exit to
+       EXIT_SVC and svc to the number. */
+    void (*svc)(Context *, uint32_t number);
 } Host;
 
 /* why the code gave control back to the host. */
 enum {
     EXIT_NONE,
-    /* an svc, its number is in svc and r15 points after it. */
+    /* an svc the host left for later, its number is in svc and r15 points
+       after it. */
     EXIT_SVC,
     /* the budget ran out, r15 is where to resume. */
     EXIT_BUDGET,
@@ -713,12 +719,14 @@ static inline void recomp_call(Context *ctx) {
 
 #define OUT_OF_BUDGET() OUT_OF_BUDGET_AT(out_of_budget)
 
+/* an svc, which the host runs right there, the way the interpreter runs an
+   instruction. */
 #define SVC(next, number) do { \
     SYNC_OUT(); \
     ctx->r[15] = (next); \
-    ctx->svc = (number); \
-    ctx->exit = EXIT_SVC; \
-    return; \
+    ctx->host->svc(ctx, (number)); \
+    if (UNLIKELY(ctx->exit)) return; \
+    SYNC_IN(); \
 } while (0)
 
 #define INTERPRET(address, opcode) do { \

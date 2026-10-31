@@ -143,11 +143,10 @@ enum Event {
     Write(usize, bool),
     /// the end of a statement, the reads in it come before its writes.
     Boundary,
-    /// the context has to be complete for a call, the interpreter or a
-    /// short vector, and the locals are taken again after it.
+    /// the context has to be complete for a call, the interpreter, an svc
+    /// or a short vector, and the locals are taken again after it.
     Sync,
-    /// leaving the function, by a return or an svc, with the context
-    /// complete.
+    /// leaving the function by a return, with the context complete.
     Leave,
     /// a jump through dispatch, which syncs first, so the labels it reaches
     /// start with the context complete.
@@ -335,8 +334,8 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
         }
         let guarded = blocks.guarded();
         match &rest[..word] {
-            b"CALL" | b"INTERPRET" => events.push((Event::Sync, guarded)),
-            b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" | b"SVC" => events.push((Event::Leave, guarded)),
+            b"CALL" | b"INTERPRET" | b"SVC" => events.push((Event::Sync, guarded)),
+            b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" => events.push((Event::Leave, guarded)),
             b"JUMP_TO" => events.push((Event::Dispatch, guarded)),
             b"BLOCK" => events.push((Event::Budget, guarded)),
             b"goto" if rest.starts_with(b"goto dispatch;") => {
@@ -587,6 +586,19 @@ mod tests {
         // nothing changed yet where the budget is checked
         assert!(kept.contains("BLOCK_TO(0x00100000u, 6, out_of_budget_0);"));
         assert_eq!(sync_before(&kept, "OUT_OF_BUDGET_AT(out_of_budget_0);"), "#define SYNC_OUT() do { ctx->budget = budget_; } while (0)");
+    }
+
+    #[test]
+    fn an_svc_stores_what_changed_and_goes_on_with_the_locals_taken_again() {
+        let body = "L_00100000:\n    BLOCK(0x00100000u, 2);\n    ctx->r[0] = ctx->r[4] + 1;\n    SVC(0x00100008u, 0x28u);\n\
+            L_00100008:\n    BLOCK(0x00100008u, 2);\n    ctx->r[5] = ctx->r[0];\n    ctx->r[15] = ctx->r[14] & ~3u; RETURN();\n    OUT_OF_BUDGET();\n";
+        let kept = keep(body);
+        assert_eq!(sync_before(&kept, "SVC("), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
+        // what the host left in the context is what the code has after
+        assert_eq!(
+            sync_before(&kept, "RETURN();"),
+            "#define SYNC_OUT() do { ctx->r[5] = reg5_; ctx->r[15] = reg15_; ctx->budget = budget_; } while (0)"
+        );
     }
 
     #[test]

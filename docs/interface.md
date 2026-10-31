@@ -5,7 +5,10 @@ depends on a particular emulator. It runs against a small interface, declared
 in [`recomp.h`](../abi/recomp.h). Any program that implements that
 interface can run the code. This document calls that program the host.
 
-This page describes version 4 of the interface.
+This page describes version 5 of the interface. Version 4 differed only in
+the `svc` callback, which it did not have: its code left every `svc` to the
+host's loop with `EXIT_SVC`. Code made for version 4 still runs on a host
+written for 5, which `recomp_abi` accepts.
 
 ## What build writes
 
@@ -45,13 +48,15 @@ Zakuro does it on its own.
 | `recomp_modules` | `const Module[]` | One per CRO module |
 | `recomp_origins` | `const Origins[]` | What the code was made from, the executable's and then one per module, read from generation 3 on |
 
-Check `recomp_abi` first, and refuse to run the library when it is not the
+Check `recomp_abi` first, and refuse to run the library when it is not a
 version you were written for. The version goes up whenever the layout of any
-structure or the meaning of any field changes.
+structure or the meaning of any field changes. A host written for version 5
+can also run code made for 4, which never calls `svc`.
 
 `recomp_generation` goes up when the generated code gets much faster or does
-more, without the interface changing. Generation 3 added `recomp_origins`. A
-library of an older generation, or one without the symbol, still runs.
+more. Generation 3 added `recomp_origins`, and generation 4, made for
+version 5 of the interface, runs svcs in place. A library of an older
+generation, or one without the symbol, still runs.
 Building it again brings the improvements, which a host can suggest. In Rust, `Library::generation` reads it, 0 when it is missing, and
 `recomp_abi::GENERATION` is the current one.
 
@@ -76,7 +81,8 @@ function starts:
 - the instruction after every `svc`.
 
 This matters because the host sometimes returns to an address whose C frame is
-already gone, after an unwind or an svc (see below). Several entries can share
+already gone, after an unwind or an svc it stopped the code for (see below).
+Several entries can share
 one `code`, because a function dispatches internally to the right place from
 `r[15]`.
 
@@ -212,10 +218,12 @@ the same registers without copying them back and forth.
 The code keeps the registers, the flags, the VFP registers, `fpscr` and the
 budget in locals while it runs, and puts them back in the context wherever
 something else can look at them: when it returns, and before it calls
-`lookup`, `interpret` or another function. Inside the memory callbacks they
-are not current, only the arguments, `host`, `user` and the page tables are.
-`r[15]` is set when the code returns and before it calls `lookup`. The
-`interpret` callback receives the address it needs as an argument.
+`lookup`, `interpret`, `svc` or another function. After `interpret` and `svc`
+it takes them all back, so whatever the host changed there is what the code
+goes on with. Inside the memory callbacks they are not current, only the
+arguments, `host`, `user` and the page tables are. `r[15]` is set when the
+code returns and before it calls `lookup` or `svc`. The `interpret` callback
+receives the address it needs as an argument.
 
 ## Memory
 
@@ -249,6 +257,7 @@ typedef struct Host {
     void (*write32)(Context *, uint32_t, uint32_t);
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
     Code (*lookup)(Context *, uint32_t address);
+    void (*svc)(Context *, uint32_t number);
 } Host;
 ```
 
@@ -277,6 +286,24 @@ typedef struct Host {
   It is usually the same search the host's own run loop does. When it returns
   null, the code sets `exit` to `EXIT_UNWIND`, with `r[15]` holding the
   target.
+- **`svc`.** The guest ran an `svc`. `number` is its number, and `r[15]`
+  already points at the instruction after it. The host can do one of three
+  things:
+  - run it right there, writing its results into the context, and leave
+    `exit` alone. The code then goes on after the `svc`, with the C stack and
+    every guest call it is in intact. Set `budget` to what the code may run
+    from there. Leave `r[15]` and `thumb` as they are: the code goes on
+    after the `svc` whatever they say, and to send it anywhere else, set
+    `exit` to `EXIT_UNWIND`.
+  - run it, then set `exit` to `EXIT_UNWIND` when it has more to do before
+    the guest goes on, such as switching to another thread or ending a frame.
+    The code returns, and the host picks up from `r[15]` later.
+  - leave it for its own loop: set `svc` to `number` and `exit` to
+    `EXIT_SVC`. That is what code made for version 4 always did.
+
+  Running it in place saves the code from returning all the way out and
+  being entered again, which titles that read the clock or take a lock
+  thousands of times a frame pay for each time.
 
 ## Exits
 
@@ -286,9 +313,9 @@ execution continues.
 | `exit` | Meaning | `r[15]` |
 | --- | --- | --- |
 | `EXIT_NONE` | The guest function returned. | The return address. |
-| `EXIT_SVC` | The guest ran an `svc`. The number is in `svc`. | The instruction after the `svc`. |
+| `EXIT_SVC` | The `svc` callback left the `svc` for the host's loop. The number is in `svc`. | The instruction after the `svc`. |
 | `EXIT_BUDGET` | The budget ran out. | The first instruction that did not run. |
-| `EXIT_UNWIND` | Anything else: an `interpret` that branched, a failed `lookup`, or calls nested too deep. | Where to continue. |
+| `EXIT_UNWIND` | Anything else: an `interpret` that branched, an `svc` the host stopped the code after, a failed `lookup`, or calls nested too deep. | Where to continue. |
 
 In every case the host can go on from `r[15]`: with the code when `lookup`
 finds any, and with its interpreter otherwise, and the guest runs exactly as
@@ -322,6 +349,11 @@ and returns `EXIT_BUDGET`. As a result:
   any progress. Give each run more budget than the longest block, or let the
   interpreter take over when that happens. The longest block depends on the
   title, in Alpha Sapphire it is 1,603 instructions.
+- each C function cuts its code into blocks of its own, and a block that a
+  branch leaves early is still charged in full. So the same instructions
+  can cost a little more or less depending on which function runs them:
+  the caller, going on after a call or an svc run in place, or the
+  function an entry names, when the host comes back in after a stop.
 
 ## A minimal host
 
@@ -353,6 +385,12 @@ void interpret_one(Context *ctx);
 static Code lookup(Context *ctx, uint32_t address) {
     Code code = find(entries, entry_count, address);
     return code ? code : find_module_code(address);
+}
+
+/* the simplest svc callback, which leaves every svc to run below. */
+static void svc(Context *ctx, uint32_t number) {
+    ctx->svc = number;
+    ctx->exit = EXIT_SVC;
 }
 
 int open_library(const char *path) {
@@ -387,7 +425,10 @@ int run(Context *ctx, int32_t budget) {
 ```
 
 A working host also fills in the page tables, `vfp`, `fpscr`, `tls` and
-`host`, and implements the memory callbacks and `interpret`.
+`host`, and implements the memory callbacks and `interpret`. A host that runs
+svcs in place does in its `svc` callback what its loop would do with an
+`EXIT_SVC`, and lets the code go on whenever the guest would simply carry on.
+Zakuro's does that for every svc that only touches the kernel.
 
 ## Overrides and programs
 

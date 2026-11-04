@@ -292,9 +292,13 @@ impl Title {
             return error("the executable partition has no NCCH header");
         }
         let flags = &header[0x188..0x190];
-        // the partition is readable as it is when it says so, or when it was
-        // never encrypted
-        if flags[7] & 0x04 == 0 && flags[3] != 0 {
+        // NoCrypto says the partition is readable as it is. without it, a
+        // crypto method (flags[3]) other than 0 is one of the newer keys;
+        // 0 is the original key, which most games use, or a dump decrypted
+        // with the flags left as they were, so that one is only called
+        // encrypted when its ExeFS turns out unreadable, below
+        let no_crypto = flags[7] & 0x04 != 0;
+        if !no_crypto && flags[3] != 0 {
             return error("the dump is encrypted, it has to be decrypted first");
         }
         let program_id = u64_at(&header, 0x118);
@@ -313,7 +317,13 @@ impl Title {
             .take(10)
             .find(|entry| ascii(&entry[..8]) == ".code")
             .map(|entry| (exefs + EXEFS_HEADER_SIZE + u32_at(entry, 8) as u64, u32_at(entry, 12) as u64))
-            .ok_or(Error("the ExeFS has no .code".into()))?;
+            .ok_or_else(|| {
+                Error(if no_crypto {
+                    "the ExeFS has no .code".into()
+                } else {
+                    "the dump is encrypted, it has to be decrypted first (the ExeFS has no .code)".into()
+                })
+            })?;
 
         let romfs = if has_romfs { read_romfs(&mut file, romfs_offset, read).ok() } else { None };
         Ok(Title { file: Mutex::new(file), program_id, exheader, code, romfs })
@@ -573,6 +583,28 @@ pub(crate) mod tests {
         assert_eq!(read("cro/Battle.cro"), b"battle");
         assert_eq!(read("CRO/field.cro"), b"field");
         drop(title);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// a dump encrypted with the original key, crypto method 0 and no
+    /// NoCrypto, is called encrypted, and one decrypted without its flags
+    /// being updated still loads.
+    #[test]
+    fn an_encrypted_dump_says_so() {
+        let path = rom("encrypted", &[1, 2, 3, 4], &[]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0x18F] = 0;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Title::load(&path).unwrap().code().unwrap(), [1, 2, 3, 4]);
+        // the ExeFS as encryption leaves it, garbage where the names were
+        put(&mut bytes, 0x600, &[0x8F, 0x13, 0xA2, 0x07, 0x51, 0xE4, 0x3C, 0x90]);
+        std::fs::write(&path, &bytes).unwrap();
+        let message = Title::load(&path).err().unwrap().to_string();
+        assert!(message.starts_with("the dump is encrypted"), "{message}");
+        // decrypted and said so, but with no .code, is told as it is
+        bytes[0x18F] = 0x04;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(Title::load(&path).err().unwrap().to_string(), "the ExeFS has no .code");
         std::fs::remove_file(path).unwrap();
     }
 

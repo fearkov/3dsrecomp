@@ -5,16 +5,21 @@ depends on a particular emulator. It runs against a small interface, declared
 in [`recomp.h`](../abi/recomp.h). Any program that implements that
 interface can run the code. This document calls that program the host.
 
-This page describes version 7 of the interface. Version 6 had no `tick_`
-fields: its code asked the host for every GetSystemTick, where version 7
-code can read the clock itself, see [Ticks](#ticks). Version 5 differed in
+This page describes version 8 of the interface. Version 7 had no fields
+after `ticks`: its code asked the host for every WaitSynchronizationN and
+ReleaseMutex, where version 8 code can take and let go of a mutex the host
+lends it, see [A mutex lent](#a-mutex-lent), and its ticks left no
+`trail`. Version 6 had no `tick_` fields: its code asked the host for every
+GetSystemTick, where version 7 code can read the clock itself, see
+[Ticks](#ticks). Version 5 differed in
 how the code makes calls: its functions returned nothing and counted how
 deep they were in `depth`, where version 6 gives back where the guest went
 and checks the C stack against `stack_limit`. Version 4 also had no `svc`
 callback: its code left every `svc` to the host's loop with `EXIT_SVC`. Code
-made for 4, 5 and 6 still runs on a host written for 7, which `recomp_abi`
-accepts, as long as the host also sets `depth` to 0. Such code never reads
-the `tick_` fields.
+made for 4, 5, 6 and 7 still runs on a host written for 8, which
+`recomp_abi` accepts, as long as the host also sets `depth` to 0. Code made
+before 7 never reads the `tick_` fields, and code made before 8 never reads
+or writes the fields after `ticks`.
 
 ## What build writes
 
@@ -57,8 +62,9 @@ Zakuro does it on its own.
 
 Check `recomp_abi` first, and refuse to run the library when it is not a
 version you were written for. The version goes up whenever the layout of any
-structure or the meaning of any field changes. A host written for version 7
-can also run code made for 6, 5 and 4, which ask for every tick, and for 5
+structure or the meaning of any field changes. A host written for version 8
+can also run code made for 7, which asks for every wait and release and
+leaves no trail, for 6, 5 and 4, which ask for every tick too, and for 5
 and 4 give nothing back and count calls in `depth`, and for 4 never call
 `svc`.
 
@@ -223,7 +229,9 @@ context. The context does not need to live between two runs.
 | `user` | Belongs to the host. The code never touches it. |
 | `stack_limit` | The lowest address the code's C stack may reach. The host sets it before each call, see [Calls](#calls). |
 | `tick_end`, `tick_floor`, `tick_cost`, `tick_at` | Where and how the code may answer GetSystemTick itself, see [Ticks](#ticks). A host that never sets `tick_at` gets every one through `svc`. |
-| `ticks`, `tick_last` | How many ticks the code answered, and the last one it gave. |
+| `ticks`, `tick_last` | How many ticks the code answered, and the tick of the last svc it answered itself. |
+| `wait_at`, `release_at`, `held`, `holding`, `held_floor` | Where and how the code may take and let go of a mutex itself, see [A mutex lent](#a-mutex-lent). `held_floor` at `INT32_MAX`, `NOTHING_HELD` in Rust, has every wait and release go through `svc`. |
+| `done`, `trail` | How many svcs the code answered itself, ticks too, and the addresses after the last `RECOMP_TRAIL` of them. |
 
 `vfp` and `fpscr` are pointers so that the code and an interpreter can work on
 the same registers without copying them back and forth.
@@ -366,6 +374,59 @@ The host sets `tick_end` and `tick_floor` again whenever it changes
 `budget` or what the floor depends on, as it does after an svc it ran in
 place, and `tick_at` whenever that stops being a place it would answer at.
 Setting `tick_at` to 0 is always enough.
+
+From version 8 each tick the code answers also goes in the trail, see
+below.
+
+## A mutex lent
+
+After the clock, titles mostly take a mutex with `svc 0x25`,
+WaitSynchronizationN, on its handle alone, and let it go with `svc 0x14`,
+ReleaseMutex, often the same mutex from the same two places. From version 8
+the host can lend the code one mutex, which the code then takes and lets go
+of itself, without calling anything, while nothing but its thread could
+touch it. The code answers a WaitSynchronizationN when all of these hold:
+
+- `wait_at` is the address after the `svc`, with bit 0 set for Thumb;
+- `budget` is greater than `held_floor`;
+- `r2`, the count, is 1, and the word `r1` points at is `held`, read
+  where the page tables reach it directly, in one page.
+
+Then it adds one to `holding` and gives 0 in `r0` and `r1`, the result and
+the index. It answers a ReleaseMutex when `release_at` is the address after
+the `svc`, `budget` is greater than `held_floor`, `r0` is `held` and
+`holding` is not 0. Then it takes one from `holding` and gives 0 in `r0`.
+Neither costs any budget. Anywhere else, or otherwise, the code calls `svc`
+as for any svc.
+
+Every svc the code answers itself, a tick too, leaves the address after it,
+with bit 0 set for Thumb, in `trail[done % RECOMP_TRAIL]`, adds one to
+`done`, and leaves its tick, `tick_end - budget` before anything is taken
+for it, in `tick_last`. So the host can tell what the code answered and in
+which order, the last `RECOMP_TRAIL` of them at least, and whether the last
+was a tick, from where it was.
+
+A host lends a mutex the way it decides it can run a wait or a release in
+place:
+
+- `held` is the mutex's handle and `holding` how many times the current
+  thread holds it, 0 when it is free. The host lends it only when it is
+  free or the current thread's, and nothing else waits on it, no thread
+  that would run in its place is ready, and so on, whatever has to hold
+  for a wait or release in place to do no more than count;
+- `held_floor` keeps the code off waits and releases after which that may
+  stop being so, a timer coming due, say, the way `tick_floor` does for
+  ticks, but with nothing to pay: a wait or release at cycle `t` is clear
+  of the host's next such point `due` when `t < due`, which is
+  `budget > tick_end - due`;
+- `wait_at` and `release_at` are places the host has seen the wait and the
+  release at and ran in place, 0 naming none, so a context of zeros lends
+  nothing;
+- when the code next calls `svc` or `interpret`, or returns, the host first
+  makes the mutex what `holding` says, held that many times by the thread
+  or free, then does for the svcs in the trail what it does around one it
+  runs in place, then sets `done` and `ticks` back to 0. Setting
+  `held_floor` to `INT32_MAX` then ends the loan, which is always enough.
 
 ## Exits
 

@@ -363,6 +363,8 @@ fn conditional_branch(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool 
         0xF => {
             match op & 0xFF {
                 0x28 => emit!(out, "    SVC_TICK({}, 1u);", scope.at(a + 2)),
+                0x25 => emit!(out, "    SVC_WAIT({}, 1u);", scope.at(a + 2)),
+                0x14 => emit!(out, "    SVC_RELEASE({}, 1u);", scope.at(a + 2)),
                 number => emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 2), number),
             }
             true

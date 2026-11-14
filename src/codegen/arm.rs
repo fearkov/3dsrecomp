@@ -61,10 +61,13 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         }
         0b110 => vfp::load_store(out, scope, a, op),
         // the host runs an svc in place, and the code goes on after it,
-        // the code reading the clock itself where the host lets it
+        // the code reading the clock and taking the mutex the host lends it
+        // itself where the host lets it
         0b111 if op & (1 << 24) != 0 => {
             match op & 0x00FF_FFFF {
                 0x28 => emit!(out, "    SVC_TICK({}, 0u);", scope.at(a + 4)),
+                0x25 => emit!(out, "    SVC_WAIT({}, 0u);", scope.at(a + 4)),
+                0x14 => emit!(out, "    SVC_RELEASE({}, 0u);", scope.at(a + 4)),
                 number => emit!(out, "    SVC({}, 0x{:X}u);", scope.at(a + 4), number),
             }
             true

@@ -665,14 +665,15 @@ mod tests {
 
     /// the code goes on after an svc, which the host ran, into the next
     /// instruction, where the host comes back in when it stops instead.
-    /// GetSystemTick is one the code can answer itself.
+    /// GetSystemTick, WaitSynchronizationN and ReleaseMutex are ones the
+    /// code can answer itself.
     #[test]
     fn an_svc_goes_on_to_the_next_instruction() {
-        // svceq 0x28, svc 0x14, bx lr
-        let files = files(&[0x0F00_0028, 0xEF00_0014, 0xE12F_FF1E], &[]);
-        let code = &files["code000.c"];
+        // svceq 0x28, svc 0x32, bx lr
+        let plain = files(&[0x0F00_0028, 0xEF00_0032, 0xE12F_FF1E], &[]);
+        let code = &plain["code000.c"];
         let conditional = code.find("SVC_TICK(0x00100004u, 0u);").expect("the first svc");
-        let svc = code.find("SVC(0x00100008u, 0x14u);").expect("the second svc");
+        let svc = code.find("SVC(0x00100008u, 0x32u);").expect("the second svc");
         let next = code.find("L_00100008:").expect("a label after it");
         assert!(conditional < svc && svc < next);
         assert!(!code[svc..next].contains("goto"), "{}", &code[svc..next]);
@@ -688,8 +689,25 @@ mod tests {
         let thumb: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
         assert!(thumb["code000.c"].contains("SVC_TICK(0x00100002u, 1u);"), "{}", thumb["code000.c"]);
 
-        compiles("svc", &files, &["code000.c"]);
+        // svc 0x25, svc 0x14, bx lr, and the same in Thumb
+        let mutex = files(&[0xEF00_0025, 0xEF00_0014, 0xE12F_FF1E], &[]);
+        assert!(mutex["code000.c"].contains("SVC_WAIT(0x00100004u, 0u);"), "{}", mutex["code000.c"]);
+        assert!(mutex["code000.c"].contains("SVC_RELEASE(0x00100008u, 0u);"), "{}", mutex["code000.c"]);
+        let program = Program {
+            text: Segment { base: BASE, bytes: [0xDF25u16, 0xDF14, 0x4770].iter().flat_map(|h| h.to_le_bytes()).collect() },
+            seeds: vec![(BASE | 1, Source::Entry)],
+            slots: None,
+        };
+        let analysis = discover::analyze(&program);
+        let units = [Unit { module: None, program: &program, analysis: &analysis }];
+        let thumb_mutex: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
+        assert!(thumb_mutex["code000.c"].contains("SVC_WAIT(0x00100002u, 1u);"), "{}", thumb_mutex["code000.c"]);
+        assert!(thumb_mutex["code000.c"].contains("SVC_RELEASE(0x00100004u, 1u);"), "{}", thumb_mutex["code000.c"]);
+
+        compiles("svc", &plain, &["code000.c"]);
         compiles("thumb-svc", &thumb, &["code000.c"]);
+        compiles("mutex-svc", &mutex, &["code000.c"]);
+        compiles("thumb-mutex-svc", &thumb_mutex, &["code000.c"]);
     }
 
     /// a call checks where the callee came back to with one compare against
@@ -826,6 +844,13 @@ mod tests {
             tick_cost: 0,
             tick_at: recomp_abi::NO_TICKS,
             ticks: 0,
+            wait_at: recomp_abi::NO_TICKS,
+            release_at: recomp_abi::NO_TICKS,
+            held: 0,
+            holding: 0,
+            held_floor: recomp_abi::NOTHING_HELD,
+            done: 0,
+            trail: [0; recomp_abi::TRAIL],
         };
         // where the guest returns to the host, which no code is at
         const DONE: u32 = 0x0020_0000;
@@ -969,6 +994,13 @@ mod tests {
             tick_cost: 150,
             tick_at: BASE + 4,
             ticks: 0,
+            wait_at: recomp_abi::NO_TICKS,
+            release_at: recomp_abi::NO_TICKS,
+            held: 0,
+            holding: 0,
+            held_floor: recomp_abi::NOTHING_HELD,
+            done: 0,
+            trail: [0; recomp_abi::TRAIL],
         };
         let run = |ctx: &mut Context, floor: i32| {
             ASKED.store(0, Ordering::Relaxed);
@@ -994,6 +1026,147 @@ mod tests {
         // with the budget at or below the floor the host answers both
         assert_eq!(run(&mut ctx, 500), 2);
         assert_eq!((ctx.r[0], ctx.r[2], ctx.ticks, ctx.budget), (7, 7, 0, 500 - 4));
+    }
+
+    /// WaitSynchronizationN and ReleaseMutex run for real: the code takes
+    /// and lets go of the mutex the host lent it itself, at the places the
+    /// host lets it, while the budget is above the floor, leaving each in
+    /// the trail with the ticks, and the host answers the rest.
+    #[cfg(feature = "host")]
+    #[test]
+    fn the_code_takes_the_mutex_the_host_lends_it() {
+        use recomp_abi::{Code, Context, Host, Library, EXIT_NONE, TRAIL};
+        use std::sync::Mutex;
+
+        static ASKED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        unsafe extern "C" fn read8(_: *mut Context, _: u32) -> u8 {
+            0
+        }
+        unsafe extern "C" fn read16(_: *mut Context, _: u32) -> u16 {
+            0
+        }
+        unsafe extern "C" fn read32(_: *mut Context, _: u32) -> u32 {
+            0
+        }
+        unsafe extern "C" fn write8(_: *mut Context, _: u32, _: u8) {}
+        unsafe extern "C" fn write16(_: *mut Context, _: u32, _: u16) {}
+        unsafe extern "C" fn write32(_: *mut Context, _: u32, _: u32) {}
+        unsafe extern "C" fn interpret(_: *mut Context, _: u32, _: u32) {}
+        unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
+            ASKED.lock().unwrap().push(number);
+            let r = &mut (*ctx).r;
+            match number {
+                0x25 => (r[0], r[1]) = (0, 0),
+                0x14 => r[0] = 0,
+                _ => (r[0], r[1]) = (7, 0),
+            }
+        }
+        unsafe extern "C" fn lookup(ctx: *mut Context, address: u32) -> Option<Code> {
+            (*((*ctx).user as *const Library)).lookup(address)
+        }
+        static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
+
+        // svc 0x25, mov r0, r5, svc 0x14, svc 0x28, bx lr
+        let words = [0xEF00_0025u32, 0xE1A0_0005, 0xEF00_0014, 0xEF00_0028, 0xE12F_FF1E];
+        let program = Program {
+            text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
+            seeds: vec![(BASE, Source::Entry)],
+            slots: None,
+        };
+        let library = library("mutex", &program);
+        // where the handles are, a page the code reaches, and its last word
+        const HANDLES: u32 = 0x0810_0000;
+        const HELD: u32 = 0x0001_0012;
+        let mut page = vec![0u8; 0x1000];
+        page[..4].copy_from_slice(&HELD.to_le_bytes());
+        page[0xFFC..].copy_from_slice(&HELD.to_le_bytes());
+        page[8..12].copy_from_slice(&0x0001_0013u32.to_le_bytes());
+        let mut pages = vec![std::ptr::null_mut::<u8>(); 1 << 20];
+        pages[HANDLES as usize >> 12] = page.as_mut_ptr();
+        let (mut vfp, mut fpscr) = ([0u32; 32], 0u32);
+        let mut ctx = Context {
+            r: [0; 16],
+            n: 0,
+            z: 0,
+            c: 0,
+            v: 0,
+            q: 0,
+            thumb: 0,
+            ge: 0,
+            exclusive: 0,
+            budget: 0,
+            exit: 0,
+            svc: 0,
+            depth: 0,
+            exclusive_address: 0,
+            tls: 0,
+            read_pages: pages.as_ptr(),
+            write_pages: pages.as_ptr(),
+            vfp: vfp.as_mut_ptr(),
+            fpscr: &mut fpscr,
+            host: &HOST,
+            user: &library as *const Library as *mut std::ffi::c_void,
+            stack_limit: 0,
+            tick_end: 1000,
+            tick_last: 0,
+            tick_floor: 10,
+            tick_cost: 150,
+            tick_at: BASE + 0x10,
+            ticks: 0,
+            wait_at: BASE + 4,
+            release_at: BASE + 0xC,
+            held: HELD,
+            holding: 0,
+            held_floor: 10,
+            done: 0,
+            trail: [0; TRAIL],
+        };
+        // runs the program from the top with the handles at handles, how
+        // many there are in count, the handle let go of in r5, and floor
+        let run = |ctx: &mut Context, handles: u32, count: u32, floor: i32| {
+            ASKED.lock().unwrap().clear();
+            (ctx.r[14], ctx.r[15], ctx.budget, ctx.ticks) = (0x0020_0000, BASE, 500, 0);
+            (ctx.r[1], ctx.r[2], ctx.r[5], ctx.held_floor) = (handles, count, HELD, floor);
+            ctx.exit = EXIT_NONE;
+            ctx.stack_limit = recomp_abi::stack_limit();
+            let code = library.lookup(BASE).expect("code for the program");
+            // SAFETY: the code came from the library, and the context has
+            // what it needs
+            let back = unsafe { code(ctx) };
+            assert_eq!((back, ctx.exit), (0x0020_0000, EXIT_NONE));
+            std::mem::take(&mut *ASKED.lock().unwrap())
+        };
+
+        // the code takes it, lets it go and reads the clock, all itself
+        ctx.done = 0;
+        assert_eq!(run(&mut ctx, HANDLES, 1, 10), []);
+        assert_eq!((ctx.holding, ctx.done, ctx.ticks, ctx.r[0], ctx.r[1]), (0, 3, 1, ctx.tick_last as u32, 0));
+        assert!((1000 - 500..=1000 - 495).contains(&ctx.tick_last), "{}", ctx.tick_last);
+        assert_eq!(ctx.trail[..3], [BASE + 4, BASE + 0xC, BASE + 0x10]);
+        assert_eq!(ctx.budget, 500 - 5 - 150, "five instructions and a tick");
+        // the last word of a page, held once already
+        (ctx.holding, ctx.done) = (1, 0);
+        assert_eq!(run(&mut ctx, HANDLES + 0xFFC, 1, 10), []);
+        assert_eq!((ctx.holding, ctx.done), (1, 3));
+        // the trail goes round
+        (ctx.holding, ctx.done) = (0, TRAIL as u32 - 1);
+        assert_eq!(run(&mut ctx, HANDLES, 1, 10), []);
+        assert_eq!((ctx.done, ctx.trail[TRAIL - 1], ctx.trail[0], ctx.trail[1]), (TRAIL as u32 + 2, BASE + 4, BASE + 0xC, BASE + 0x10));
+        ctx.done = 0;
+
+        // the host answers another handle, two of them, one past the page or
+        // on none, and a release of a mutex the thread does not hold
+        assert_eq!(run(&mut ctx, HANDLES + 8, 1, 10), [0x25, 0x14]);
+        assert_eq!(run(&mut ctx, HANDLES, 2, 10), [0x25, 0x14]);
+        assert_eq!(run(&mut ctx, HANDLES + 0xFFE, 1, 10), [0x25, 0x14]);
+        assert_eq!(run(&mut ctx, HANDLES + 0x1000, 1, 10), [0x25, 0x14]);
+        // only the ticks went in the trail
+        assert_eq!((ctx.holding, ctx.done, ctx.ticks), (0, 4, 1));
+        assert_eq!(ctx.trail[..4], [BASE + 0x10; 4]);
+        // and the waits and releases at or below the floor, not the tick
+        ctx.done = 0;
+        assert_eq!(run(&mut ctx, HANDLES, 1, 500), [0x25, 0x14]);
+        assert_eq!((ctx.holding, ctx.done, ctx.ticks), (0, 1, 1));
     }
 
     /// compiles sources among files, in a folder of their own named after

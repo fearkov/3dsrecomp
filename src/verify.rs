@@ -517,6 +517,13 @@ fn context(run: &mut Run) -> Context {
         tick_cost: 0,
         tick_at: abi::NO_TICKS,
         ticks: 0,
+        wait_at: abi::NO_TICKS,
+        release_at: abi::NO_TICKS,
+        held: 0,
+        holding: 0,
+        held_floor: abi::NOTHING_HELD,
+        done: 0,
+        trail: [0; abi::TRAIL],
     }
 }
 

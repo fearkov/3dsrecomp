@@ -7,13 +7,17 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 7
+#define RECOMP_ABI 8
 
 typedef struct Context Context;
 /* runs the guest from r15 and gives back where it went when it returned,
    the way the value was written to pc, Thumb in bit 0, or RECOMP_STOPPED
    when it left something to the host, which exit says. */
 typedef uint32_t (*Code)(Context *);
+
+/* how many of the svcs it answers itself the code keeps the addresses of,
+   see Context. */
+#define RECOMP_TRAIL 64
 
 /* what code gives back when it stopped for the host rather than returning,
    an address no code returns to, odd and past everything. */
@@ -90,6 +94,22 @@ struct Context {
     int32_t tick_cost;
     uint32_t tick_at;
     uint32_t ticks;
+    /* from version 8, the code also takes and lets go of the one mutex the
+       host lends it, see SVC_WAIT and SVC_RELEASE: WaitSynchronizationN on
+       held alone, at wait_at, takes it once more, and ReleaseMutex on held,
+       at release_at, lets go of it once, holding counting how many times
+       the thread has it, while the budget is above held_floor, which is
+       INT32_MAX while no mutex is lent. each svc the code answers itself,
+       a tick too, leaves the address after it in trail, the latest at
+       done - 1 modulo RECOMP_TRAIL, done counting them, and its tick,
+       before what it costs, in tick_last. */
+    uint32_t wait_at;
+    uint32_t release_at;
+    uint32_t held;
+    uint32_t holding;
+    int32_t held_floor;
+    uint32_t done;
+    uint32_t trail[RECOMP_TRAIL];
 };
 
 typedef struct Entry {
@@ -818,6 +838,13 @@ static inline uint32_t recomp_call(Context *ctx) {
     SYNC_IN(); \
 } while (0)
 
+/* an svc the code answered itself at at, the address after it with bit 0
+   set for Thumb, at the tick the budget says, see Context. */
+#define ANSWERED(at) do { \
+    ctx->tick_last = ctx->tick_end - (uint64_t)(int64_t)ctx->budget; \
+    ctx->trail[ctx->done++ & (RECOMP_TRAIL - 1)] = (at); \
+} while (0)
+
 /* svc 0x28, GetSystemTick, which the code answers itself where the host
    lets it, thumb 1 for Thumb code, see Context. anywhere else it is an svc
    like the others. */
@@ -826,13 +853,57 @@ static inline uint32_t recomp_call(Context *ctx) {
     ctx->r[15] = (next); \
     if (LIKELY(ctx->tick_at == ((next) | (thumb))) && LIKELY(ctx->budget > ctx->tick_floor)) { \
         uint64_t tick_ = ctx->tick_end - (uint64_t)(int64_t)ctx->budget; \
+        ANSWERED((next) | (thumb)); \
         ctx->budget -= ctx->tick_cost; \
-        ctx->tick_last = tick_; \
         ctx->ticks += 1; \
         ctx->r[0] = (uint32_t)tick_; \
         ctx->r[1] = (uint32_t)(tick_ >> 32); \
     } else { \
         ctx->host->svc(ctx, 0x28u); \
+        if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
+    } \
+    SYNC_IN(); \
+} while (0)
+
+/* whether the word at address, on a page the code reaches directly, is the
+   handle of the mutex the host lent the code. */
+static ALWAYS_INLINE int recomp_held_at(Context *ctx, uint32_t address) {
+    const uint8_t *at = mem_read_span(ctx, address, 4);
+    return at && load32(at) == ctx->held;
+}
+
+/* svc 0x25, WaitSynchronizationN, which the code answers itself where the
+   host lets it when it waits on the mutex the host lent it alone, taking it
+   once more, see Context. anything else is an svc like the others. */
+#define SVC_WAIT(next, thumb) do { \
+    SYNC_OUT(); \
+    ctx->r[15] = (next); \
+    if (LIKELY(ctx->wait_at == ((next) | (thumb))) && LIKELY(ctx->budget > ctx->held_floor) \
+        && LIKELY(ctx->r[2] == 1) && LIKELY(recomp_held_at(ctx, ctx->r[1]))) { \
+        ANSWERED((next) | (thumb)); \
+        ctx->holding += 1; \
+        ctx->r[0] = 0; \
+        ctx->r[1] = 0; \
+    } else { \
+        ctx->host->svc(ctx, 0x25u); \
+        if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
+    } \
+    SYNC_IN(); \
+} while (0)
+
+/* svc 0x14, ReleaseMutex, which the code answers itself where the host
+   lets it for the mutex the host lent it, while it holds it, see Context.
+   anything else is an svc like the others. */
+#define SVC_RELEASE(next, thumb) do { \
+    SYNC_OUT(); \
+    ctx->r[15] = (next); \
+    if (LIKELY(ctx->release_at == ((next) | (thumb))) && LIKELY(ctx->budget > ctx->held_floor) \
+        && LIKELY(ctx->r[0] == ctx->held) && LIKELY(ctx->holding != 0)) { \
+        ANSWERED((next) | (thumb)); \
+        ctx->holding -= 1; \
+        ctx->r[0] = 0; \
+    } else { \
+        ctx->host->svc(ctx, 0x14u); \
         if (UNLIKELY(ctx->exit)) return RECOMP_STOPPED; \
     } \
     SYNC_IN(); \

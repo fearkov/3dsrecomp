@@ -54,7 +54,7 @@ const MOST: i64 = 512;
 /// other code, which can do anything to the page tables, and after which the
 /// locals are read again.
 const TURNS: &[&str] =
-    &["CALL(", "CALL_RETURNING(", "SVC(", "SVC_TICK(", "INTERPRET(", "RETURN", "JUMP_TO(", "VFP_VECTOR(", "OUT_OF_BUDGET", "SYNC_"];
+    &["CALL(", "CALL_RETURNING(", "SVC(", "SVC_TICK(", "SVC_WAIT(", "SVC_RELEASE(", "INTERPRET(", "RETURN", "JUMP_TO(", "VFP_VECTOR(", "OUT_OF_BUDGET", "SYNC_"];
 
 /// whether an instruction's C lets the host or other code run.
 fn turns(text: &str) -> bool {

@@ -334,7 +334,9 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
         }
         let guarded = blocks.guarded();
         match &rest[..word] {
-            b"CALL" | b"CALL_RETURNING" | b"INTERPRET" | b"SVC" | b"SVC_TICK" => events.push((Event::Sync, guarded)),
+            b"CALL" | b"CALL_RETURNING" | b"INTERPRET" | b"SVC" | b"SVC_TICK" | b"SVC_WAIT" | b"SVC_RELEASE" => {
+                events.push((Event::Sync, guarded))
+            }
             b"RETURN" | b"RETURN_TO" | b"RETURN_TO_A" | b"RETURN_TO_T" | b"TAIL_CALL" => events.push((Event::Leave, guarded)),
             b"JUMP_TO" => events.push((Event::Dispatch, guarded)),
             b"BLOCK" => events.push((Event::Budget, guarded)),

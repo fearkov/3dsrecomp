@@ -11,7 +11,7 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 7;
+pub const ABI: u32 = 8;
 
 /// the oldest version code can be made for and still run: version 4 left
 /// every svc to the host's loop, and never calls Host::svc.
@@ -20,9 +20,10 @@ pub const OLDEST_ABI: u32 = 4;
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
 /// at 2, doing that much faster at 3, running svcs without leaving the code
-/// at 4, and dividing on the host at 5. code of an older one still runs, and
-/// building it again brings the improvements, which a host can suggest.
-pub const GENERATION: u32 = 5;
+/// at 4, dividing on the host at 5, and answering the clock and a mutex
+/// itself at 6. code of an older one still runs, and building it again
+/// brings the improvements, which a host can suggest.
+pub const GENERATION: u32 = 6;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -120,10 +121,31 @@ pub struct Context {
     pub tick_cost: i32,
     pub tick_at: u32,
     pub ticks: u32,
+    /// from version 8, the code also takes and lets go of the one mutex the
+    /// host lends it: WaitSynchronizationN on held alone, at wait_at, takes
+    /// it once more, and ReleaseMutex on held, at release_at, lets go of it
+    /// once, holding counting how many times the thread has it, while the
+    /// budget is above held_floor, which NOTHING_HELD keeps it from. each
+    /// svc the code answers itself, a tick too, leaves the address after it
+    /// in trail, the latest at done - 1 modulo TRAIL, done counting them,
+    /// and its tick, before what it costs, in tick_last.
+    pub wait_at: u32,
+    pub release_at: u32,
+    pub held: u32,
+    pub holding: u32,
+    pub held_floor: i32,
+    pub done: u32,
+    pub trail: [u32; TRAIL],
 }
 
 /// a tick_at no code answers GetSystemTick at.
 pub const NO_TICKS: u32 = 0;
+
+/// a held_floor that has the code answer no wait or release itself.
+pub const NOTHING_HELD: i32 = i32::MAX;
+
+/// how many of the svcs it answered itself the code keeps the addresses of.
+pub const TRAIL: usize = 64;
 
 /// a stack_limit that gives the code STACK bytes of the C stack below the
 /// caller's frame, for a host to set before each call.
@@ -601,6 +623,8 @@ int main(void) {
     AT(Context, write_pages); AT(Context, vfp); AT(Context, fpscr); AT(Context, host);
     AT(Context, user); AT(Context, stack_limit); AT(Context, tick_end); AT(Context, tick_last);
     AT(Context, tick_floor); AT(Context, tick_cost); AT(Context, tick_at); AT(Context, ticks);
+    AT(Context, wait_at); AT(Context, release_at); AT(Context, held); AT(Context, holding);
+    AT(Context, held_floor); AT(Context, done); AT(Context, trail);
     SIZE(Host);
     AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
     AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
@@ -618,7 +642,7 @@ int main(void) {
     AT(Origins, count); AT(Origins, piece_count); AT(Origins, pieces); AT(Origins, functions); AT(Origins, runs);
     AT(Origins, owners); AT(Origins, stale); AT(Origins, starts);
     printf("NO_ORIGIN %u\nNO_START %u\n", NO_ORIGIN, NO_START);
-    printf("RECOMP_ABI %d\nRECOMP_STOPPED %u\n", RECOMP_ABI, RECOMP_STOPPED);
+    printf("RECOMP_ABI %d\nRECOMP_STOPPED %u\nRECOMP_TRAIL %d\n", RECOMP_ABI, RECOMP_STOPPED, RECOMP_TRAIL);
     printf("EXIT_NONE %d\nEXIT_SVC %d\nEXIT_BUDGET %d\nEXIT_UNWIND %d\n", EXIT_NONE, EXIT_SVC, EXIT_BUDGET, EXIT_UNWIND);
     return 0;
 }
@@ -821,7 +845,8 @@ int main(void) {
 
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
-            read_pages, write_pages, vfp, fpscr, host, user, stack_limit, tick_end, tick_last, tick_floor, tick_cost, tick_at, ticks);
+            read_pages, write_pages, vfp, fpscr, host, user, stack_limit, tick_end, tick_last, tick_floor, tick_cost, tick_at, ticks,
+            wait_at, release_at, held, holding, held_floor, done, trail);
         at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, svc);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
@@ -833,6 +858,7 @@ int main(void) {
         lines.push(format!("NO_START {NO_START}"));
         lines.push(format!("RECOMP_ABI {ABI}"));
         lines.push(format!("RECOMP_STOPPED {STOPPED}"));
+        lines.push(format!("RECOMP_TRAIL {TRAIL}"));
         for (name, value) in
             [("EXIT_NONE", EXIT_NONE), ("EXIT_SVC", EXIT_SVC), ("EXIT_BUDGET", EXIT_BUDGET), ("EXIT_UNWIND", EXIT_UNWIND)]
         {

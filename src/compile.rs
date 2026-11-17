@@ -1,38 +1,29 @@
-//! compiling the generated C, a compiler per core as long as the memory
-//! holds them, into a shared library a host loads or a static one a program
-//! links in.
+//! compiles the generated C into a shared lib for hosts or a static one programs link in
+//! one compiler per core as long as memory holds out
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// floating point has to round exactly the way the interpreter does, so
-/// nothing may be fused into a multiply-add.
+/// floats must round exactly like the interpreter, so nothing gets fused into a multiply add
 const FLAGS: &[&str] = &["-O2", "-ffp-contract=off", "-fno-math-errno", "-w"];
-/// what only matters for ELF and Mach-O, and that compilers for Windows
-/// refuse or ignore.
+/// stuff that only matters for ELF and Mach O, windows compilers refuse or ignore it
 const UNIX_FLAGS: &[&str] = &["-fPIC", "-fvisibility=hidden"];
 
-/// gcc collects its garbage far less often on a machine with a lot of
-/// memory, and with that a file of generated code took 7.8 GB at its peak
-/// instead of 4.8.
+/// gcc collects garbage way less often on a box w/ lots of RAM, then one generated file peaked at 7.8 GB instead of 4.8
 const GCC_FLAGS: &[&str] = &["--param", "ggc-min-expand=20", "--param", "ggc-min-heapsize=65536"];
 
-/// about how many bytes a compiler takes at its peak for each byte of
-/// generated C it compiles, gcc 16 keeping a whole file of functions in
-/// memory took around 450 for one of 2.9 MB.
+/// roughly how many bytes a compiler peaks at per byte of generated C, gcc 16 w/ a whole file of funcs in memory took ~450 for a 2.9 MB one
 const MEMORY_PER_BYTE: u64 = 600;
 
-/// what to leave of the memory there is for everything else.
+/// memory to leave for everything else
 const RESERVE: u64 = 1 << 30;
 
-/// what progress hears after each file, how many are done and of how
-/// many, answering whether to go on.
+/// what progress hears after each file (done, total), answers whether to go on
 pub type Progress<'a> = &'a (dyn Fn(usize, usize) -> bool + Sync);
 
-/// a C compiler: a program, and the arguments that go before the rest,
-/// none for gcc, cc for zig, whose compiler is zig cc.
+/// a C compiler, the program plus args that go first (none for gcc, cc for zig, whose compiler is zig cc)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compiler {
     pub program: PathBuf,
@@ -44,9 +35,8 @@ impl Compiler {
         Compiler { program: program.into(), leading: leading.iter().map(|arg| arg.to_string()).collect() }
     }
 
-    /// the compiler CC names, or else the first of the usual ones that runs.
-    /// on Windows MinGW's gcc comes first, it links a DLL with nothing else
-    /// installed.
+    /// whatever CC names, else the first usual one that runs
+    /// on windows MinGW's gcc comes first, it links a DLL w/ nothing else installed
     pub fn find() -> Option<Compiler> {
         if let Some(named) = std::env::var("CC").ok().filter(|named| !named.trim().is_empty()) {
             return Some(Compiler::named(&named));
@@ -55,8 +45,7 @@ impl Compiler {
         compilers.iter().map(|name| Compiler::new(name, &[])).find(Compiler::runs)
     }
 
-    /// what CC holds: a program, or a program and the arguments that go
-    /// first, separated by spaces, like zig cc.
+    /// what CC holds, a program or a program plus leading args split by spaces, like zig cc
     fn named(value: &str) -> Compiler {
         if Path::new(value).exists() {
             return Compiler::new(value, &[]);
@@ -66,36 +55,35 @@ impl Compiler {
         Compiler { program: program.into(), leading: words.map(str::to_owned).collect() }
     }
 
-    /// whether it runs, asked for its version.
+    /// does it run, asked for its version
     pub fn runs(&self) -> bool {
         self.command().arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
     }
 
-    /// a command that runs it, its leading arguments given.
+    /// a command that runs it, leading args included
     fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.leading);
         command
     }
 
-    /// whether it is gcc, whose options for its garbage the others refuse.
+    /// is it gcc, the others refuse its garbage options
     fn is_gcc(&self) -> bool {
         let output = self.command().arg("--version").output();
         output.is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains("Free Software Foundation"))
     }
 
-    /// how it is called, for messages.
+    /// how it's called, for messages
     pub fn describe(&self) -> String {
         std::iter::once(self.program.display().to_string()).chain(self.leading.iter().cloned()).collect::<Vec<_>>().join(" ")
     }
 }
 
-/// makes command run below normal priority, so that a game being played
-/// keeps the processor while it compiles.
+/// makes command run below normal priority so a game being played keeps the cpu while it compiles
 #[cfg(unix)]
 fn lower(command: &mut Command) {
     use std::os::unix::process::CommandExt;
-    // SAFETY: setpriority is safe to call between fork and exec
+    // safe bc setpriority is fine to call between fork and exec
     unsafe {
         command.pre_exec(|| {
             libc::setpriority(libc::PRIO_PROCESS, 0, 10);
@@ -114,8 +102,7 @@ fn lower(command: &mut Command) {
 #[cfg(not(any(unix, windows)))]
 fn lower(_: &mut Command) {}
 
-/// the memory the system has to spare, MemAvailable on Linux and the free
-/// physical memory on Windows, or none when it can't tell.
+/// memory the system can spare, MemAvailable on linux and free physical memory on windows, or none if it can't tell
 fn spare_memory() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -142,7 +129,7 @@ fn spare_memory() -> Option<u64> {
         unsafe extern "system" {
             fn GlobalMemoryStatusEx(status: *mut MemoryStatus) -> i32;
         }
-        // SAFETY: the struct is MEMORYSTATUSEX, with its length filled in
+        // safe bc the struct is MEMORYSTATUSEX w/ its length filled in
         unsafe {
             let mut status: MemoryStatus = std::mem::zeroed();
             status.length = std::mem::size_of::<MemoryStatus>() as u32;
@@ -153,8 +140,7 @@ fn spare_memory() -> Option<u64> {
     None
 }
 
-/// the compiler to build with, the one given or else the one find() picks,
-/// when it runs.
+/// the compiler to build with, the given one or else whatever find() picks, if it runs
 pub fn check(given: Option<&Compiler>) -> Result<Compiler, String> {
     let compiler = given.cloned().or_else(Compiler::find);
     if let Some(compiler) = compiler.as_ref().filter(|compiler| compiler.runs()) {
@@ -169,9 +155,8 @@ pub fn check(given: Option<&Compiler>) -> Result<Compiler, String> {
     Err(format!("there is no C compiler ({name}), {suggestion}, or name it in CC"))
 }
 
-/// compiles sources, file names inside dir, and links them into library,
-/// telling progress how many of them are done after each one. in the
-/// background the compilers run below normal priority and leave a core.
+/// compiles sources (names inside dir) and links them into library, telling progress after each one
+/// in the background compilers run below normal priority and leave a core
 pub fn compile(
     compiler: &Compiler,
     dir: &Path,
@@ -183,11 +168,9 @@ pub fn compile(
     shared(compiler, &objects(compiler, dir, sources, progress, background)?, library)
 }
 
-/// compiles sources, file names inside dir, each into an object beside it,
-/// stopping when progress says so. a compiler starts once the memory there
-/// is to spare holds what it is likely to take, and there is always one
-/// running, so a machine with little memory builds slower instead of
-/// running out of it.
+/// compiles sources (names inside dir) each into an object next to it, stopping when progress says so
+/// a compiler starts once spare memory holds what it'll likely take, and one always runs
+/// so a low memory box builds slower instead of going oom
 pub fn objects(
     compiler: &Compiler,
     dir: &Path,
@@ -201,12 +184,11 @@ pub fn objects(
     let budget = spare_memory().map(|spare| spare.saturating_sub(RESERVE));
     let needs: Vec<u64> =
         sources.iter().map(|source| std::fs::metadata(dir.join(source)).map_or(0, |m| m.len()) * MEMORY_PER_BYTE).collect();
-    // the biggest first, so that none of them starts last and holds the
-    // others up
+    // biggest first, so none of them starts last and holds the others up
     let mut order: Vec<usize> = (0..sources.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(needs[i]));
 
-    // the next of order to start, and the memory and compilers in use
+    // next in order to start, plus memory and compilers in use
     let state = Mutex::new((0usize, 0u64, 0usize));
     let freed = Condvar::new();
     let done = AtomicUsize::new(0);
@@ -271,8 +253,7 @@ pub fn objects(
     Ok(sources.iter().map(|source| dir.join(source).with_extension("o")).collect())
 }
 
-/// links objects into a shared library. on Windows gcc's runtime goes in
-/// with it, so the DLL needs no other DLL beside it.
+/// links objects into a shared lib, on windows gcc's runtime goes in too so the DLL needs no buddies
 pub fn shared(compiler: &Compiler, objects: &[PathBuf], library: &Path) -> Result<(), String> {
     let mut command = compiler.command();
     if cfg!(windows) && compiler.is_gcc() {
@@ -283,10 +264,8 @@ pub fn shared(compiler: &Compiler, objects: &[PathBuf], library: &Path) -> Resul
     finished(command.arg("-shared").arg("-o").arg(library).args(objects).status(), "linking")
 }
 
-/// has command run in the folder objects are all in and gives their names
-/// from there, their whole paths when they are not in one. a command line
-/// on Windows holds 32767 characters, which the whole paths of the 600
-/// objects of Monster Hunter 3 Ultimate or Pokémon Sun pass.
+/// runs command in the folder the objects are all in and names them from there, full paths when they're not in one
+/// a windows command line holds 32767 chars, which the full paths of MH3U's or Pokemon Sun's 600 objects blow past
 fn from_folder(command: &mut Command, objects: &[PathBuf]) -> Vec<PathBuf> {
     let folder = objects.first().and_then(|object| object.parent()).filter(|folder| !folder.as_os_str().is_empty());
     match folder.filter(|folder| objects.iter().all(|object| object.parent() == Some(*folder))) {
@@ -298,7 +277,7 @@ fn from_folder(command: &mut Command, objects: &[PathBuf]) -> Vec<PathBuf> {
     }
 }
 
-/// what a tool's run came to, an error saying why when it failed.
+/// what a tool's run came to, an error saying why when it failed
 fn finished(status: std::io::Result<ExitStatus>, what: &str) -> Result<(), String> {
     match status {
         Ok(status) if status.success() => Ok(()),
@@ -307,9 +286,9 @@ fn finished(status: std::io::Result<ExitStatus>, what: &str) -> Result<(), Strin
     }
 }
 
-/// puts objects into a static library.
+/// puts objects into a static lib
 pub fn archive(objects: &[PathBuf], library: &Path) -> Result<(), String> {
-    // ar adds to what is there, which could hold objects no longer built
+    // ar adds to what's there, which could hold objects no longer built
     if library.exists() {
         std::fs::remove_file(library).map_err(|e| format!("could not replace {}, {e}", library.display()))?;
     }
@@ -332,7 +311,7 @@ mod tests {
     fn cc_names_a_program_and_what_goes_before_the_rest() {
         assert_eq!(Compiler::named("zig cc"), Compiler::new("zig", &["cc"]));
         assert_eq!(Compiler::named("gcc"), Compiler::new("gcc", &[]));
-        // a program that is there stays whole, spaces and all
+        // a program that's there stays whole, spaces and all
         let dir = std::env::temp_dir().join(format!("3dsrecomp cc {}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let program = dir.join("my cc");
@@ -341,8 +320,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// a big game's objects link however long their paths are, on Windows
-    /// too, where a command line holds 32767 characters.
+    /// a big game's objects link however long their paths are, on windows too (32767 char command lines lol)
     #[test]
     fn objects_link_however_long_their_paths_are() {
         let Some(compiler) = Compiler::find() else { return };

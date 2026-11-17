@@ -1,30 +1,26 @@
-//! the C library functions that 3dsrecomp runs natively instead of as the
-//! title's code: the integer divisions of ARM's C library, which every title
-//! built with armcc links and which the ARM11 does with a loop, having no
-//! divide instruction. they are found by their bytes, RVCT 4.1's as its
-//! libraries have them, the ones a relocation fills in left out, and each
-//! becomes an override that divides on the host, leaving division by zero
-//! and the one quotient that overflows to the library's own code. Star Fox
-//! 64 3D spends about 6% of its time in its 64-bit division.
+//! the C lib funcs 3dsrecomp runs natively instead of as the title's code
+//! the int divisions of ARM's C lib, every armcc title links them and the ARM11 loops bc it has no divide instr lol
+//! found by their bytes (RVCT 4.1's, minus what relocs fill in), each becomes an override dividing on the host
+//! div by zero and the one overflowing quotient still go to the lib's own code
+//! Star Fox 64 3D spends ~6% of its time in its 64 bit division
 
 use crate::image::Segment;
 
-/// a division of the library's.
+/// one of the lib's divisions
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
-    /// r0 / r1 unsigned, the quotient in r0 and the remainder in r1.
+    /// r0 / r1 unsigned, quotient in r0 and remainder in r1
     Uidivmod,
-    /// the same signed, rounding toward zero.
+    /// same but signed, rounding toward zero
     Idivmod,
-    /// r0:r1 / r2:r3 unsigned, the quotient in r0:r1 and the remainder in
-    /// r2:r3.
+    /// (r0, r1) / (r2, r3) unsigned, quotient in (r0, r1), remainder in (r2, r3)
     Uldivmod,
-    /// the same signed.
+    /// same but signed
     Ldivmod,
 }
 
 impl Kind {
-    /// the name recomp.h's functions for it go by, native_<name>.
+    /// the name recomp.h's funcs for it use, native_<name>
     pub fn name(self) -> &'static str {
         match self {
             Kind::Uidivmod => "uidivmod",
@@ -46,15 +42,14 @@ impl Kind {
     }
 }
 
-/// one the title has, at an address, all of them ARM code.
+/// one the title has, at an addr, all ARM code
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Native {
     pub address: u32,
     pub kind: Kind,
 }
 
-/// a signature's bytes, and a mask that is zero where a relocation filled
-/// them in, the 24-bit offsets of the branches and calls.
+/// a signature's bytes plus a mask that's zero where a reloc filled them in (24 bit branch and call offsets)
 fn pattern(kind: Kind) -> (Vec<u8>, Vec<u8>) {
     let (hex, relocated) = kind.signature();
     let hex: String = hex.concat();
@@ -66,15 +61,14 @@ fn pattern(kind: Kind) -> (Vec<u8>, Vec<u8>) {
     (bytes, mask)
 }
 
-/// where a branch at address goes.
+/// where a branch at address goes
 fn branch_target(address: u32, word: u32) -> u32 {
     let offset = ((word & 0x00FF_FFFF) << 8) as i32 >> 6;
     address.wrapping_add(8).wrapping_add(offset as u32)
 }
 
-/// the divisions in code, each where its bytes are. the unsigned 32-bit one
-/// is only a way into the signed one's loop, so it counts when all of its
-/// branches lead into a signed one found too.
+/// the divisions in code, each where its bytes are
+/// the unsigned 32 bit one is just a way into the signed one's loop, so it only counts when all its branches land in a signed one we found
 pub fn find(text: &Segment) -> Vec<Native> {
     let mut found = Vec::new();
     for kind in Kind::ALL {
@@ -116,8 +110,7 @@ fn find_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     haystack.get(start..)?.windows(needle.len()).position(|window| window == needle).map(|at| at + start)
 }
 
-/// the overrides that run the natives found, as a C file next to the
-/// generated code. one written by hand for the same address goes first.
+/// the overrides running the natives found, as a C file next to the generated code, a handwritten one for the same addr wins
 pub fn source(natives: &[Native]) -> String {
     let mut out = String::from(
         "/* the C library's divisions, run on the host, see natives.rs. */\n\n#include \"overrides.h\"\n\n\
@@ -134,7 +127,7 @@ pub fn source(natives: &[Native]) -> String {
     out
 }
 
-/// `__aeabi_uldivmod`, which is `_ll_udiv`, from lludiv5.o.
+/// `__aeabi_uldivmod` aka `_ll_udiv`, from lludiv5.o
 const ULDIVMOD: (&[&str], &[usize]) = (
     &[
     "70402de90340a0e10250a0e10130a0e10020a0e1000054e304c0a01105c0a0011cef6fe101008ee21cc0a0e13fe07e12",
@@ -157,7 +150,7 @@ const ULDIVMOD: (&[&str], &[usize]) = (
     &[604],
 );
 
-/// `__aeabi_ldivmod`, which is `_ll_sdiv`, from llsdiv.o.
+/// `__aeabi_ldivmod` aka `_ll_sdiv`, from llsdiv.o
 const LDIVMOD: (&[&str], &[usize]) = (
     &[
     "10402de9c140b0e1a34024e00100005a000070e20010e1e2030013e10100005a002072e20030e3e2feffffeb010114e3",
@@ -166,7 +159,7 @@ const LDIVMOD: (&[&str], &[usize]) = (
     &[40],
 );
 
-/// `__aeabi_idivmod`, which is `__aeabi_idiv`, from aeabi_sdivfast_rs.o.
+/// `__aeabi_idivmod` aka `__aeabi_idiv`, from aeabi_sdivfast_rs.o
 const IDIVMOD: (&[&str], &[usize]) = (
     &[
     "013090e14d00004aa03071e04400003a0020b0e3203271e03400003a203471e02600003a203671e01700003a203871e0",
@@ -185,9 +178,8 @@ const IDIVMOD: (&[&str], &[usize]) = (
     &[548],
 );
 
-/// `__aeabi_uidivmod`, which is `__aeabi_uidiv`, from aeabi_sdivfast.o and
-/// aeabi_sdivfast_rs.o alike, a way in that branches into the division of
-/// `__aeabi_idivmod`.
+/// `__aeabi_uidivmod` aka `__aeabi_uidiv`, from aeabi_sdivfast.o and aeabi_sdivfast_rs.o alike
+/// a way in that branches into the division of `__aeabi_idivmod`
 const UIDIVMOD: (&[&str], &[usize]) = (
     &[
     "0020b0e3203171e0feffff3aa03271e0feffff3a203471e0feffff3a203671e0feffff3a203871e0feffff3afeffffea",
@@ -201,8 +193,7 @@ mod tests {
 
     const BASE: u32 = 0x0010_0000;
 
-    /// code with each division in it where the linker would put them, the
-    /// relocated branches and calls pointing where they should.
+    /// code w/ each division where the linker would put it, relocated branches and calls pointing right
     fn code(uidiv_into_signed: bool) -> (Segment, [u32; 4]) {
         let mut bytes = vec![0u8; 0x2000];
         let place = |bytes: &mut Vec<u8>, at: usize, kind: Kind| {

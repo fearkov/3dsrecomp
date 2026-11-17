@@ -1,52 +1,44 @@
-//! the interface between the code 3dsrecomp generates and the programs that
-//! run it. recomp.h is the C side and this is the same thing in Rust, which
-//! a test holds to the header's layout. docs/interface.md describes it.
+//! the contract between the code 3dsrecomp spits out and the programs running it
+//! recomp.h is the C side, this is the Rust twin (a test keeps their layouts in sync), docs/interface.md has the details
 
 use std::ffi::{c_char, c_void, CStr};
 #[cfg(feature = "load")]
 use std::path::Path;
 use std::path::PathBuf;
 
-/// recomp.h, which the generated code includes.
+/// recomp.h, the generated code includes it
 pub const HEADER: &str = include_str!("../recomp.h");
 
-/// the interface version, which code has to match to be run.
+/// interface version, code has to match it to run
 pub const ABI: u32 = 8;
 
-/// the oldest version code can be made for and still run: version 4 left
-/// every svc to the host's loop, and never calls Host::svc.
+/// oldest version code can be made for and still run, v4 left every svc to the host's loop and never calls Host::svc
 pub const OLDEST_ABI: u32 = 4;
 
-/// the code generator's version, raised when the code it makes runs much
-/// better or does more than before, which checking itself against memory did
-/// at 2, doing that much faster at 3, running svcs without leaving the code
-/// at 4, dividing on the host at 5, and answering the clock and a mutex
-/// itself at 6. code of an older one still runs, and building it again
-/// brings the improvements, which a host can suggest.
+/// codegen version, bumped when its code runs way better or does more
+/// 2 checked itself vs memory, 3 did that way faster, 4 ran svcs w/o leaving the code
+/// 5 divided on the host, 6 answers the clock and a mutex itself
+/// older code still runs, rebuilding gets the goodies, hosts can nag about it
 pub const GENERATION: u32 = 6;
 
-/// why the code gave control back.
+/// why the code handed control back
 pub const EXIT_NONE: u32 = 0;
 pub const EXIT_SVC: u32 = 1;
 pub const EXIT_BUDGET: u32 = 2;
 pub const EXIT_UNWIND: u32 = 3;
 
-/// runs the guest from r15, giving back where it went when it returned, as
-/// the value written to pc, or STOPPED when it left something to the host.
-/// a host goes by exit and the context, never by what comes back, which code
-/// made before version 6 doesn't give.
+/// runs the guest from r15, gives back where it went on return (the value written to pc) or STOPPED when the host takes over
+/// hosts go by exit and the context, never by the return value, pre v6 code doesn't give one
 pub type Code = unsafe extern "C" fn(*mut Context) -> u32;
 
-/// what code gives back when it stopped for the host.
+/// what code returns when it stopped for the host
 pub const STOPPED: u32 = u32::MAX;
 
-/// how much of the C stack the code gets below where the host enters it,
-/// which takes well over 2,048 guest calls, as deep as code of the versions
-/// before went.
+/// how much C stack the code gets below where the host enters it
+/// way more than 2048 guest calls, as deep as older versions went
 pub const STACK: usize = 1 << 20;
 
-/// where 3dsrecomp build installs libraries for hosts to find, one per
-/// title, in the system's place for a program's data.
+/// where `3dsrecomp build` drops libs for hosts to find, one per title, in the system's app data dir
 pub fn library_dir() -> Option<PathBuf> {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let dir = if cfg!(windows) {
@@ -59,13 +51,12 @@ pub fn library_dir() -> Option<PathBuf> {
     dir.map(|dir| dir.join("3dsrecomp"))
 }
 
-/// the file a title's library goes by, named after its title id, with the
-/// system's extension for them, so, dll or dylib.
+/// a title's lib file name, its title id plus the system's extension (so, dll or dylib)
 pub fn library_name(program_id: u64) -> String {
     format!("{program_id:016X}.{}", std::env::consts::DLL_EXTENSION)
 }
 
-/// the library installed for a title, if there is one.
+/// the lib installed for a title, if any
 pub fn installed(program_id: u64) -> Option<PathBuf> {
     let path = library_dir()?.join(library_name(program_id));
     path.is_file().then_some(path)
@@ -98,7 +89,7 @@ pub struct Context {
     pub budget: i32,
     pub exit: u32,
     pub svc: u32,
-    /// what code made before version 6 counts calls in, 0 before each call.
+    /// what pre v6 code counts calls in, 0 b4 each call
     pub depth: u32,
     pub exclusive_address: u32,
     pub tls: u32,
@@ -108,27 +99,22 @@ pub struct Context {
     pub fpscr: *mut u32,
     pub host: *const Host,
     pub user: *mut c_void,
-    /// the lowest address the code's C stack may reach, see stack_limit.
+    /// lowest addr the code's C stack may reach, see stack_limit
     pub stack_limit: usize,
-    /// from version 7, GetSystemTick the code answers itself: tick_end
-    /// less the budget, costing tick_cost of it, only at tick_at, the
-    /// address after the svc with bit 0 set for Thumb, while the budget is
-    /// above tick_floor. it counts them in ticks and leaves the last tick
-    /// in tick_last. NO_TICKS has every one go through Host::svc.
+    /// from v7 the code answers GetSystemTick itself, tick_end minus the budget, costing tick_cost of it
+    /// only at tick_at (addr after the svc, bit 0 for Thumb) while budget > tick_floor
+    /// counted in ticks, last one in tick_last, NO_TICKS sends them all thru Host::svc
     pub tick_end: u64,
     pub tick_last: u64,
     pub tick_floor: i32,
     pub tick_cost: i32,
     pub tick_at: u32,
     pub ticks: u32,
-    /// from version 8, the code also takes and lets go of the one mutex the
-    /// host lends it: WaitSynchronizationN on held alone, at wait_at, takes
-    /// it once more, and ReleaseMutex on held, at release_at, lets go of it
-    /// once, holding counting how many times the thread has it, while the
-    /// budget is above held_floor, which NOTHING_HELD keeps it from. each
-    /// svc the code answers itself, a tick too, leaves the address after it
-    /// in trail, the latest at done - 1 modulo TRAIL, done counting them,
-    /// and its tick, before what it costs, in tick_last.
+    /// from v8 the code also takes and drops the one mutex the host lends it
+    /// WaitSynchronizationN on held alone at wait_at takes it once more, ReleaseMutex on held at release_at drops it once
+    /// holding counts how many times the thread has it, all while budget > held_floor (NOTHING_HELD turns it off)
+    /// each svc the code answers itself (ticks too) logs the addr after it in trail
+    /// latest at (done minus 1) mod TRAIL, done counts them, its tick b4 the cost goes in tick_last
     pub wait_at: u32,
     pub release_at: u32,
     pub held: u32,
@@ -138,17 +124,16 @@ pub struct Context {
     pub trail: [u32; TRAIL],
 }
 
-/// a tick_at no code answers GetSystemTick at.
+/// a tick_at where no code answers GetSystemTick
 pub const NO_TICKS: u32 = 0;
 
-/// a held_floor that has the code answer no wait or release itself.
+/// a held_floor that makes the code answer no wait or release itself
 pub const NOTHING_HELD: i32 = i32::MAX;
 
-/// how many of the svcs it answered itself the code keeps the addresses of.
+/// how many self answered svc addrs the code keeps
 pub const TRAIL: usize = 64;
 
-/// a stack_limit that gives the code STACK bytes of the C stack below the
-/// caller's frame, for a host to set before each call.
+/// a stack_limit giving the code STACK bytes of C stack below the caller's frame, set it b4 each call
 #[inline(always)]
 pub fn stack_limit() -> usize {
     let here = 0u8;
@@ -161,7 +146,7 @@ pub struct Entry {
     pub code: Code,
 }
 
-/// a module's code, whose entries are offsets from where it gets loaded.
+/// a module's code, entries are offsets from its load addr
 #[repr(C)]
 pub struct Module {
     name: *const c_char,
@@ -173,18 +158,17 @@ pub struct Module {
 
 impl Module {
     pub fn name(&self) -> &str {
-        // SAFETY: the generated table holds string literals
+        // safe bc the generated table only holds string literals
         unsafe { CStr::from_ptr(self.name) }.to_str().unwrap_or_default()
     }
 
     pub fn entries(&self) -> &[Entry] {
-        // SAFETY: the table lives as long as the code does
+        // safe bc the table lives as long as the code
         unsafe { std::slice::from_raw_parts(self.entries, self.count as usize) }
     }
 }
 
-/// a piece of guest code, as addresses or offsets in a module, and the hash
-/// of its bytes. a unit's pieces are in order and never overlap.
+/// a chunk of guest code (addrs or module offsets) plus its bytes' hash, a unit's pieces are in order w/o overlaps
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Piece {
@@ -193,7 +177,7 @@ pub struct Piece {
     pub hash: u64,
 }
 
-/// a run of a unit's pieces, as indices.
+/// a run of a unit's pieces, as indices
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Run {
@@ -201,8 +185,7 @@ pub struct Run {
     pub end: u32,
 }
 
-/// a function's code, count runs from the unit's runs[first], and where it
-/// starts.
+/// a func's code, count runs from the unit's runs[first], plus where it starts
 #[repr(C)]
 pub struct Origin {
     pub first: u32,
@@ -210,9 +193,7 @@ pub struct Origin {
     pub start: u32,
 }
 
-/// the code of the executable or a module, its functions, the function
-/// each entry runs, and a flag per function the host sets when its code
-/// changed.
+/// code of the exe or a module, its funcs, the func each entry runs, and a per func flag the host sets when its code changed
 #[repr(C)]
 pub struct Origins {
     count: u32,
@@ -225,14 +206,13 @@ pub struct Origins {
     starts: *mut u32,
 }
 
-/// an entry's owner when code written by hand runs it.
+/// an entry's owner when handwritten code runs it
 pub const NO_ORIGIN: u32 = u32::MAX;
 
-/// the start a stale function gets, which nothing starts at.
+/// the start a stale func gets, nothing starts there
 pub const NO_START: u32 = u32::MAX;
 
-/// the hash of the bytes a function was made from, 64-bit FNV-1a over its
-/// spans one after another.
+/// hash of the bytes a func came from, 64 bit FNV1a over its spans back to back
 #[derive(Debug, Clone, Copy)]
 pub struct CodeHash(u64);
 
@@ -259,7 +239,7 @@ impl Origins {
         if self.pieces.is_null() {
             return &[];
         }
-        // SAFETY: the generated table has piece_count pieces
+        // safe bc the generated table has piece_count pieces
         unsafe { std::slice::from_raw_parts(self.pieces, self.piece_count as usize) }
     }
 
@@ -267,7 +247,7 @@ impl Origins {
         if self.functions.is_null() {
             return &[];
         }
-        // SAFETY: the generated table has count functions
+        // safe bc the generated table has count funcs
         unsafe { std::slice::from_raw_parts(self.functions, self.count as usize) }
     }
 
@@ -276,14 +256,13 @@ impl Origins {
         if count == 0 {
             return &[];
         }
-        // SAFETY: the functions' runs are all in the table
+        // safe bc the funcs' runs are all in the table
         unsafe { std::slice::from_raw_parts(self.runs, count) }
     }
 
-    /// whether the function that runs entry i is stale.
+    /// is the func running entry i stale
     fn owner_is_stale(&self, entry: usize) -> bool {
-        // SAFETY: there is an owner for each of the unit's entries, and a
-        // flag for each function
+        // safe bc every entry of the unit has an owner and every func a flag
         if self.owners.is_null() {
             return false;
         }
@@ -294,8 +273,7 @@ impl Origins {
     }
 }
 
-/// the tables of code linked into the program itself rather than loaded
-/// from a library, which is how a program 3dsrecomp port made runs.
+/// tables of code linked into the program instead of loaded from a lib, that's how `3dsrecomp port` programs run
 #[derive(Debug, Clone, Copy)]
 pub struct Linked {
     program_id: u64,
@@ -304,8 +282,7 @@ pub struct Linked {
     count: u32,
     modules: *const c_void,
     module_count: u32,
-    /// the code generator's version and its recomp_origins, what the
-    /// functions were made from, none for a program that doesn't give them.
+    /// codegen version and its recomp_origins (what the funcs came from), none if the program doesn't say
     generation: u32,
     origins: *const c_void,
 }
@@ -313,8 +290,7 @@ pub struct Linked {
 impl Linked {
     /// # Safety
     ///
-    /// the pointers and counts have to be the recomp_ symbols of code that
-    /// 3dsrecomp generated, linked into this program.
+    /// the ptrs and counts must be the recomp_ symbols of code 3dsrecomp generated and linked into this program
     pub unsafe fn new(
         program_id: u64,
         abi: u32,
@@ -326,62 +302,56 @@ impl Linked {
         Linked { program_id, abi, entries, count, modules, module_count, generation: 0, origins: std::ptr::null() }
     }
 
-    /// the same code with what its functions were made from, so that it is
-    /// checked against what the program has in memory the way a library is,
-    /// and a function whose code a mod or another version of the game
-    /// changed runs no more.
+    /// same code plus what its funcs came from, so it gets checked against memory like a lib
+    /// and a func a mod or another game version changed stops running
     ///
     /// # Safety
     ///
-    /// generation and origins have to be the recomp_generation and the
-    /// recomp_origins of the same code.
+    /// generation and origins must be recomp_generation and recomp_origins of the same code
     pub unsafe fn with_origins(self, generation: u32, origins: *const c_void) -> Linked {
         Linked { generation, origins, ..self }
     }
 
-    /// the title the code was recompiled from.
+    /// the title the code got recompiled from
     pub fn program_id(&self) -> u64 {
         self.program_id
     }
 }
 
-// SAFETY: the tables live as long as the program and are read only, apart
-// from the module bases, which only the thread running the code touches.
+// safe bc the tables live as long as the program and are readonly
+// except the module bases, which only the thread running the code touches
 unsafe impl Send for Linked {}
 unsafe impl Sync for Linked {}
 
-/// code 3dsrecomp generated, from a library or linked in.
+/// code 3dsrecomp generated, from a lib or linked in
 pub struct Library {
     entries: *const Entry,
     count: usize,
     modules: *const Module,
     module_count: usize,
-    /// the modules placed somewhere, as base, size and index.
+    /// modules placed somewhere, as base, size and index
     placed: Vec<(u32, u32, usize)>,
-    /// the interface version the code was made for, see ABI.
+    /// interface version the code was made for, see ABI
     abi: u32,
-    /// the code generator's version that made the code, see GENERATION.
+    /// codegen version that made the code, see GENERATION
     generation: u32,
-    /// what the executable's functions and then each module's were made
-    /// from, none for code of the generations before.
+    /// what the exe's funcs and then each module's came from, none for older generations
     origins: *const Origins,
-    /// recomp_natives, which says whether the C library functions the code
-    /// runs on the host do, null when it has none.
+    /// recomp_natives, says if the C lib funcs the code runs on the host do, null when there are none
     natives: *mut u8,
-    /// the library the tables are in, none when they are linked in.
+    /// the lib the tables live in, none when linked in
     #[cfg(feature = "load")]
     _library: Option<libloading::Library>,
 }
 
-// SAFETY: as for Linked
+// safe for the same reasons as Linked
 unsafe impl Send for Library {}
 
 impl Library {
-    /// a library 3dsrecomp build made.
+    /// a lib `3dsrecomp build` made
     #[cfg(feature = "load")]
     pub fn open(path: &Path) -> Result<Library, String> {
-        // SAFETY: a library 3dsrecomp built, whose symbols have the types
-        // recomp.h gives them, which the version check makes sure of
+        // safe bc 3dsrecomp built it and its symbols have recomp.h's types, the version check makes sure
         unsafe {
             let library = libloading::Library::new(path).map_err(|e| e.to_string())?;
             let symbol = |name: &[u8]| -> Result<*const c_void, String> {
@@ -398,10 +368,9 @@ impl Library {
                 origins: std::ptr::null(),
             };
             let mut code = Library::linked(&linked)?;
-            // libraries made before it said have none
+            // libs made b4 it said have none
             code.generation = symbol(b"recomp_generation").map_or(0, |generation| *(generation as *const u32));
-            // generation 2 laid the table out differently, nothing was made
-            // with it but tests
+            // generation 2 laid the table out differently, only tests ever used it
             if code.generation >= 3 {
                 code.origins = symbol(b"recomp_origins").map_or(std::ptr::null(), |origins| origins as *const Origins);
             }
@@ -411,7 +380,7 @@ impl Library {
         }
     }
 
-    /// the code linked into the program.
+    /// the code linked into the program
     pub fn linked(linked: &Linked) -> Result<Library, String> {
         if !(OLDEST_ABI..=ABI).contains(&linked.abi) {
             return Err(format!("it was built for version {} of the interface, this is {ABI}", linked.abi));
@@ -423,11 +392,9 @@ impl Library {
             module_count: linked.module_count as usize,
             placed: Vec::new(),
             abi: linked.abi,
-            // code linked in was made along with the program
+            // linked code was made along w/ the program
             generation: GENERATION,
-            // and is checked against what the program has in memory when
-            // the program says what it was made from, which generation 3 on
-            // can, as a library is
+            // and gets checked against memory when the program says what it came from (gen 3 and up can), like a lib
             origins: if linked.generation >= 3 { linked.origins as *const Origins } else { std::ptr::null() },
             natives: std::ptr::null_mut(),
             #[cfg(feature = "load")]
@@ -435,50 +402,45 @@ impl Library {
         })
     }
 
-    /// the version of the interface the code was made for, from OLDEST_ABI
-    /// to ABI. code made for 4 never calls Host::svc.
+    /// interface version the code was made for, OLDEST_ABI to ABI, v4 code never calls Host::svc
     pub fn abi(&self) -> u32 {
         self.abi
     }
 
-    /// has the C library functions that the code runs on the host, its
-    /// natives, run as the title's own code instead when off, and says
-    /// whether the code has any. they are on until turned off.
+    /// switches the C lib funcs the code runs on the host (natives) back to the title's own code when off
+    /// says if the code has any, they start on
     pub fn set_natives(&mut self, on: bool) -> bool {
         if self.natives.is_null() {
             return false;
         }
-        // SAFETY: recomp_natives is the code's own byte, which only the
-        // thread running it reads
+        // safe bc recomp_natives is the code's own byte, only the thread running it reads it
         unsafe { *self.natives = on as u8 };
         true
     }
 
-    /// the version of the code generator that made the code, 0 for a
-    /// library made before libraries said. lower than GENERATION means
-    /// building it again gives faster code.
+    /// codegen version that made the code, 0 for libs older than that
+    /// below GENERATION means a rebuild gives faster code
     pub fn generation(&self) -> u32 {
         self.generation
     }
 
     pub fn entries(&self) -> &[Entry] {
-        // SAFETY: the table lives as long as the code does
+        // safe bc the table lives as long as the code
         unsafe { std::slice::from_raw_parts(self.entries, self.count) }
     }
 
     pub fn modules(&self) -> &[Module] {
-        // SAFETY: as above
+        // safe for the same reason
         unsafe { std::slice::from_raw_parts(self.modules, self.module_count) }
     }
 
-    /// how many functions and modules there is code for.
+    /// how many funcs and modules there's code for
     pub fn describe(&self) -> String {
         format!("{} entry points, {} modules", self.count, self.module_count)
     }
 
-    /// the code that can run from address, bit 0 set for Thumb, in the
-    /// executable or in a module that is placed. none for a function whose
-    /// code changed since it was made.
+    /// code that can run from address (bit 0 for Thumb) in the exe or a placed module
+    /// none for a func whose code changed since it was made
     pub fn lookup(&self, address: u32) -> Option<Code> {
         let find = |entries: &[Entry], unit: usize, address: u32| {
             let i = entries.binary_search_by_key(&address, |entry| entry.address).ok()?;
@@ -491,27 +453,24 @@ impl Library {
         })
     }
 
-    /// what the functions of unit were made from, the executable's for 0
-    /// and module i's for i + 1, when the code says.
+    /// what unit's funcs came from, 0 is the exe, i + 1 is module i, when the code says
     pub fn origins(&self, unit: usize) -> Option<&Origins> {
         if self.origins.is_null() || unit > self.module_count {
             return None;
         }
-        // SAFETY: the code has a table for the executable and each module
+        // safe bc the code has a table for the exe and each module
         Some(unsafe { &*self.origins.add(unit) })
     }
 
-    /// checks the functions of unit against the code in memory, which read
-    /// fills in from an address, the unit's offsets added to base. those
-    /// whose bytes changed are marked stale and run no more, and how many
-    /// there are comes back. each piece of code is read and hashed once.
+    /// checks unit's funcs against memory (read fills it in from an addr, offsets plus base)
+    /// funcs w/ changed bytes go stale and stop running, returns how many, each piece read and hashed once
     pub fn check(&mut self, unit: usize, base: u32, mut read: impl FnMut(u32, &mut [u8])) -> usize {
         let Some(origins) = self.origins(unit) else { return 0 };
         let pieces = origins.pieces();
         let (Some(first), Some(last)) = (pieces.first(), pieces.last()) else { return 0 };
         let mut code = vec![0; (last.end - first.start) as usize];
         read(base.wrapping_add(first.start), &mut code);
-        // how many of the pieces before each one changed
+        // how many pieces b4 each one changed
         let mut changed_before = Vec::with_capacity(pieces.len() + 1);
         changed_before.push(0u32);
         for piece in pieces {
@@ -525,8 +484,7 @@ impl Library {
         for (index, function) in origins.functions().iter().enumerate() {
             let runs = &runs[function.first as usize..(function.first + function.count) as usize];
             let changed = runs.iter().any(|run| changed_before[run.end as usize] > changed_before[run.first as usize]);
-            // SAFETY: the flags and starts are the code's own, one of each
-            // per function, which only the thread running it reads
+            // safe bc the flags and starts are the code's own, one each per func, only the running thread reads them
             unsafe {
                 *origins.stale.add(index) = changed as u8;
                 *origins.starts.add(index) = if changed { NO_START } else { function.start };
@@ -536,15 +494,13 @@ impl Library {
         stale
     }
 
-    /// marks the function of unit that starts at start stale, as if its code
-    /// had changed, so that the interpreter runs it, for a host that has to
-    /// see it run instruction by instruction. start is an offset in a module,
-    /// as its pieces are, and a later check of the unit takes the mark back.
-    /// whether there is one.
+    /// marks unit's func starting at start stale as if its code changed, so the interpreter runs it
+    /// for hosts that need to watch it step by step, start is a module offset like its pieces
+    /// a later check undoes it, returns whether there was one
     pub fn interpret(&mut self, unit: usize, start: u32) -> bool {
         let Some(origins) = self.origins(unit) else { return false };
         let Some(index) = origins.functions().iter().position(|function| function.start == start) else { return false };
-        // SAFETY: as in check, a flag and a start per function
+        // safe, same as check, a flag and a start per func
         unsafe {
             *origins.stale.add(index) = 1;
             *origins.starts.add(index) = NO_START;
@@ -552,11 +508,9 @@ impl Library {
         true
     }
 
-    /// marks every function of unit whose code takes in address stale, so
-    /// that the interpreter runs whatever reaches it, for a host that has to
-    /// stop there: code can be part of more than one function, and each one
-    /// would run it. address is an offset in a module, and a later check
-    /// takes the marks back, as for interpret. how many there are.
+    /// marks every func of unit whose code covers address stale so the interpreter runs whatever reaches it
+    /// for hosts that must stop there, code can belong to several funcs and each would run it
+    /// address is a module offset, a later check undoes it like interpret, returns how many
     pub fn interpret_at(&mut self, unit: usize, address: u32) -> usize {
         let Some(origins) = self.origins(unit) else { return 0 };
         let pieces = origins.pieces();
@@ -568,7 +522,7 @@ impl Library {
                 pieces[run.first as usize..run.end as usize].iter().any(|piece| (piece.start..piece.end).contains(&address))
             });
             if takes_in {
-                // SAFETY: as in check, a flag and a start per function
+                // safe, same as check, a flag and a start per func
                 unsafe {
                     *origins.stale.add(index) = 1;
                     *origins.starts.add(index) = NO_START;
@@ -579,17 +533,15 @@ impl Library {
         marked
     }
 
-    /// the module called name.
+    /// the module called name
     pub fn module_index(&self, name: &str) -> Option<usize> {
         self.modules().iter().position(|module| module.name() == name)
     }
 
-    /// tells the code of module index where it was loaded, zero when it goes
-    /// away.
+    /// tells module index's code where it got loaded, 0 when it goes away
     pub fn place(&mut self, index: usize, base: u32) {
         let module = &self.modules()[index];
-        // SAFETY: base points at the module's variable beside the code, which
-        // the code only reads on entry
+        // safe bc base points at the module's var next to the code, which the code only reads on entry
         unsafe { *module.base = base };
         let size = module.size;
         self.placed.retain(|&(_, _, i)| i != index);
@@ -605,7 +557,7 @@ mod tests {
     use std::mem::{offset_of, size_of};
     use std::process::Command;
 
-    /// prints the header's layout, the way the lines below expect it.
+    /// prints the header's layout the way the lines below expect
     const LAYOUT: &str = r#"
 #include <stddef.h>
 #include <stdio.h>
@@ -655,8 +607,7 @@ int main(void) {
         };
     }
 
-    /// a changed byte marks the functions whose code holds it, and only
-    /// those, each piece hashed once whichever functions share it.
+    /// a changed byte marks the funcs holding it and only those, each piece hashed once however many funcs share it
     #[test]
     fn a_changed_byte_marks_the_functions_holding_it() {
         let mut memory = vec![0u8; 0x40];
@@ -670,7 +621,7 @@ int main(void) {
         };
         let pieces = [(0x10, 0x20), (0x20, 0x28), (0x28, 0x30)]
             .map(|(start, end)| Piece { start, end, hash: hash(&memory, start, end) });
-        // one function holds all the code, one the middle piece, one the last
+        // one func holds all the code, one the middle piece, one the last
         let runs = [Run { first: 0, end: 3 }, Run { first: 1, end: 2 }, Run { first: 2, end: 3 }];
         let functions = [Origin { first: 0, count: 1, start: 0x10 }, Origin { first: 1, count: 1, start: 0x20 }, Origin { first: 2, count: 1, start: 0x28 }];
         let owners = [0u32, 1, 2];
@@ -711,13 +662,11 @@ int main(void) {
         assert!(origins.owner_is_stale(0) && !origins.owner_is_stale(1));
     }
 
-    /// a host has the interpreter run the function starting at an address,
-    /// or every function whose code holds one, until a check of the code
-    /// takes the marks back.
+    /// a host has the interpreter run the func starting at an addr, or every func covering one, till a check undoes the marks
     #[test]
     fn a_host_marks_functions_for_the_interpreter() {
         let pieces = [(0x10, 0x20), (0x20, 0x28), (0x28, 0x30)].map(|(start, end)| Piece { start, end, hash: 0 });
-        // one function holds all the code, one the middle piece, one the last
+        // one func holds all the code, one the middle piece, one the last
         let runs = [Run { first: 0, end: 3 }, Run { first: 1, end: 2 }, Run { first: 2, end: 3 }];
         let functions = [Origin { first: 0, count: 1, start: 0x10 }, Origin { first: 1, count: 1, start: 0x20 }, Origin { first: 2, count: 1, start: 0x28 }];
         let owners = [0u32, 1, 2];
@@ -749,10 +698,10 @@ int main(void) {
         assert!(library.interpret(0, 0x20));
         assert!(!library.interpret(0, 0x24), "nothing starts there");
         assert_eq!((stale, starts), ([0, 1, 0], [0x10, NO_START, 0x28]));
-        // the last piece is the first function's and the last one's
+        // the last piece belongs to the first func and the last one
         assert_eq!(library.interpret_at(0, 0x2A), 2);
         assert_eq!((stale, starts), ([1, 1, 1], [NO_START; 3]));
-        // the code as it was made, every piece hashing to what it says
+        // the code as made, every piece hashing to what it says
         let mut hashed = pieces;
         for piece in hashed.iter_mut() {
             let mut hash = CodeHash::default();
@@ -765,9 +714,8 @@ int main(void) {
         assert_eq!((stale, starts), ([0; 3], [0x10, 0x20, 0x28]));
     }
 
-    /// code linked in is checked against memory when the program says what
-    /// it was made from, and not when it doesn't, or says it in a layout
-    /// from before generation 3.
+    /// linked code gets checked vs memory when the program says what it came from
+    /// not when it doesn't, or says it in a pre gen 3 layout
     #[test]
     fn linked_code_is_checked_when_it_says_what_it_was_made_from() {
         let memory: Vec<u8> = (0..0x10u8).collect();
@@ -789,7 +737,7 @@ int main(void) {
             stale: stale.as_mut_ptr(),
             starts: starts.as_mut_ptr(),
         };
-        // SAFETY: empty tables, and origins that outlive the code
+        // safe bc the tables are empty and origins outlive the code
         let plain = unsafe { Linked::new(1, ABI, std::ptr::null(), 0, std::ptr::null(), 0) };
         let given = unsafe { plain.with_origins(GENERATION, &origins as *const Origins as *const c_void) };
         let older = unsafe { plain.with_origins(2, &origins as *const Origins as *const c_void) };
@@ -804,11 +752,10 @@ int main(void) {
         assert_eq!(starts, [NO_START]);
     }
 
-    /// code made for an older version runs down to the oldest one, which
-    /// leaves every svc to the host's loop, and code of any other doesn't.
+    /// code for older versions runs down to the oldest (which leaves every svc to the host's loop), any other version doesn't
     #[test]
     fn code_runs_down_to_the_oldest_version() {
-        // SAFETY: empty tables
+        // safe bc the tables are empty
         let made = |abi| unsafe { Linked::new(1, abi, std::ptr::null(), 0, std::ptr::null(), 0) };
         assert!(Library::linked(&made(ABI)).is_ok());
         assert!(Library::linked(&made(OLDEST_ABI)).is_ok());
@@ -816,15 +763,14 @@ int main(void) {
         assert!(Library::linked(&made(ABI + 1)).is_err());
     }
 
-    /// recomp.h and the structs here describe the same memory, which a C
-    /// program built from the header reports on.
+    /// recomp.h and these structs describe the same memory, a C program built from the header reports it
     #[test]
     fn the_header_has_the_same_layout() {
         let dir = std::env::temp_dir().join(format!("recomp-abi-layout-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("recomp.h"), HEADER).unwrap();
         std::fs::write(dir.join("layout.c"), LAYOUT).unwrap();
-        // CC, else the first compiler there is, which on Windows is rarely cc
+        // CC, else the first compiler around, which on windows is rarely cc
         let compilers = std::env::var("CC").map_or_else(|_| vec!["cc".to_owned(), "gcc".to_owned(), "clang".to_owned()], |cc| vec![cc]);
         let math: &[&str] = if cfg!(unix) { &["-lm"] } else { &[] };
         let built = compilers.iter().any(|compiler| {

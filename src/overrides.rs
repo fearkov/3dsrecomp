@@ -1,30 +1,28 @@
-//! functions written by hand to run instead of the ones 3dsrecomp generates,
-//! found in C files by the RECOMP_OVERRIDE marks recomp.h gives them.
+//! handwritten funcs that run instead of the generated ones, found in C files by the RECOMP_OVERRIDE marks recomp.h gives them
 
 use std::path::{Path, PathBuf};
 
-/// one function written by hand.
+/// one handwritten func
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Override {
-    /// the module whose function it replaces, none for the executable.
+    /// module whose func it replaces, none for the exe
     pub module: Option<String>,
-    /// what it replaces, an address or an offset in the module, odd for
-    /// Thumb.
+    /// what it replaces, an addr or module offset, odd for Thumb
     pub address: u32,
-    /// the C function, as the mark names it.
+    /// the C func as the mark names it
     pub name: String,
-    /// the name the generated function it replaces goes by for it.
+    /// the name the replaced generated func goes by for it
     pub original: String,
 }
 
-/// a C file of overrides.
+/// a C file of overrides
 pub struct File {
     pub path: PathBuf,
     pub source: String,
     pub overrides: Vec<Override>,
 }
 
-/// the C files at path, a file or a directory of them.
+/// the C files at path, a file or a dir of them
 pub fn load(path: &Path) -> Result<Vec<File>, String> {
     let paths = if path.is_dir() {
         let entries = std::fs::read_dir(path).map_err(|e| format!("could not read {}, {e}", path.display()))?;
@@ -45,7 +43,7 @@ pub fn load(path: &Path) -> Result<Vec<File>, String> {
         .collect()
 }
 
-/// the overrides a C source marks.
+/// the overrides a C source marks
 pub fn parse(source: &str) -> Result<Vec<Override>, String> {
     let code = strip_comments(source);
     let mut overrides = Vec::new();
@@ -97,7 +95,7 @@ fn is_identifier(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// a literal as C writes it, which also has to fit in a name.
+/// a literal as C writes it, also has to fit in a name
 fn number(literal: &str) -> Result<u32, String> {
     let parsed = match literal.strip_prefix("0x").or_else(|| literal.strip_prefix("0X")) {
         Some(hex) => u32::from_str_radix(hex, 16),
@@ -109,8 +107,7 @@ fn number(literal: &str) -> Result<u32, String> {
     }
 }
 
-/// the source with its comments and the insides of its strings blanked
-/// out.
+/// the source w/ comments and string insides blanked out
 fn strip_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();

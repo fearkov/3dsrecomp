@@ -1,5 +1,4 @@
-//! lowering Thumb instructions to C, following zakuro-cpu's decoding the
-//! same way the ARM side does. r15 reads as the address plus 4.
+//! lowers Thumb instrs to C, following `zakuro-cpu`'s decoding like the ARM side, r15 reads as the addr plus 4
 
 use std::fmt::Write;
 
@@ -24,7 +23,7 @@ fn sign_extend(value: u32, bits: u32) -> u32 {
     (((value << (32 - bits)) as i32) >> (32 - bits)) as u32
 }
 
-/// reading a register, where r15 is the address plus 4.
+/// reads a reg, r15 being the addr plus 4
 fn reg(scope: &Scope, register: u32, a: u32) -> String {
     if register == 15 { scope.at(a + 4) } else { format!("ctx->r[{register}]") }
 }
@@ -35,8 +34,7 @@ fn interpret(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// writes the C for the instruction at address, second being the halfword
-/// after it, returning whether execution can carry on to the next one.
+/// writes the C for the instr at address (second is the halfword after it), returns whether execution falls into the next one
 pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> bool {
     match op >> 13 {
         0b000 if (op >> 11) & 3 == 0b11 => add_subtract(out, op),
@@ -102,13 +100,13 @@ pub fn lower(out: &mut String, scope: &Scope, a: u32, op: u32, second: u32) -> b
                     call(out, scope, (a + 4) | 1, target & !3, false)
                 }
             }
-            // a half of bl on its own
+            // half a bl on its own
             _ => interpret(out, scope, a, op),
         },
     }
 }
 
-/// lsl, lsr and asr by an immediate.
+/// lsl, lsr and asr by an immediate
 fn shift_immediate(out: &mut String, op: u32) -> bool {
     let amount = (op >> 6) & 0x1F;
     let (value, carry) = match ((op >> 11) & 3, amount) {
@@ -124,7 +122,7 @@ fn shift_immediate(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// add and sub with a register or a 3 bit immediate.
+/// add and sub w/ a reg or a 3 bit imm
 fn add_subtract(out: &mut String, op: u32) -> bool {
     let field = (op >> 6) & 7;
     let b = if op & (1 << 10) != 0 { format!("{field}u") } else { format!("ctx->r[{field}]") };
@@ -133,7 +131,7 @@ fn add_subtract(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// mov, cmp, add and sub with an 8 bit immediate.
+/// mov, cmp, add and sub w/ an 8 bit imm
 fn immediate(out: &mut String, op: u32) -> bool {
     let rd = (op >> 8) & 7;
     let imm = op & 0xFF;
@@ -146,7 +144,7 @@ fn immediate(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// the register to register ALU operations.
+/// reg to reg ALU ops
 fn alu(out: &mut String, op: u32) -> bool {
     let rd = op & 7;
     let rs = (op >> 3) & 7;
@@ -182,7 +180,7 @@ fn alu(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// add, cmp and mov on the high registers, and bx and blx.
+/// add, cmp and mov on the high regs, plus bx and blx
 fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op & 7) | ((op >> 4) & 8);
     let rs = (op >> 3) & 0xF;
@@ -234,7 +232,7 @@ fn high_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     }
 }
 
-/// loads and stores with a register offset.
+/// loads and stores w/ a reg offset
 fn register_offset(out: &mut String, op: u32) -> bool {
     let rd = op & 7;
     let address = format!("ctx->r[{}] + ctx->r[{}]", (op >> 3) & 7, (op >> 6) & 7);
@@ -252,7 +250,7 @@ fn register_offset(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// ldr, str, ldrb and strb with an immediate offset.
+/// ldr, str, ldrb and strb w/ an imm offset
 fn immediate_offset(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = op & 7;
     let rb = (op >> 3) & 7;
@@ -315,7 +313,7 @@ fn push_pop(out: &mut String, op: u32) -> bool {
     if op & (1 << 11) != 0 {
         emit!(out, "    {{ uint32_t p = ctx->r[13];");
         if extra {
-            // where pc leads is taken once the rest is in
+            // where pc leads gets taken once the rest is in
             emit!(out, "    uint32_t next;");
             registers.push("next".to_owned());
         }
@@ -337,7 +335,7 @@ fn push_pop(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// ldmia and stmia.
+/// ldmia and stmia
 fn block_transfer(out: &mut String, op: u32) -> bool {
     let rb = (op >> 8) & 7;
     let list = op & 0xFF;
@@ -356,10 +354,10 @@ fn block_transfer(out: &mut String, op: u32) -> bool {
     true
 }
 
-/// conditional branches, with svc and undefined in the last two conditions.
+/// conditional branches, w/ svc and undefined in the last two conds
 fn conditional_branch(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     match (op >> 8) & 0xF {
-        // run in place, as in ARM code
+        // run in place, like in ARM code
         0xF => {
             match op & 0xFF {
                 0x28 => emit!(out, "    SVC_TICK({}, 1u);", scope.at(a + 2)),

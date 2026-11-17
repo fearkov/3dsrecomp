@@ -1,7 +1,6 @@
-//! reading a decrypted game dump, a .3ds cartridge image, a .cia or a bare .cxi,
-//! for what recompiling needs, the code and its layout from the executable
-//! partition, and the modules and their descriptions from its RomFS. only
-//! what is read is loaded, dumps run to gigabytes.
+//! reads a decrypted dump (.3ds cart image, .cia or bare .cxi) for what recompiling needs
+//! the code and its layout from the exe partition, the modules and their descriptions from RomFS
+//! only what's needed gets loaded, dumps can be gigabytes
 
 use std::fmt;
 use std::fs::File;
@@ -9,11 +8,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
 
-/// offsets and sizes in NCSD and NCCH headers count these.
+/// NCSD and NCCH header offsets and sizes count in these
 const MEDIA_UNIT: u64 = 0x200;
 const NCCH_HEADER_SIZE: u64 = 0x200;
 const EXEFS_HEADER_SIZE: u64 = 0x200;
-/// the RomFS tables' mark for no entry.
+/// RomFS tables' mark for no entry
 const NONE: u32 = 0xFFFF_FFFF;
 
 #[derive(Debug)]
@@ -54,13 +53,13 @@ fn ascii(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// where one segment of the code is mapped, from the exheader.
+/// where one code segment gets mapped, from the exheader
 #[derive(Debug, Clone, Copy)]
 pub struct CodeSetInfo {
     pub address: u32,
-    /// the pages it is mapped in.
+    /// pages it's mapped in
     pub num_pages: u32,
-    /// the bytes it really has.
+    /// bytes it really has
     pub size: u32,
 }
 
@@ -74,11 +73,11 @@ impl CodeSetInfo {
     }
 }
 
-/// the parts of the extended header recompiling cares about.
+/// the exheader bits recompiling cares about
 #[derive(Debug, Clone)]
 pub struct ExHeader {
     pub title: String,
-    /// the ExeFS .code is compressed.
+    /// ExeFS .code is compressed
     pub compress_code: bool,
     pub text: CodeSetInfo,
     pub rodata: CodeSetInfo,
@@ -88,7 +87,7 @@ pub struct ExHeader {
 }
 
 impl ExHeader {
-    /// the parts of an extended header read from its first 0x400 bytes.
+    /// the exheader bits read from its first 0x400 bytes
     pub fn read(ex: &[u8]) -> ExHeader {
         ExHeader {
             title: ascii(&ex[..8]),
@@ -112,16 +111,15 @@ pub struct DirEntry {
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     next_sibling: u32,
-    /// where its bytes start in the file data.
+    /// where its bytes start in the file data
     data_offset: u64,
     pub data_size: u64,
     pub name: String,
 }
 
-/// the directory tree of a RomFS, the tables read in, the files left in
-/// the dump.
+/// a RomFS dir tree, tables read in, files left in the dump
 pub struct RomFs {
-    /// where the file data starts in the dump.
+    /// where file data starts in the dump
     data: u64,
     dirs: Vec<u8>,
     files: Vec<u8>,
@@ -161,7 +159,7 @@ impl RomFs {
         self.dir(0).ok_or(Error("the RomFS has no root".into()))
     }
 
-    /// the folders in dir, with where each is in the table.
+    /// folders in dir, w/ their spot in the table
     pub fn subdirs(&self, dir: &DirEntry) -> Vec<(u32, DirEntry)> {
         let mut out = Vec::new();
         let mut cursor = dir.first_child;
@@ -174,7 +172,7 @@ impl RomFs {
         out
     }
 
-    /// the files in dir, with where each is in the table.
+    /// files in dir, w/ their spot in the table
     pub fn files(&self, dir: &DirEntry) -> Vec<(u32, FileEntry)> {
         let mut out = Vec::new();
         let mut cursor = dir.first_file;
@@ -187,12 +185,11 @@ impl RomFs {
         out
     }
 
-    /// a file by its path, / separated, the case ignored.
+    /// a file by its / separated path, case ignored
     pub fn lookup(&self, path: &str) -> Result<FileEntry, Error> {
         let missing = || Error(format!("{path} is not in the RomFS"));
         let mut dir = self.root()?;
-        // the contents hang off a nameless folder under the root, which no
-        // path spells out
+        // contents hang off a nameless folder under the root that no path spells out
         if let Some((_, nameless)) = self.subdirs(&dir).into_iter().find(|(_, d)| d.name.is_empty()) {
             dir = nameless;
         }
@@ -214,12 +211,11 @@ impl RomFs {
     }
 }
 
-/// a .cia's header size, which is also its first field.
+/// a .cia's header size, also its first field
 const CIA_HEADER_SIZE: u32 = 0x2020;
 
-/// where the executable content of a .cia starts. the header, certificates,
-/// ticket, TMD and contents each start on 64 bytes, and the contents follow
-/// in the order of the TMD's records, those the header's bitmap has.
+/// where a .cia's exe content starts
+/// header, certs, ticket, TMD and contents each start on 64 bytes, contents follow in TMD record order (those in the header's bitmap)
 fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<u8>, Error>) -> Result<u64, Error> {
     let align = |n: u64| n.next_multiple_of(0x40);
     let bitmap = read(0x20, 0x2000)?;
@@ -228,7 +224,7 @@ fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<
     let tmd = read(tmd_offset, u32_at(header, 0x10) as usize)?;
     let be16 = |at: usize| u16::from_be_bytes([tmd[at], tmd[at + 1]]);
     let be64 = |at: usize| u64::from_be_bytes(tmd[at..at + 8].try_into().unwrap());
-    // the signature's size goes by its type, padded to 64 bytes
+    // signature size depends on its type, padded to 64 bytes
     let signature = match u32::from_be_bytes(tmd[..4].try_into().unwrap()) & 0xFFFF {
         0x0000 | 0x0003 => 0x240,
         0x0001 | 0x0004 => 0x140,
@@ -258,12 +254,12 @@ fn cia_executable(header: &[u8], mut read: impl FnMut(u64, usize) -> Result<Vec<
     error("the .cia has no executable")
 }
 
-/// a game's executable partition.
+/// a game's exe partition
 pub struct Title {
     file: Mutex<File>,
     program_id: u64,
     pub exheader: ExHeader,
-    /// where .code is in the dump, and how big.
+    /// where .code sits in the dump, and its size
     code: (u64, u64),
     pub romfs: Option<RomFs>,
 }
@@ -278,8 +274,7 @@ impl Title {
             Ok(bytes)
         };
 
-        // a cartridge image holds the executable as its first partition, a
-        // .cia as its first content, and a .cxi is that partition by itself
+        // a cart image has the exe as its first partition, a .cia as its first content, a .cxi is just that partition
         let start = read(&mut file, 0, 0x200)?;
         let ncch = match &start[0x100..0x104] {
             b"NCSD" => u32_at(&start, 0x120) as u64 * MEDIA_UNIT,
@@ -292,11 +287,10 @@ impl Title {
             return error("the executable partition has no NCCH header");
         }
         let flags = &header[0x188..0x190];
-        // NoCrypto says the partition is readable as it is. without it, a
-        // crypto method (flags[3]) other than 0 is one of the newer keys;
-        // 0 is the original key, which most games use, or a dump decrypted
-        // with the flags left as they were, so that one is only called
-        // encrypted when its ExeFS turns out unreadable, below
+        // NoCrypto means it's readable as is
+        // w/o it, crypto method (flags[3]) other than 0 means one of the newer keys
+        // 0 is the original key (most games) or a dump decrypted w/ the flags left alone
+        // so that one only counts as encrypted when its ExeFS turns out unreadable, below
         let no_crypto = flags[7] & 0x04 != 0;
         if !no_crypto && flags[3] != 0 {
             return error("the dump is encrypted, it has to be decrypted first");
@@ -308,7 +302,7 @@ impl Title {
 
         let exheader = ExHeader::read(&read(&mut file, ncch + NCCH_HEADER_SIZE, 0x400)?);
 
-        // ten files, a name, an offset past the header and a size each
+        // ten files, a name, offset past the header and size each
         let table = read(&mut file, exefs, EXEFS_HEADER_SIZE as usize)?;
         let code = table
             .as_chunks::<16>()
@@ -341,7 +335,7 @@ impl Title {
         Ok(bytes)
     }
 
-    /// the code, the three segments one after another, decompressed.
+    /// the code, all three segments back to back, decompressed
     pub fn code(&self) -> Result<Vec<u8>, Error> {
         let raw = self.read(self.code.0, self.code.1 as usize)?;
         if self.exheader.compress_code {
@@ -351,7 +345,7 @@ impl Title {
         }
     }
 
-    /// up to len bytes of a RomFS file from offset.
+    /// up to len bytes of a RomFS file from offset
     pub fn read_romfs(&self, file: &FileEntry, offset: u64, len: usize) -> Option<Vec<u8>> {
         let romfs = self.romfs.as_ref()?;
         let len = len.min(file.data_size.saturating_sub(offset) as usize);
@@ -359,7 +353,7 @@ impl Title {
     }
 }
 
-/// the level 3 tables of the RomFS whose IVFC header is at offset.
+/// level 3 tables of the RomFS whose IVFC header sits at offset
 fn read_romfs(
     file: &mut File,
     offset: u64,
@@ -369,8 +363,7 @@ fn read_romfs(
     if &ivfc[..4] != b"IVFC" {
         return error("the RomFS has no IVFC header");
     }
-    // level 3 starts after the header and the master hash, on a block of
-    // its own size
+    // level 3 starts after the header and master hash, aligned to its own block size
     let master_hash = u32_at(&ivfc, 0x08) as u64;
     let block = 1u64 << u32_at(&ivfc, 0x0C + 2 * 0x18 + 0x10).min(31);
     let level3 = offset + (0x60 + master_hash).next_multiple_of(block);
@@ -388,8 +381,7 @@ fn read_romfs(
     })
 }
 
-/// undoes the backwards LZSS the SDK compresses .code with, which works from
-/// the end of the buffer towards its start.
+/// undoes the backwards LZSS the SDK packs .code with, it works from the end of the buffer to the start (nintendo pls)
 pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
     let size = compressed.len();
     if size < 8 {
@@ -397,8 +389,7 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
     }
     let out_size = size + u32_at(compressed, size - 4) as usize;
     let footer = u32_at(compressed, size - 8);
-    // the high byte counts the footer and padding, the rest how far back the
-    // compressed part starts
+    // high byte counts footer plus padding, the rest how far back the compressed part starts
     let footer_size = (footer >> 24) as usize;
     let span = (footer & 0x00FF_FFFF) as usize;
     if footer_size > size || span > size {
@@ -423,7 +414,7 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
                 }
                 index -= 2;
                 let pair = u16_at(compressed, index) as usize;
-                // runs are never shorter than three, nor closer than two
+                // runs are never shorter than 3 or closer than 2
                 let (length, distance) = ((pair >> 12) + 3, (pair & 0xFFF) + 2);
                 if cursor < length {
                     return error("a run goes past the start");
@@ -449,19 +440,17 @@ pub fn decompress(compressed: &[u8]) -> Result<Vec<u8>, Error> {
 pub(crate) mod tests {
     use super::*;
 
-    /// the id of the titles tests make, which no real title has.
+    /// title id for test titles, no real game has it
     const PROGRAM_ID: u64 = 0x0004_0000_0FF3_DE00;
 
     fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
         out[at..at + bytes.len()].copy_from_slice(bytes);
     }
 
-    /// writes a decrypted .cxi to a file named after test and returns its
-    /// path. code is all text, at 0x00100000, and a RomFS holds files at
-    /// their paths when there are any.
+    /// writes a decrypted .cxi named after test and returns its path
+    /// code is all text at 0x00100000, a RomFS holds files at their paths if there are any
     pub(crate) fn rom(test: &str, code: &[u8], files: &[(&str, &[u8])]) -> std::path::PathBuf {
-        // the NCCH header, never encrypted, the exheader after it, and the
-        // ExeFS at 0x600 with .code its only file
+        // NCCH header (never encrypted), exheader after it, ExeFS at 0x600 w/ .code as its only file
         let mut out = vec![0; 0x800];
         put(&mut out, 0x100, b"NCCH");
         put(&mut out, 0x118, &PROGRAM_ID.to_le_bytes());
@@ -485,11 +474,9 @@ pub(crate) mod tests {
         path
     }
 
-    /// a RomFS without hashes, its IVFC header and then level 3, holding
-    /// files at their paths in the folders those need.
+    /// a RomFS w/o hashes, IVFC header then level 3, files at their paths in whatever folders those need
     fn romfs(files: &[(&str, &[u8])]) -> Vec<u8> {
-        // every folder's path and its parent, the root first, and every
-        // file's folder, name and bytes
+        // every folder's path and parent (root first) and every file's folder, name and bytes
         let mut dirs: Vec<(String, usize)> = vec![(String::new(), 0)];
         let mut leaves = Vec::new();
         for &(path, bytes) in files {
@@ -549,9 +536,8 @@ pub(crate) mod tests {
             data.extend_from_slice(bytes);
         }
 
-        // the IVFC header, no master hash and level 3 in blocks of 16 bytes
-        // right after it, then level 3, its header, the tables without the
-        // hash tables, and the file data
+        // IVFC header w/ no master hash and 16 byte level 3 blocks right after
+        // then level 3, its header, the tables minus hash tables, and the file data
         let mut out = vec![0; 0x60];
         put(&mut out, 0, b"IVFC");
         out[0x4C] = 4;
@@ -566,7 +552,7 @@ pub(crate) mod tests {
         out
     }
 
-    /// the fixture reads back as the title it describes.
+    /// the fixture reads back as the title it describes
     #[test]
     fn a_title_made_for_tests_reads_back() {
         let path = rom("fixture", &[1, 2, 3, 4], &[("static.crs", b"crs"), ("cro/Battle.cro", b"battle"), ("cro/Field.cro", b"field")]);
@@ -586,9 +572,7 @@ pub(crate) mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// a dump encrypted with the original key, crypto method 0 and no
-    /// NoCrypto, is called encrypted, and one decrypted without its flags
-    /// being updated still loads.
+    /// a dump encrypted w/ the original key (method 0, no NoCrypto) says so, and one decrypted w/o fixing its flags still loads
     #[test]
     fn an_encrypted_dump_says_so() {
         let path = rom("encrypted", &[1, 2, 3, 4], &[]);
@@ -601,26 +585,24 @@ pub(crate) mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let message = Title::load(&path).err().unwrap().to_string();
         assert!(message.starts_with("the dump is encrypted"), "{message}");
-        // decrypted and said so, but with no .code, is told as it is
+        // decrypted and flagged, but no .code, gets told straight
         bytes[0x18F] = 0x04;
         std::fs::write(&path, &bytes).unwrap();
         assert_eq!(Title::load(&path).err().unwrap().to_string(), "the ExeFS has no .code");
         std::fs::remove_file(path).unwrap();
     }
 
-    /// a literal and a run, the smallest stream that exercises both.
+    /// a literal and a run, the tiniest stream that hits both
     #[test]
     fn backwards_lzss_decompresses() {
-        // the output ends in "abcabc", three literals, then a run of three
-        // copying them from three bytes further on
+        // output ends in "abcabc", three literals then a run of three copying them from 3 bytes further on
         let mut stream = vec![0xFF, 0xFF];
-        // the run, a length and an offset of zero, the shortest there is
+        // the run, length and offset both 0, the shortest one there is
         stream.extend_from_slice(&0x0000u16.to_le_bytes());
         stream.extend_from_slice(b"abc");
         // control, three literals then a run, read from the high bit
         stream.push(0b0001_0000);
-        // footer, 8 bytes of footer, the compressed part spans all but the
-        // two filler bytes, and three more bytes come out
+        // footer, 8 footer bytes, the compressed part covers all but the 2 filler bytes, and 3 more bytes come out
         let span = (stream.len() + 8 - 2) as u32;
         stream.extend_from_slice(&((8u32 << 24) | span).to_le_bytes());
         stream.extend_from_slice(&3u32.to_le_bytes());

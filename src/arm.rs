@@ -1,8 +1,7 @@
-//! just enough ARM decoding to follow control flow. every instruction that
-//! does not change where execution goes, or point at data inside the code,
-//! is simply Other.
+//! just enough ARM decoding to follow control flow
+//! anything that doesn't change where execution goes (or point at data in the code) is just Other
 
-/// the condition field value meaning always.
+/// cond field value for always
 pub const ALWAYS: u32 = 0xE;
 const PC: u32 = 15;
 const LR: u32 = 14;
@@ -10,26 +9,26 @@ const SP: u32 = 13;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flow {
-    /// b or bl to a known address.
+    /// b or bl to a known address
     Branch { target: u32, link: bool },
-    /// blx to a known address, which switches between ARM and Thumb.
+    /// blx to a known addr, flips between ARM and Thumb
     CallOtherMode { target: u32 },
-    /// bx or blx through a register.
+    /// bx or blx thru a reg
     BranchRegister { register: u32, link: bool },
-    /// bx lr, pop with pc, mov pc lr and the like.
+    /// bx lr, pop w/ pc, mov pc lr and friends
     Return,
-    /// add pc, pc, rm lsl 2, followed by a table of branches.
+    /// add pc, pc, rm lsl 2, then a table of branches
     JumpTable,
-    /// ldr pc, [pc, rm lsl 2], followed by a table of addresses.
+    /// ldr pc, [pc, rm lsl 2], then a table of addrs
     AddressTable { index: u32 },
-    /// any other write to pc whose target is not known statically.
+    /// any other write to pc we can't know statically
     IndirectJump,
-    /// ldr pc from a literal, whose value is the target.
+    /// ldr pc from a literal, its value is the target
     LoadPcLiteral { literal: u32 },
-    /// a load from a literal pool inside the code.
+    /// a load from a literal pool inside the code
     LiteralLoad { literal: u32, size: u32 },
     Svc,
-    /// an encoding that cannot be code, so the path that reached it is wrong.
+    /// an encoding that can't be code, so whatever path got here is wrong
     Undefined,
     Other,
 }
@@ -46,7 +45,7 @@ impl Instruction {
     }
 }
 
-/// the register and immediate of cmp rn, imm, used to size switch tables.
+/// reg and imm of cmp rn, imm, used to size switch tables
 pub fn compare_immediate(word: u32) -> Option<(u32, u32)> {
     if word & 0x0FF0_F000 != 0x0350_0000 {
         return None;
@@ -66,7 +65,7 @@ pub fn decode(word: u32, address: u32) -> Instruction {
     let rn = (word >> 16) & 0xF;
 
     let flow = if condition == 0xF {
-        // the unconditional space, only blx immediate matters here
+        // unconditional space, only blx immediate matters here
         if word & 0x0E00_0000 == 0x0A00_0000 {
             let half = (word >> 24) & 1;
             let offset = (sign_extend_24(word & 0x00FF_FFFF) << 2) + (half << 1) as i32;
@@ -90,7 +89,7 @@ pub fn decode(word: u32, address: u32) -> Instruction {
     } else if word & 0x0C00_0000 == 0x0400_0000 {
         single_transfer(word, pc, rd, rn)
     } else if word & 0x0E00_0000 == 0x0800_0000 {
-        // ldm with pc in the list
+        // ldm w/ pc in the list
         let load = word & (1 << 20) != 0;
         if load && word & (1 << 15) != 0 {
             if rn == SP { Flow::Return } else { Flow::IndirectJump }
@@ -111,14 +110,14 @@ pub fn decode(word: u32, address: u32) -> Instruction {
     Instruction { condition, flow }
 }
 
-/// ldr and str with a word or byte.
+/// ldr and str of a word or byte
 fn single_transfer(word: u32, pc: u32, rd: u32, rn: u32) -> Flow {
     let load = word & (1 << 20) != 0;
     let register_offset = word & (1 << 25) != 0;
     if !load {
         return Flow::Other;
     }
-    // ldr pc, [pc, rm lsl 2] with an immediate shift and no writeback
+    // ldr pc, [pc, rm lsl 2] w/ an immediate shift and no writeback
     if rd == PC && rn == PC && register_offset && word & 0x0170_0FF0 == 0x0110_0100 {
         return Flow::AddressTable { index: word & 0xF };
     }
@@ -148,7 +147,7 @@ fn data_processing(word: u32, rd: u32, rn: u32) -> Flow {
     }
     let opcode = (word >> 21) & 0xF;
     let sets_flags = word & (1 << 20) != 0;
-    // tst teq cmp cmn write no register, and without s they are misc instructions
+    // tst teq cmp cmn write no reg, w/o s they're misc instrs
     if (8..=11).contains(&opcode) || rd != PC {
         return Flow::Other;
     }

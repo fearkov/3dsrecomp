@@ -1,6 +1,6 @@
-//! lowering ARM instructions to C. the decoding follows zakuro-cpu's, down
-//! to which pipeline offset each form reads r15 with, so that the two agree
-//! on every instruction. anything uncommon is left to the interpreter.
+//! lowers ARM instrs to C
+//! decoding follows `zakuro-cpu`'s, down to which pipeline offset each form reads r15 with, so both agree on every instr
+//! anything weird is left to the interpreter
 
 use std::fmt::Write;
 
@@ -21,13 +21,12 @@ fn sign_extend_24(value: u32) -> u32 {
     (((value << 8) as i32) >> 8) as u32
 }
 
-/// reading a register, where r15 is the address the pipeline gives it.
+/// reads a reg, r15 being whatever addr the pipeline gives it
 fn reg(scope: &Scope, register: u32, pc: u32) -> String {
     if register == 15 { scope.at(pc) } else { format!("ctx->r[{register}]") }
 }
 
-/// writes the C for the instruction at address, returning whether execution
-/// can carry on to the next one.
+/// writes the C for the instr at address, returns whether execution can fall into the next one
 pub fn lower(out: &mut String, scope: &Scope, address: u32, op: u32) -> bool {
     let condition = op >> 28;
     if condition == 0xF {
@@ -45,8 +44,7 @@ pub fn lower(out: &mut String, scope: &Scope, address: u32, op: u32) -> bool {
 fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     match (op >> 25) & 7 {
         0b000 => register_space(out, scope, a, op),
-        // msr with an immediate lives in the compare opcodes without s, and
-        // with no fields to write it is nop and the other hints
+        // msr w/ an immediate lives in the compare opcodes w/o s, and w/ no fields to write it's nop and the other hints
         0b001 if (op >> 23) & 3 == 0b10 && op & (1 << 20) == 0 => {
             if op & (1 << 21) != 0 && (op >> 16) & 0xF == 0 { true } else { status_register(out, scope, a, op) }
         }
@@ -60,9 +58,8 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             if op & (1 << 24) != 0 { call(out, scope, a + 4, target, false) } else { jump(out, scope, target, false) }
         }
         0b110 => vfp::load_store(out, scope, a, op),
-        // the host runs an svc in place, and the code goes on after it,
-        // the code reading the clock and taking the mutex the host lends it
-        // itself where the host lets it
+        // the host runs an svc in place and the code goes on after it
+        // the code reads the clock and takes the lent mutex itself where the host allows
         0b111 if op & (1 << 24) != 0 => {
             match op & 0x00FF_FFFF {
                 0x28 => emit!(out, "    SVC_TICK({}, 0u);", scope.at(a + 4)),
@@ -73,9 +70,8 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
             true
         }
         0b111 if op & 0x10 != 0 && matches!((op >> 8) & 0xF, 10 | 11) => vfp::register_transfer(out, scope, a, op),
-        // cp15, where reading the TLS address is common enough to do here,
-        // and so are the barriers and data cache maintenance, which change
-        // nothing for code that sees memory as it is
+        // cp15, reading the TLS addr is common enough to do here
+        // so are the barriers and dcache maintenance, which do nothing for code that sees memory as is
         0b111 if op & 0x10 != 0 => {
             let rd = (op >> 12) & 0xF;
             let data_cache = op & 0x0FFF_0F10 == 0x0E07_0F10 && !matches!(op & 0xF, 5 | 7 | 13);
@@ -92,8 +88,7 @@ fn body(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     }
 }
 
-/// the register data processing space, with the multiplies, extra loads
-/// and stores and miscellaneous instructions in its holes.
+/// the reg data processing space, w/ the multiplies, extra loads and stores and misc instrs in its holes
 fn register_space(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     if op & 0x90 == 0x90 {
         if (op >> 5) & 3 != 0 {
@@ -127,9 +122,9 @@ fn interpret(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// mrs and msr on the cpsr. titles run in system mode and only ever change
-/// the flags and ge this way, so reading gives those over that mode, and a
-/// write to anything else, or the spsr, is the interpreter's.
+/// mrs and msr on the cpsr
+/// titles run in system mode and only ever touch the flags and ge this way, so reads give those over that mode
+/// a write to anything else (or the spsr) goes to the interpreter
 fn status_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     if op & (1 << 22) != 0 {
         return interpret(out, scope, a, op);
@@ -168,7 +163,7 @@ fn status_register(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// the shifter operand as b, and its carry as sc when the flags need it.
+/// the shifter operand as b, and its carry as sc when the flags need it
 fn shifter_operand(out: &mut String, scope: &Scope, a: u32, op: u32, carry: bool) {
     if op & (1 << 25) != 0 {
         let rotate = ((op >> 8) & 0xF) * 2;
@@ -218,7 +213,7 @@ fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     let compare = (8..=11).contains(&opcode);
     if set_flags && rd == 15 && !compare {
-        // an exception return, which also restores cpsr
+        // an exception return, also restores cpsr
         return interpret(out, scope, a, op);
     }
     let register_shift = op & (1 << 25) == 0 && op & (1 << 4) != 0;
@@ -277,7 +272,7 @@ fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     continues
 }
 
-/// ldr, str, ldrb and strb.
+/// ldr, str, ldrb and strb
 fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let rd = (op >> 12) & 0xF;
@@ -305,7 +300,7 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
     let size = if byte { 1 } else { 4 };
-    // at the base plus a constant, which a span off the base can cover
+    // at base plus a const, a span off the base can cover it
     let covered = if op & (1 << 25) == 0 && rn != 15 {
         let offset = if !pre { 0 } else if sign == '+' { (op & 0xFFF) as i32 } else { -((op & 0xFFF) as i32) };
         scope.access(a, rn, offset, size, !load)
@@ -326,7 +321,7 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         }
         emit!(out, "    ctx->r[{rd}] = v; }}");
     } else {
-        // storing r15 stores the address plus 12
+        // storing r15 stores the addr plus 12 (arm being arm)
         let value = if rd == 15 { scope.at(a + 12) } else { format!("ctx->r[{rd}]") };
         let value = if byte { format!("(uint8_t){value}") } else { value };
         emit!(out, "    {};", write(covered, size, address, &value));
@@ -338,7 +333,7 @@ fn single_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// ldrh, strh, ldrsb, ldrsh, ldrd and strd.
+/// ldrh, strh, ldrsb, ldrsh, ldrd and strd
 fn extra_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let rd = (op >> 12) & 0xF;
@@ -358,7 +353,7 @@ fn extra_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let sign = if op & (1 << 23) != 0 { '+' } else { '-' };
     let address = if pre { "oa" } else { "base" };
     let back = if writeback { format!(" ctx->r[{rn}] = oa;") } else { String::new() };
-    // what a span off the base can cover, at the base plus a constant
+    // what a span off the base can cover, at base plus a const
     let constant = op & (1 << 22) != 0 && rn != 15;
     let at = if !pre {
         0
@@ -407,7 +402,7 @@ fn extra_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// ldm and stm.
+/// ldm and stm
 fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rn = (op >> 16) & 0xF;
     let pre = op & (1 << 24) != 0;
@@ -415,8 +410,7 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let writeback = op & (1 << 21) != 0;
     let load = op & (1 << 20) != 0;
     let list = op & 0xFFFF;
-    // the user bank forms, empty lists and r15 as the base are rare enough
-    // to leave alone
+    // user bank forms, empty lists and r15 as base are rare enough to skip
     if op & (1 << 22) != 0 || list == 0 || rn == 15 {
         return interpret(out, scope, a, op);
     }
@@ -433,7 +427,7 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         if writeback && list & (1 << rn) == 0 {
             emit!(out, "    ctx->r[{rn}] = fin;");
         }
-        // r15 comes last, and where it leads is taken once the rest is in
+        // r15 goes last, where it leads gets taken once the rest is in
         let destinations: Vec<String> =
             registers.iter().map(|&r| if r == 15 { "next".to_owned() } else { format!("ctx->r[{r}]") }).collect();
         if list & (1 << 15) != 0 {
@@ -451,7 +445,7 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
                 if register == 15 {
                     scope.at(a + 12)
                 } else if register == rn && writeback && list & ((1 << rn) - 1) != 0 {
-                    // the base when it is not the lowest register stores its new value
+                    // the base, when it's not the lowest reg, stores its new value
                     "fin".to_owned()
                 } else {
                     format!("ctx->r[{register}]")
@@ -467,7 +461,7 @@ fn block_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// swp and swpb.
+/// swp and swpb
 fn swap(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     if rd == 15 {
@@ -483,14 +477,13 @@ fn swap(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// ldrex and strex in all their sizes. a store only goes through while
-/// the monitor still has its address, and a successful one clears it.
+/// ldrex and strex in every size, a store only goes thru while the monitor still has its addr, and a good one clears it
 fn exclusive(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     let rm = op & 0xF;
     let size = (op >> 21) & 3;
     let load = op & (1 << 20) != 0;
-    // r15 as a destination, or a pair that runs into it
+    // r15 as a dest, or a pair running into it
     if rd == 15 || (size == 0b01 && (if load { rd } else { rm }) >= 14) {
         return interpret(out, scope, a, op);
     }
@@ -521,7 +514,7 @@ fn exclusive(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// mul and mla.
+/// mul and mla
 fn multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 16) & 0xF;
     if rd == 15 {
@@ -534,7 +527,7 @@ fn multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// umull, umlal, smull, smlal and umaal.
+/// umull, umlal, smull, smlal and umaal
 fn multiply_long(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let hi = (op >> 16) & 0xF;
     let lo = (op >> 12) & 0xF;
@@ -557,8 +550,7 @@ fn multiply_long(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// smlaxy, smlawy, smulwy, smlalxy and smulxy. the 32 bit accumulates
-/// wrap and set q when they overflow.
+/// smlaxy, smlawy, smulwy, smlalxy and smulxy, the 32 bit accumulates wrap and set q on overflow
 fn halfword_multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 16) & 0xF;
     let rn = (op >> 12) & 0xF;
@@ -589,7 +581,7 @@ fn halfword_multiply(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// qadd, qsub, qdadd and qdsub.
+/// qadd, qsub, qdadd and qdsub
 fn saturating(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     if rd == 15 {
@@ -616,7 +608,7 @@ fn clz(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// bx and blx through a register.
+/// bx and blx thru a reg
 fn branch_exchange(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rm = op & 0xF;
     if (op >> 4) & 0xF == 0b0011 {
@@ -638,7 +630,7 @@ fn branch_exchange(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     false
 }
 
-/// the ARMv6 media instructions, decoded in zakuro-cpu's order.
+/// ARMv6 media instrs, decoded in `zakuro-cpu`'s order
 fn media(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let op1 = (op >> 20) & 0x1F;
     let op2 = (op >> 5) & 7;
@@ -651,7 +643,7 @@ fn media(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     }
 }
 
-/// the parallel adds and subtracts, sadd16 to uhsub8.
+/// parallel adds and subs, sadd16 to uhsub8
 fn parallel(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32, op2: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     if rd == 15 || op1 & 3 == 0 || matches!(op2, 5 | 6) {
@@ -663,7 +655,7 @@ fn parallel(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32, op2: u32
     true
 }
 
-/// packing, the extensions, sel, the reversals and the saturations.
+/// packing, extends, sel, reversals and saturations
 fn pack_saturate_extend(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32, op2: u32) -> bool {
     let rd = (op >> 12) & 0xF;
     if rd == 15 {
@@ -718,7 +710,7 @@ fn pack_saturate_extend(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u
             let bits = ((op >> 16) & 0xF) + !unsigned as u32;
             format!("media_saturate16(ctx, {m}, {bits}, {})", unsigned as u8)
         }
-        // ssat and usat, of a value shifted first
+        // ssat and usat of a value shifted first
         (_, o) if o & 1 == 0 && matches!((op1 >> 2) & 0b111, 0b010 | 0b011) => {
             let bits = ((op >> 16) & 0x1F) + !unsigned as u32;
             let shifted = if op & (1 << 6) != 0 {
@@ -734,7 +726,7 @@ fn pack_saturate_extend(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u
     true
 }
 
-/// smlad, smuad, smlsd, smusd, smlald, smlsld, smmul, smmla and smmls.
+/// smlad, smuad, smlsd, smusd, smlald, smlsld, smmul, smmla and smmls
 fn dual_multiply(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32) -> bool {
     let rd = (op >> 16) & 0xF;
     let ra = (op >> 12) & 0xF;
@@ -747,7 +739,7 @@ fn dual_multiply(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32) -> 
     let subtract = op & (1 << 6) != 0;
     match op1 {
         0b10000 | 0b10100 => {
-            // bit 5 swaps the halves of the second operand
+            // bit 5 swaps the second operand's halves
             let b = if bit5 { format!("ror32({s}, 16)") } else { s };
             let sign = if subtract { '-' } else { '+' };
             let dual = format!(
@@ -763,7 +755,7 @@ fn dual_multiply(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32) -> 
                 );
             }
         }
-        // the top of a full 64 bit product, bit 5 rounding it
+        // top of a full 64 bit product, bit 5 rounds it
         0b10101 => {
             let product = format!("(uint64_t)((int64_t)(int32_t){m} * (int32_t){s})");
             let acc = if ra == 15 { "0".to_owned() } else { format!("((uint64_t)ctx->r[{ra}] << 32)") };
@@ -776,7 +768,7 @@ fn dual_multiply(out: &mut String, scope: &Scope, a: u32, op: u32, op1: u32) -> 
     true
 }
 
-/// usad8 and usada8.
+/// usad8 and usada8
 fn usad8(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let rd = (op >> 16) & 0xF;
     let ra = (op >> 12) & 0xF;
@@ -789,7 +781,7 @@ fn usad8(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// the cond 0xF space.
+/// the cond 0xF space
 fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     if op & 0xFE00_0000 == 0xFA00_0000 {
         // blx to Thumb
@@ -802,7 +794,7 @@ fn unconditional(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         return true;
     }
     if matches!((op >> 25) & 7, 0b010 | 0b011) {
-        // pld and the barriers do nothing here
+        // pld and barriers do nothing here
         return true;
     }
     interpret(out, scope, a, op)

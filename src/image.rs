@@ -1,5 +1,4 @@
-//! the executable image of a title, split into its segments at the addresses
-//! the title expects to run at.
+//! a title's exe image split into segments at the addrs the title expects to run at
 
 use crate::rom::{CodeSetInfo, Error, ExHeader, Title};
 
@@ -38,7 +37,7 @@ impl Segment {
         Some(u16::from_le_bytes(bytes.try_into().unwrap()))
     }
 
-    /// every aligned word in the segment, with its address.
+    /// every aligned word in the segment w/ its addr
     pub fn words(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
         self.bytes
             .as_chunks::<4>()
@@ -57,14 +56,13 @@ pub struct Image {
 }
 
 impl Image {
-    /// the title's own code.
+    /// the title's own code
     pub fn from_title(title: &Title) -> Result<Image, Error> {
         Ok(Image::from_code(&title.exheader, &title.code()?))
     }
 
-    /// the image of code, decompressed, at the addresses header gives. the
-    /// segments sit one after another in it, each padded to whole pages,
-    /// the same way the loader maps them.
+    /// the image of code (decompressed) at the addrs header gives
+    /// segments back to back, each padded to whole pages, same as the loader maps them
     pub fn from_code(header: &ExHeader, code: &[u8]) -> Image {
         let segment = |info: CodeSetInfo, offset: usize| Segment {
             base: info.address,
@@ -83,10 +81,8 @@ impl Image {
         }
     }
 
-    /// the executable as discovery sees it, starting from the entry point,
-    /// the exports and what modules take from it without a name. nothing
-    /// says where it keeps pointers, so any word in the data segments that
-    /// lands in the code is taken for one.
+    /// the exe as discovery sees it, starting from the entry point, the exports and what modules take from it w/o a name
+    /// nothing says where it keeps pointers, so any data word landing in the code counts as one
     pub fn into_program(self, exports: &[u32], imported: &[u32]) -> Program {
         let entry = std::iter::once((self.entry, Source::Entry));
         let exports = exports.iter().map(|&address| (address, Source::Export));

@@ -1,6 +1,5 @@
-//! lowering VFPv2 to C, following zakuro-cpu's VFP, which computes singles
-//! as f32 and doubles as f64, rounding once, and flushes results to zero
-//! when fpscr asks.
+//! lowers VFPv2 to C following `zakuro-cpu`'s VFP
+//! singles as f32 and doubles as f64 rounding once, results flushed to zero when fpscr asks
 
 use std::fmt::Write;
 
@@ -27,7 +26,7 @@ fn dreg(vd: u32, extra: bool) -> u32 {
     ((extra as u32) << 4) | vd
 }
 
-/// a register of either size as C, doubles taking the two singles at 2N.
+/// a reg of either size as C, doubles take the two singles at 2N
 fn get(double: bool, register: u32) -> String {
     if double { format!("vfp_d(ctx, {})", register & 15) } else { format!("vfp_s(ctx, {register})") }
 }
@@ -36,10 +35,8 @@ fn set(double: bool, register: u32, value: &str) -> String {
     if double { format!("vfp_set_d(ctx, {}, {value});", register & 15) } else { format!("vfp_set_s(ctx, {register}, {value});") }
 }
 
-/// writes body, or when fpscr has the instruction working on a short
-/// vector, which only a destination past the first bank can, the loop
-/// over it. operation numbers the arithmetic the way vfp_apply does, and
-/// registers are d, n and m.
+/// writes body, or the loop over a short vector when fpscr says so (only a dest past the first bank can)
+/// operation numbers the math like vfp_apply does, regs are d, n and m
 fn scalar(out: &mut String, double: bool, operation: u32, registers: (u32, u32, u32), body: &str) -> bool {
     let (d, n, m) = registers;
     let bank = if double { 4 } else { 8 };
@@ -55,8 +52,7 @@ fn scalar(out: &mut String, double: bool, operation: u32, registers: (u32, u32, 
     true
 }
 
-/// the cdp space of coprocessors 10 and 11, the arithmetic, the unary
-/// operations, comparisons and conversions.
+/// cdp space of coprocs 10 and 11, the math, unary ops, compares and conversions
 pub fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let coprocessor = (op >> 8) & 0xF;
     if coprocessor != 10 && coprocessor != 11 {
@@ -84,8 +80,7 @@ pub fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool
         (0b1011, true) => return extension(out, scope, a, op, double, rd, rm),
         _ => return interpret(out, scope, a, op),
     };
-    // a vector runs its operand m as a scalar when m is in the first bank,
-    // which only matters to the interpreter
+    // a vector runs its operand m as a scalar when m is in the first bank, only matters to the interpreter
     let kind = if double { "double" } else { "float" };
     let body = format!(
         "{kind} a = {}, b = {}, acc = {}; {}",
@@ -100,8 +95,8 @@ pub fn data_processing(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool
 fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd: u32, rm: u32) -> bool {
     let top = op & (1 << 7) != 0;
     match ((op >> 16) & 0xF, top) {
-        // vmov, vabs, vneg and vsqrt, moves and signs change bits untouched,
-        // a double's too, which can be two singles reading as a subnormal
+        // vmov, vabs, vneg and vsqrt, moves and sign ops leave bits untouched
+        // even a double's, which can be two singles reading as a subnormal
         (0b0000 | 0b0001, _) => {
             let second = (op >> 16) & 1 != 0;
             let body = if double {
@@ -127,7 +122,7 @@ fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd:
             };
             scalar(out, double, 9 + ((second as u32) << 1 | top as u32), (rd, rd, rm), &body)
         }
-        // vcmp against a register or zero, singles compared as doubles
+        // vcmp against a reg or zero, singles compared as doubles
         (0b0100, _) => {
             emit!(out, "    vfp_compare(ctx, {}, {});", get(double, rd), get(double, rm));
             true
@@ -147,7 +142,7 @@ fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd:
             }
             true
         }
-        // vcvt from an integer, bit 7 set for signed
+        // vcvt from an int, bit 7 set means signed
         (0b1000, _) => {
             let source = sreg(op & 0xF, op & (1 << 5) != 0);
             let integer = if top { format!("(double)(int32_t)ctx->vfp[{source}]") } else { format!("(double)ctx->vfp[{source}]") };
@@ -155,8 +150,7 @@ fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd:
             emit!(out, "    {}", set(double, rd, &value));
             true
         }
-        // vcvt to an integer rounding toward zero, the other rounding modes
-        // are rare enough for the interpreter
+        // vcvt to an int rounding toward zero, the other rounding modes are rare enough for the interpreter
         (0b1100 | 0b1101, true) => {
             let source = if double { get(true, rm) } else { format!("(double){}", get(false, rm)) };
             let convert = if (op >> 16) & 1 != 0 { "vfp_to_s32" } else { "vfp_to_u32" };
@@ -168,8 +162,7 @@ fn extension(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool, rd:
     }
 }
 
-/// the mrc and mcr space of coprocessors 10 and 11, moves between core and
-/// VFP registers and to and from fpscr.
+/// mrc and mcr space of coprocs 10 and 11, moves between core and VFP regs and to and from fpscr
 pub fn register_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let coprocessor = (op >> 8) & 0xF;
     let load = op & (1 << 20) != 0;
@@ -186,7 +179,7 @@ pub fn register_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bo
             }
             true
         }
-        // vmov between a core register and a single
+        // vmov between a core reg and a single
         (10 | 11, 0) if rt != 15 => {
             let sn = sreg((op >> 16) & 0xF, op & (1 << 7) != 0);
             if load {
@@ -200,8 +193,7 @@ pub fn register_transfer(out: &mut String, scope: &Scope, a: u32, op: u32) -> bo
     }
 }
 
-/// the ldc and stc space of coprocessors 10 and 11, vldr, vstr, vldm and
-/// vstm, and the moves between two core registers and a double.
+/// ldc and stc space of coprocs 10 and 11, vldr, vstr, vldm and vstm, plus moves between two core regs and a double
 pub fn load_store(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     let coprocessor = (op >> 8) & 0xF;
     if coprocessor != 10 && coprocessor != 11 {
@@ -241,8 +233,7 @@ pub fn load_store(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
         .flat_map(|i| if double { vec![(first + i) * 2, (first + i) * 2 + 1] } else { vec![first + i] })
         .map(|word| format!("ctx->vfp[{}]", word & 31))
         .collect();
-    // vldr and vstr, at the base plus a constant, which spans off the base
-    // can cover, a word at a time
+    // vldr and vstr at base plus const, spans off the base can cover them, a word at a time
     let covered: Vec<Option<Covered>> = if pre && !writeback && rn != 15 {
         let at = if up { offset as i32 } else { -(offset as i32) };
         (0..registers.len()).map(|i| scope.access(a, rn, at + 4 * i as i32, 4, !load)).collect()
@@ -269,7 +260,7 @@ pub fn load_store(out: &mut String, scope: &Scope, a: u32, op: u32) -> bool {
     true
 }
 
-/// vmov between two core registers and a double or two singles.
+/// vmov between two core regs and a double or two singles
 fn move_pair(out: &mut String, scope: &Scope, a: u32, op: u32, double: bool) -> bool {
     let load = op & (1 << 20) != 0;
     let rt = (op >> 12) & 0xF;

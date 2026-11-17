@@ -1,13 +1,9 @@
-//! 3dsrecomp as a library, for tools that find a 3DS title's code or
-//! recompile it themselves.
+//! 3dsrecomp as a lib, for tools that find a 3DS title's code or recompile it themselves
 //!
-//! rom reads the title, discover finds its functions, codegen writes them as
-//! C against recomp.h, with any overrides in place of the functions they
-//! replace, and compile builds that into a shared or a static library. port
-//! makes a program of a title out of the static one. abi is the interface
-//! the code runs against, which loads the shared one from Rust with the
-//! host feature. what a mod changes, code and files read in place of the
-//! title's own, goes in a Mods.
+//! rom reads the title, discover finds its funcs, codegen writes them as C against recomp.h (overrides swapped in)
+//! compile builds that into a shared or static lib, port turns the static one into a program
+//! abi is the interface the code runs against, and loads the shared one from rust w/ the host feature
+//! what a mod changes (code and files read instead of the title's own) goes in a Mods
 //!
 //! ```no_run
 //! let title = recomp3ds::rom::Title::load("game.3ds")?;
@@ -37,39 +33,29 @@ pub mod verify;
 use discover::Program;
 use rom::{DirEntry, Error, FileEntry, RomFs, Title};
 
-/// what a mod changes in a title, read in place of the title's own code and
-/// files. the default changes nothing.
+/// what a mod changes in a title, read instead of the title's own code and files, default changes nothing
 #[derive(Clone, Copy, Default)]
 pub struct Mods<'a> {
-    /// the executable's code, decompressed, its segments one after another
-    /// the way the title's own has them, or the way exheader says.
+    /// the exe's code decompressed, segments back to back like the title's own (or like exheader says)
     pub code: Option<&'a [u8]>,
-    /// the extended header the mod gives in place of the title's, at least
-    /// its first 0x400 bytes, which says where the segments of code lie
-    /// when the mod's code moves them.
+    /// the exheader the mod gives instead of the title's, at least its first 0x400 bytes, says where code segments sit when the mod moves them
     pub exheader: Option<&'a [u8]>,
-    /// the RomFS files the mod replaces. the modules and static.crs are
-    /// read through it, by their paths from the RomFS's root, / separated
-    /// and spelled the way the title has them, like static.crs or
-    /// cro/Battle.cro.
+    /// RomFS files the mod replaces, modules and static.crs get read thru it
+    /// by their / separated paths from the RomFS root, spelled like the title has them (static.crs, cro/Battle.cro)
     pub romfs: Option<Files<'a>>,
 }
 
-/// the bytes that replace the RomFS file at a path, None to keep the
-/// title's.
+/// bytes replacing the RomFS file at a path, None keeps the title's
 pub type Files<'a> = &'a (dyn Fn(&str) -> Option<Vec<u8>> + Sync);
 
 impl Mods<'_> {
-    /// the RomFS file at path, the bytes given in its place or else the
-    /// title's.
+    /// the RomFS file at path, the given bytes or else the title's
     fn read(&self, title: &Title, path: &str, file: &FileEntry) -> Option<Vec<u8>> {
         self.romfs.and_then(|romfs| romfs(path)).or_else(|| title.read_romfs(file, 0, file.data_size as usize))
     }
 }
 
-/// the title's programs, the executable first and then its modules, each
-/// named and ready for discovery, made from what mods change in place of
-/// the title's own.
+/// the title's programs, exe first then its modules, each named and ready for discovery, built from what mods swap in
 pub fn programs(title: &Title, mods: Mods) -> Result<Vec<(String, Program)>, Error> {
     let image = match mods.code {
         Some(code) => {
@@ -89,9 +75,7 @@ pub fn programs(title: &Title, mods: Mods) -> Result<Vec<(String, Program)>, Err
     Ok(programs)
 }
 
-/// the code addresses in module that the other modules, and the executable
-/// through its crs, take from it without a name, which nothing else may lead
-/// to.
+/// code addrs in module that other modules (and the exe thru its crs) take from it w/o a name, nothing else may lead there
 pub fn imported(files: &[(cro::Module, Vec<u8>)], crs: Option<&cro::Module>, module: &cro::Module) -> Vec<u32> {
     files
         .iter()
@@ -103,16 +87,14 @@ pub fn imported(files: &[(cro::Module, Vec<u8>)], crs: Option<&cro::Module>, mod
         .collect()
 }
 
-/// the main executable's module description, the static.crs every title
-/// carries in its RomFS, or the one a mod gives in its place.
+/// the main exe's module description, the static.crs every title carries in RomFS, or the mod's replacement
 pub fn static_module(title: &Title, mods: Mods) -> Option<cro::Module> {
     let romfs = title.romfs.as_ref()?;
     let file = romfs.lookup("static.crs").ok()?;
     cro::parse(&mods.read(title, "static.crs", &file)?)
 }
 
-/// every CRO module in the RomFS with its file, the one a mod gives in its
-/// place when it gives one.
+/// every CRO module in RomFS w/ its file, the mod's replacement when it gives one
 pub fn module_files(title: &Title, mods: Mods) -> Vec<(cro::Module, Vec<u8>)> {
     let Some(romfs) = &title.romfs else { return Vec::new() };
     let mut files = Vec::new();
@@ -128,8 +110,7 @@ pub fn module_files(title: &Title, mods: Mods) -> Vec<(cro::Module, Vec<u8>)> {
         .collect()
 }
 
-/// the CRO files in dir and in the folders in it, with their paths, path
-/// being dir's.
+/// CRO files in dir and its subfolders w/ their paths, path being dir's
 fn find_modules(romfs: &RomFs, dir: &DirEntry, path: &str, files: &mut Vec<(String, FileEntry)>) {
     for (_, file) in romfs.files(dir) {
         if file.name.to_ascii_lowercase().ends_with(".cro") {
@@ -141,8 +122,7 @@ fn find_modules(romfs: &RomFs, dir: &DirEntry, path: &str, files: &mut Vec<(Stri
     }
 }
 
-/// the path of name in the folder at path. paths skip the nameless
-/// folders, the root and the one some titles keep everything in.
+/// path of name in the folder at path, paths skip the nameless folders (the root and the one some titles stuff everything in)
 fn join(path: &str, name: &str) -> String {
     if path.is_empty() || name.is_empty() {
         format!("{path}{name}")
@@ -173,8 +153,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// a mod that makes the code longer gives an exheader saying so, and
-    /// its text is all of it, where the title's own exheader would cut it.
+    /// a mod that makes the code longer gives an exheader saying so, and its text is all of it where the title's own exheader would cut it
     #[test]
     fn a_mods_exheader_says_how_much_of_its_code_is_text() {
         let own = bytes(&[0xE3A0_0000, 0xE12F_FF1E]);
@@ -190,8 +169,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    /// the modules and the static module a mod replaces come from it, asked
-    /// for by their paths, and the rest from the title.
+    /// modules and the static module a mod replaces come from it (asked for by path), the rest from the title
     #[test]
     fn the_modules_a_mod_replaces_come_from_it() {
         let (own, modded) = ([0xE3A0_0000, 0xE12F_FF1E], [0xE3A0_0001, 0xE12F_FF1E]);

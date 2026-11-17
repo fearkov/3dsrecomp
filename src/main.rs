@@ -1,11 +1,9 @@
-//! 3dsrecomp, a static recompiler for 3DS titles, whose code runs in any
-//! emulator that implements recomp.h, Zakuro being the one it was made for.
+//! 3dsrecomp, a static recompiler for 3DS titles, its code runs in any emu implementing recomp.h (zakuro being the OG)
 //!
-//! analyze reports how much of a title's code a generic pass can discover
-//! on its own, build turns what it found into C and compiles it into a
-//! library the emulator can load, port makes a program of the title with
-//! that code linked in, and verify, built with the verify feature, checks
-//! the library against Zakuro's interpreter.
+//! analyze reports how much code a generic pass finds alone
+//! build turns that into C and compiles a lib the emu can load
+//! port makes a standalone program w/ that code linked in
+//! verify (needs the verify feature) checks the lib against zakuro's interpreter
 
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -28,14 +26,14 @@ build without a dir works in the cache and installs the library where
 Zakuro finds it on its own. hints prints the game's section for hints.txt,
 from the hints Zakuro wrote next to its library or the file given.";
 
-/// what the options on the command line ask for.
+/// what the cli options ask for
 #[derive(Default)]
 struct Options {
-    /// C files of functions written by hand, see docs/overrides.md.
+    /// C files of handwritten funcs, see docs/overrides.md
     overrides: Option<PathBuf>,
-    /// what port calls the program.
+    /// what port names the program
     name: Option<String>,
-    /// a Zakuro checkout for port to build against.
+    /// a zakuro checkout for port to build against
     zakuro: Option<PathBuf>,
 }
 
@@ -84,7 +82,7 @@ fn main() {
     }
 }
 
-/// the title and its programs, the executable first and then its modules.
+/// the title and its programs, exe first then its modules
 fn load(path: &str) -> (Title, Vec<(String, Program)>) {
     let title = Title::load(path).unwrap_or_else(|error| {
         eprintln!("could not load {path}, {error}");
@@ -97,9 +95,8 @@ fn load(path: &str) -> (Title, Vec<(String, Program)>) {
     (title, programs)
 }
 
-/// prints the section of hints.txt for the game at path, the places in the
-/// hints Zakuro wrote next to its library, or in file, that start functions
-/// the analysis does not find, along with those the list has already.
+/// prints the hints.txt section for the game at path
+/// spots in zakuro's hints next to its lib (or in file) that start funcs the analysis misses, plus the ones the list already has
 fn hints(path: &str, file: Option<&Path>) {
     let (title, programs) = load(path);
     let Some((_, program)) = programs.iter().find(|(name, _)| name == "executable") else {
@@ -129,8 +126,7 @@ fn hints(path: &str, file: Option<&Path>) {
     }
 }
 
-/// builds the library in dir, or when there is none in the cache, and then
-/// installs it where hosts look for it.
+/// builds the lib in dir (or the cache if none), then installs it where hosts look
 fn build(path: &str, given: Option<&Path>, options: &Options) {
     let build_options = build::Options { dir: given, overrides: options.overrides.as_deref(), ..build::Options::default() };
     if let Err(error) = build::build(Path::new(path), &build_options, &print_event) {
@@ -139,8 +135,7 @@ fn build(path: &str, given: Option<&Path>, options: &Options) {
     }
 }
 
-/// prints what a build does, compiling every twentieth of the way, which a
-/// frontend running build can follow.
+/// prints what a build does, compile progress every 5%, a frontend running build can follow along
 fn print_event(event: Event) {
     match event {
         Event::Generated { files, bytes, overrides } => {
@@ -157,7 +152,7 @@ fn print_event(event: Event) {
     }
 }
 
-/// a Cargo project at dir that builds the title into a program of its own.
+/// a cargo project at dir that builds the title into its own program
 fn port(path: &str, dir: &Path, options: &Options) {
     let generated = build::generate(Path::new(path), |_| dir.join("code"), options.overrides.as_deref(), Mods::default(), &print_event)
         .unwrap_or_else(|error| {
@@ -189,8 +184,7 @@ fn port(path: &str, dir: &Path, options: &Options) {
     println!("then run target/release/{name} with the path to the game");
 }
 
-/// runs up to count of the recompiled functions of each program against
-/// the interpreter, the modules one at a time, each loaded at the same place.
+/// runs up to count recompiled funcs per program against the interpreter, modules one at a time, each loaded at the same spot
 #[cfg(feature = "verify")]
 fn check(path: &str, library: &Path, count: usize) {
     let (title, programs) = load(path);
@@ -209,7 +203,7 @@ fn check(path: &str, library: &Path, count: usize) {
         title.exheader.bss_size,
     );
     let start = std::time::Instant::now();
-    // the generated code is what gets compared, the natives apart below
+    // the generated code is what gets compared, natives separately below
     let has_natives = library.set_natives(false);
 
     let executable = verify::verify(
@@ -243,7 +237,7 @@ fn check(path: &str, library: &Path, count: usize) {
         modules.add(&report);
     }
     print_report("modules", &modules);
-    // a library without natives runs the title's code for them both ways
+    // a lib w/o natives runs the title's code for them both ways
     let natives = recomp3ds::natives::find(&programs[0].1.text);
     if !natives.is_empty() {
         let report = verify::natives(&verify::Memory::new(regions.clone()), &mut library, &natives);
@@ -257,8 +251,7 @@ fn check(path: &str, library: &Path, count: usize) {
     println!("took {:.1?}", start.elapsed());
 }
 
-/// up to count of the functions that became C, spread over the program, as
-/// addresses at base with bit 0 set for Thumb.
+/// up to count funcs that became C, spread over the program, as addrs at base w/ bit 0 for Thumb
 #[cfg(feature = "verify")]
 fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
     let functions: Vec<u32> = analysis
@@ -267,7 +260,7 @@ fn sample(analysis: &Analysis, base: u32, count: usize) -> Vec<u32> {
         .filter(|&(&entry, f)| codegen::recompiles(entry, f))
         .map(|(&entry, f)| (base + entry) | (f.mode == Mode::Thumb) as u32)
         .collect();
-    // VERIFY_ONLY=address checks that one function alone
+    // VERIFY_ONLY=address checks just that one func
     if let Some(only) = std::env::var("VERIFY_ONLY").ok().and_then(|v| u32::from_str_radix(&v, 16).ok()) {
         return functions.into_iter().filter(|&f| f == only).collect();
     }
@@ -325,8 +318,7 @@ fn analyze(path: &str) {
     let instructions: usize = functions().map(|f| f.instructions.len()).sum();
     println!("thumb       {thumb} functions");
     println!("decoded     {instructions} instructions, shared code once per function");
-    // a function far bigger than the rest takes the compiler most of the
-    // build, alone
+    // a func way bigger than the rest hogs the compiler for most of the build, alone
     let mut largest: Vec<(usize, u32)> = analyses
         .iter()
         .flat_map(|analysis| analysis.functions.iter().map(|(&entry, f)| (f.instructions.len(), entry)))
@@ -351,7 +343,7 @@ fn analyze(path: &str) {
     }
 }
 
-/// the numbers the report shows for a program, or for several added up.
+/// the numbers the report shows for a program, or several summed
 #[derive(Default, Clone, Copy)]
 struct Totals {
     text: usize,

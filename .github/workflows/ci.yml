@@ -1,5 +1,4 @@
-# builds and tests 3dsrecomp on Linux and Windows, with a C compiler around
-# for the header's layout test
+# builds and tests 3dsrecomp on linux and windows, w/ a C compiler around for the header layout test
 name: CI
 
 on:

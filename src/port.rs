@@ -1,5 +1,4 @@
-//! a title made into a program of its own, its recompiled code linked in
-//! and Zakuro running everything around it.
+//! a title turned into its own program, its recompiled code linked in and zakuro running everything around it
 
 use std::path::Path;
 
@@ -86,7 +85,7 @@ fn main() {
 }
 "#;
 
-/// a name Cargo takes for the program, from the title's.
+/// a cargo friendly program name from the title's
 pub fn package_name(title: &str) -> String {
     let name: String = title
         .chars()
@@ -96,9 +95,8 @@ pub fn package_name(title: &str) -> String {
     if name.is_empty() { "title".to_owned() } else { name.to_owned() }
 }
 
-/// writes a Cargo project at dir whose program runs the title, with the code
-/// build left in dir/code/librecomp.a. zakuro is a checkout to build against
-/// instead of the one on GitHub.
+/// writes a cargo project at dir whose program runs the title, w/ the built code left in dir/code/librecomp.a
+/// zakuro is a checkout to build against instead of the github one
 pub fn write_project(dir: &Path, name: &str, title: &str, program_id: u64, zakuro: Option<&Path>) -> Result<(), String> {
     let dependency = match zakuro {
         Some(path) => {

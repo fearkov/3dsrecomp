@@ -1,18 +1,14 @@
-//! one look at the page tables for the loads and stores a stretch of code
-//! makes off the same register plus a constant, rather than one for each.
-//! a stretch runs from a label, or from the host's last turn, to the next
-//! of either. along it nothing takes a page from the code, a read or write
-//! the host handles only gives pages back, see docs/interface.md, so the
-//! span a look gives stays good while the register holds the same value.
-//! each access then needs nothing but a test that the look found its page.
+//! one page table look for all the loads and stores a stretch of code makes off the same reg plus a const, not one each
+//! a stretch runs from a label (or the host's last turn) to the next of either
+//! along it nothing takes a page from the code, accesses the host handles only give pages back (docs/interface.md)
+//! so a look's span stays good while the reg keeps its value, each access then just tests that the look found its page
 
 use std::collections::{BTreeMap, BTreeSet};
 
-/// a load or store at a register plus a constant, in the order the
-/// instruction makes them.
+/// a load or store at reg plus const, in the order the instr makes them
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Access {
-    /// the instruction's address.
+    /// the instr's addr
     pub at: u32,
     pub base: u32,
     pub offset: i32,
@@ -20,15 +16,14 @@ pub(crate) struct Access {
     pub write: bool,
 }
 
-/// the span covering a load or store, and where in it the access starts.
+/// the span covering a load or store, and where in it the access starts
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Covered {
     pub span: String,
     pub delta: u32,
 }
 
-/// a look to take before an instruction, at a register plus a constant,
-/// for length bytes.
+/// a look to take b4 an instr, at reg plus const, for length bytes
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Span {
     pub name: String,
@@ -40,29 +35,26 @@ pub(crate) struct Span {
 
 #[derive(Debug, Default)]
 pub(crate) struct Plan {
-    /// the looks to take before each instruction.
+    /// looks to take b4 each instr
     pub before: BTreeMap<u32, Vec<Span>>,
-    /// the accesses a span covers, by instruction and their order in it.
+    /// accesses a span covers, by instr and their order in it
     pub covered: BTreeMap<(u32, usize), Covered>,
 }
 
-/// the most bytes a span takes in, which keeps it from crossing pages but
-/// rarely. a function's frame and the fields of a structure fit.
+/// max bytes a span covers, keeps it from crossing pages except rarely, a func's frame and struct fields fit
 const MOST: i64 = 512;
 
-/// the words in the C of an instruction that hand control to the host or to
-/// other code, which can do anything to the page tables, and after which the
-/// locals are read again.
+/// words in an instr's C that hand control to the host or other code
+/// they can do anything to the page tables and locals get reloaded after
 const TURNS: &[&str] =
     &["CALL(", "CALL_RETURNING(", "SVC(", "SVC_TICK(", "SVC_WAIT(", "SVC_RELEASE(", "INTERPRET(", "RETURN", "JUMP_TO(", "VFP_VECTOR(", "OUT_OF_BUDGET", "SYNC_"];
 
-/// whether an instruction's C lets the host or other code run.
+/// does an instr's C let the host or other code run
 fn turns(text: &str) -> bool {
     TURNS.iter().any(|word| text.contains(word))
 }
 
-/// the registers an instruction's C may write, by assignment, a compound
-/// one, an increment, or their address taken.
+/// regs an instr's C may write, by assignment, compound assignment, increment or taking their addr
 fn written(text: &str) -> BTreeSet<u32> {
     let mut registers = BTreeSet::new();
     let bytes = text.as_bytes();
@@ -87,22 +79,20 @@ fn written(text: &str) -> BTreeSet<u32> {
     registers
 }
 
-/// the accesses off one register, with no write to it between, from the
-/// instruction whose start the look goes before.
+/// accesses off one reg w/o a write to it between, from the instr the look goes b4
 struct Group {
     first: u32,
     members: Vec<((u32, usize), Access)>,
 }
 
-/// the looks for a function, given its labels and each instruction's
-/// address and C, in order, along with the accesses they made.
+/// looks for a func given its labels and each instr's addr and C in order, plus the accesses they made
 pub(crate) fn plan(labels: &BTreeSet<u32>, lowered: &[(u32, &str)], accesses: &[Access]) -> Plan {
     let mut by_instruction: BTreeMap<u32, Vec<Access>> = BTreeMap::new();
     for access in accesses {
         by_instruction.entry(access.at).or_default().push(*access);
     }
     let mut groups: Vec<Group> = Vec::new();
-    // the group still open for each register
+    // the group still open for each reg
     let mut open: BTreeMap<u32, usize> = BTreeMap::new();
     for &(at, text) in lowered {
         if labels.contains(&at) {
@@ -130,7 +120,7 @@ pub(crate) fn plan(labels: &BTreeSet<u32>, lowered: &[(u32, &str)], accesses: &[
         for write in [false, true] {
             let mut members: Vec<&((u32, usize), Access)> = group.members.iter().filter(|(_, a)| a.write == write).collect();
             members.sort_by_key(|(_, access)| access.offset);
-            // runs of them close enough together for one look
+            // runs of them close enough for one look
             let mut i = 0;
             while i < members.len() {
                 let start = members[i].1.offset as i64;
@@ -167,7 +157,7 @@ pub(crate) fn plan(labels: &BTreeSet<u32>, lowered: &[(u32, &str)], accesses: &[
     plan
 }
 
-/// the C taking a span, before the instruction it is for.
+/// the C taking a span, goes b4 its instr
 pub(crate) fn take(span: &Span) -> String {
     let base = format!("ctx->r[{}]", span.base);
     let at = match span.offset {
@@ -182,8 +172,7 @@ pub(crate) fn take(span: &Span) -> String {
     }
 }
 
-/// a load of size bytes from address, through the span covering it when
-/// one does.
+/// a load of size bytes from address, thru the covering span if there is one
 pub(crate) fn read(covered: Option<Covered>, size: u32, address: &str) -> String {
     match covered {
         Some(Covered { span, delta }) => format!("SPAN_READ{}({span}, {delta}, {address})", size * 8),
@@ -191,8 +180,7 @@ pub(crate) fn read(covered: Option<Covered>, size: u32, address: &str) -> String
     }
 }
 
-/// a store of size bytes of value at address, the same way, as a statement
-/// without its semicolon.
+/// a store of size bytes of value at address, same deal, as a statement w/o its semicolon
 pub(crate) fn write(covered: Option<Covered>, size: u32, address: &str, value: &str) -> String {
     match covered {
         Some(Covered { span, delta }) => format!("SPAN_WRITE{}({span}, {delta}, {address}, {value})", size * 8),
@@ -208,8 +196,7 @@ mod tests {
         Access { at, base, offset, size, write }
     }
 
-    /// two loads off r4 share a look, a third after r4 changes takes its own
-    /// group, alone, and a load after a call is left as it was.
+    /// two loads off r4 share a look, a third after r4 changes gets its own group, a load after a call stays as is
     #[test]
     fn loads_off_one_register_share_a_look_until_it_changes() {
         let lowered = [
@@ -238,8 +225,7 @@ mod tests {
         assert_eq!(take(span), "    const uint8_t *hs0_ = mem_read_span(ctx, ctx->r[4] + 0x4u, 8u);");
     }
 
-    /// a label starts a stretch over, loads and stores look apart, and
-    /// accesses too far apart get looks of their own.
+    /// a label restarts the stretch, loads and stores look separately, accesses too far apart get their own looks
     #[test]
     fn labels_directions_and_distance_split_looks() {
         let lowered = [

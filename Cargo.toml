@@ -14,9 +14,9 @@ path = "src/main.rs"
 members = ["abi"]
 
 [features]
-# loading a recompiled library from Rust
+# loading a recompiled lib from rust
 host = ["recomp-abi/load"]
-# checking recompiled code against Zakuro's interpreter, which it fetches
+# checks recompiled code vs zakuro's interpreter, which it fetches
 verify = ["host", "dep:zakuro-cpu"]
 
 [dependencies]

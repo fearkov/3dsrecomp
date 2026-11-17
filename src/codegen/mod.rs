@@ -1,10 +1,9 @@
-//! turning the functions discovery found into C.
+//! turns the funcs discovery found into C
 //!
-//! every function becomes a C function that can be entered at any of its
-//! labels. guest calls are C calls, an svc is a call to the host, and
-//! anything the code cannot follow on its own, an unknown target, a full
-//! budget, an svc the host has more to do for, returns all the way out to
-//! the host, which picks up again from r15.
+//! every func becomes a C func you can enter at any of its labels
+//! guest calls are C calls, an svc is a call to the host
+//! anything the code can't follow alone (unknown target, budget's gone, an svc the host needs more for)
+//! returns all the way out and the host picks up again from r15
 
 mod arm;
 mod hoist;
@@ -20,45 +19,40 @@ use crate::overrides::Override;
 
 pub use recomp_abi::HEADER;
 
-/// what the lowering of one instruction may refer to.
+/// what lowering one instruction may refer to
 pub(crate) struct Scope<'a> {
-    /// the labels of the function being written.
+    /// labels of the func being written
     pub labels: &'a BTreeSet<u32>,
-    /// the C function that runs each function, by entry with bit 0 set
-    /// for Thumb.
+    /// the C func running each func, by entry w/ bit 0 for Thumb
     pub functions: &'a BTreeMap<u32, String>,
-    /// what the names of the functions start with, which keeps modules apart.
+    /// func name prefix, keeps modules apart
     pub prefix: &'a str,
-    /// whether the code moves, so that addresses are offsets from where the
-    /// host loaded it.
+    /// if the code moves, addrs are offsets from where the host loaded it
     pub relative: bool,
-    /// the instructions left to the interpreter, which can end the code's
-    /// run, so that it gets entered again right after them.
+    /// instrs left to the interpreter, they can end the run so we get entered again right after them
     pub interpreted: &'a std::cell::RefCell<Vec<u32>>,
-    /// the loads and stores at a register plus a constant so far.
+    /// loads and stores at reg plus const so far
     pub accesses: &'a std::cell::RefCell<Vec<hoist::Access>>,
-    /// the looks at the page tables they share, once worked out.
+    /// the page table looks they share, once worked out
     pub plan: Option<&'a hoist::Plan>,
 }
 
 impl Scope<'_> {
-    /// an address as C.
     fn at(&self, address: u32) -> String {
         if self.relative { format!("(module_base + 0x{address:X}u)") } else { format!("0x{address:08X}u") }
     }
 
-    /// a return address as lr holds it, bit 0 set for Thumb, as C.
+    /// a return addr as lr holds it (bit 0 for Thumb) as C
     fn link(&self, link: u32) -> String {
         if link & 1 != 0 { format!("({} | 1)", self.at(link & !1)) } else { self.at(link) }
     }
 
-    /// the C function that runs the function at target, if there is one.
+    /// the C func running the func at target, if any
     fn function(&self, target: u32, thumb: bool) -> Option<String> {
         self.functions.get(&(target | thumb as u32)).cloned()
     }
 
-    /// notes a load or store the instruction at makes at a register plus a
-    /// constant, and gives the span covering it, when one does.
+    /// notes a load or store at reg plus const and hands back its span if it has one
     fn access(&self, at: u32, base: u32, offset: i32, size: u32, write: bool) -> Option<hoist::Covered> {
         let mut accesses = self.accesses.borrow_mut();
         let ordinal = accesses.iter().rev().take_while(|access| access.at == at).count();
@@ -77,8 +71,7 @@ macro_rules! emit {
     };
 }
 
-/// a call, with link the return address as lr holds it, bit 0 set when
-/// the caller is Thumb.
+/// a call, link is the return addr as lr holds it, bit 0 when the caller is Thumb
 fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) -> bool {
     let caller_thumb = link & 1 != 0;
     let lr = scope.link(link);
@@ -91,10 +84,8 @@ fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) ->
     true
 }
 
-/// the words a load or store multiple moves, from p up, a destination for
-/// each when loading and a value for each when storing, both as C. they
-/// nearly always lie on one page the code reaches directly, which one
-/// check covers, and otherwise go through the usual path one at a time.
+/// the words an ldm or stm moves from p up, a dest each when loading, a value each when storing, both as C
+/// they nearly always sit on one directly reachable page (one check), else they go the slow way one by one
 fn words(out: &mut String, load: bool, words: &[String]) {
     let bytes = words.len() * 4;
     if let [word] = words {
@@ -130,7 +121,7 @@ fn words(out: &mut String, load: bool, words: &[String]) {
     emit!(out, "    }} }}");
 }
 
-/// a branch without link, to a label of this function if it is one.
+/// a branch w/o link, to a label of this func if it's one
 fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
     if scope.labels.contains(&target) {
         emit!(out, "    goto L_{target:08X};");
@@ -143,29 +134,25 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
     false
 }
 
-/// instructions per source file, so the files compile in parallel. gcc
-/// keeps a whole file in memory, and files of 20,000 took it up to 7.8 GB.
+/// instrs per source file so files compile in parallel
+/// gcc keeps a whole file in memory and 20k instr files ate 7.8 GB, yikes
 const FILE_SIZE: usize = 5_000;
 
-/// the instructions up to which a function another one holds is still
-/// written as a function of its own.
+/// up to this many instrs a func another one holds still gets its own func
 const OWN_FUNCTION: usize = 128;
 
-/// whether a function becomes C, which it does unless its entry turned
-/// out not to be code.
+/// does a func become C, yes unless its entry turned out not to be code
 pub fn recompiles(entry: u32, function: &Function) -> bool {
     function.labels.contains(&entry)
 }
 
-/// an address as the host looks it up, bit 0 set for Thumb.
+/// an addr as the host looks it up, bit 0 for Thumb
 fn key(address: u32, mode: Mode) -> u32 {
     address | (mode == Mode::Thumb) as u32
 }
 
-/// the functions whose code another function already has, each with the
-/// entry of the function that runs it. a jump table's cases and the target
-/// of a tail call turn up both ways, as functions of their own and inside
-/// the function that reaches them.
+/// funcs whose code another func already has, each w/ the entry of the func running it
+/// jump table cases and tail call targets show up both ways, as their own funcs and inside whoever reaches them
 fn containers(functions: &BTreeMap<u32, &Function>) -> BTreeMap<u32, u32> {
     let mut owners: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (&entry, function) in functions {
@@ -173,7 +160,7 @@ fn containers(functions: &BTreeMap<u32, &Function>) -> BTreeMap<u32, u32> {
             owners.entry(label).or_default().push(entry);
         }
     }
-    // a function only moves into a bigger one, so the links cannot loop
+    // a func only moves into a bigger one, so links can't loop
     let rank = |entry: u32| (functions[&entry].instructions.len(), std::cmp::Reverse(entry));
     let mut parent = BTreeMap::new();
     for (&entry, function) in functions {
@@ -203,27 +190,26 @@ fn containers(functions: &BTreeMap<u32, &Function>) -> BTreeMap<u32, u32> {
         .collect()
 }
 
-/// a program to write as C, the executable or one of its modules.
+/// a program to write as C, the exe or one of its modules
 pub struct Unit<'a> {
-    /// the module's name, None for the executable, whose code does not move.
+    /// module name, None for the exe whose code never moves
     pub module: Option<&'a str>,
     pub program: &'a Program,
     pub analysis: &'a Analysis,
 }
 
-/// the C sources for the units, the executable first, as file names and
-/// contents. the overrides take the place of the functions they replace,
-/// which overrides.h lets them still call.
+/// the C sources for the units, exe first, as (name, contents)
+/// overrides replace the funcs they override, overrides.h still lets them call those
 pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)> {
     let mut files = vec![("recomp.h".to_owned(), HEADER.to_owned())];
     let mut sources: Vec<String> = Vec::new();
     let mut source = String::new();
-    // the headers the file being written includes
+    // headers the current file includes
     let mut included = BTreeSet::new();
     let mut size = 0;
     let mut tables = String::from("#include \"recomp.h\"\n");
     let mut modules = String::new();
-    // each unit's Origins, the executable's first
+    // each unit's Origins, exe first
     let mut origins = String::new();
     let mut originals = String::new();
     let mut original_headers = BTreeSet::new();
@@ -233,9 +219,8 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let header = format!("{}functions.h", prefix);
         let mut functions: BTreeMap<u32, &Function> =
             unit.analysis.functions.iter().filter(|&(&entry, f)| recompiles(entry, f)).map(|(&e, f)| (e, f)).collect();
-        // a small function another one holds still gets a C function of its
-        // own, so that calls to it skip the bigger one's way in, its loads
-        // and its dispatch
+        // a small func another one holds still gets its own C func
+        // so calls to it skip the big one's way in, its loads and its dispatch
         let containers: BTreeMap<u32, u32> = containers(&functions)
             .into_iter()
             .filter(|(entry, _)| functions[entry].instructions.len() > OWN_FUNCTION)
@@ -249,9 +234,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             .collect();
         functions.retain(|entry, _| !containers.contains_key(entry));
 
-        // calls go to the functions written by hand, which reach the
-        // generated ones through a function that enters them where they
-        // replace them
+        // calls go to the handwritten funcs, they reach the generated ones thru a func that enters them where they replace them
         let replaced: Vec<&Override> = overrides.iter().filter(|o| o.module.as_deref() == unit.module).collect();
         for &item in &replaced {
             let Some(original) = names.insert(item.address, item.name.clone()) else { continue };
@@ -280,7 +263,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         files.push((header.clone(), prototypes));
 
         let include = format!("#include \"{header}\"\n\n");
-        // each function's labels with those after what it interprets
+        // each func's labels plus the ones after what it interprets
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
         for (number, (&entry, function)) in functions.iter().enumerate() {
             if source.is_empty() {
@@ -289,12 +272,9 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             if included.insert(index) {
                 source.push_str(&include);
             }
-            // written once to see what goes to the interpreter, the code
-            // can stop after any of those, and then again with a label
-            // after each, where the host comes back in
-            // along with the loads and stores, and where each instruction's
-            // C is, which the looks at the page tables they can share come
-            // from
+            // written once to see what goes to the interpreter (the code can stop after any of those)
+            // then again w/ a label after each, where the host comes back in
+            // plus the loads, stores and where each instr's C sits, which the shared page table looks come from
             let interpreted = std::cell::RefCell::new(Vec::new());
             let accesses = std::cell::RefCell::new(Vec::new());
             let relative = unit.module.is_some();
@@ -337,8 +317,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             }
         }
 
-        // every label the host can resume at, preferring the function that
-        // starts there
+        // every label the host can resume at, preferring the func that starts there
         let mut entries: BTreeMap<u32, (String, u32)> = BTreeMap::new();
         for (number, (&entry, function)) in functions.iter().enumerate() {
             let owner = (name(&prefix, entry, function.mode == Mode::Thumb), number as u32);
@@ -398,8 +377,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
     files
 }
 
-/// the stretches of code a function was made from, as runs of instructions
-/// one right after another.
+/// the stretches of code a func was made from, as runs of back to back instrs
 fn spans(program: &Program, function: &Function) -> Vec<(u32, u32)> {
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for &address in &function.instructions {
@@ -417,10 +395,8 @@ fn spans(program: &Program, function: &Function) -> Vec<(u32, u32)> {
     spans
 }
 
-/// a unit's stale flags and the tables saying what its functions were
-/// made from, with its Origins added to origins. the code is cut into pieces
-/// wherever a function's code starts or ends, so that the host hashes every
-/// byte once, functions holding the code of others as they do.
+/// a unit's stale flags and the tables saying what its funcs came from, its Origins added to origins
+/// code gets cut wherever a func starts or ends so the host hashes every byte once, even w/ funcs holding each other's code
 fn write_origins(
     tables: &mut String,
     origins: &mut String,
@@ -475,15 +451,14 @@ fn write_origins(
     );
 }
 
-/// the pieces spans cut the code into, in order and without overlaps: the
-/// code some span covers, cut wherever any of them starts or ends.
+/// the pieces spans cut the code into, in order, no overlaps, cut wherever any span starts or ends
 fn pieces(spans: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
     let mut spans: Vec<(u32, u32)> = spans.collect();
     spans.sort_unstable();
     let cuts: BTreeSet<u32> = spans.iter().flat_map(|&(start, end)| [start, end]).collect();
     let mut pieces = Vec::new();
     let mut covered: Option<(u32, u32)> = None;
-    // each stretch covered without a gap, cut at every start and end in it
+    // each stretch covered w/o gaps, cut at every start and end in it
     let cut = |(start, end): (u32, u32), pieces: &mut Vec<(u32, u32)>| {
         let mut from = start;
         for &at in cuts.range(start + 1..end) {
@@ -509,7 +484,7 @@ fn pieces(spans: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
     pieces
 }
 
-/// a function, the number-th of its unit.
+/// a func, the number'th of its unit
 fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
     let thumb = function.mode == Mode::Thumb;
     emit!(out, "uint32_t {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
@@ -522,8 +497,7 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
     out.push('\n');
 }
 
-/// what a function does, between its braces, noting where each
-/// instruction's C is in it when pieces is given.
+/// what a func does between its braces, noting where each instr's C sits when pieces is given
 fn write_body(
     out: &mut String,
     program: &Program,
@@ -539,12 +513,9 @@ fn write_body(
         emit!(out, "    const uint32_t module_base = {}base;", scope.prefix);
     }
     emit!(out, "    uint32_t target = ctx->r[15], resume = 0;");
-    // a function is only ever entered in its own state, callers and the
-    // host's lookups see to that, so the entry needs no look at thumb
-    // its start comes from memory, where the host puts an address nothing
-    // starts at once the function is stale, so that calls pay for the check
-    // with nothing more than the compare they make anyway, and whatever
-    // misses goes past the flag
+    // a func only gets entered in its own state (callers and host lookups make sure), so no thumb check at entry
+    // its start comes from memory, the host puts an addr nothing starts at there once it's stale
+    // so calls pay for the check w/ the compare they do anyway, and misses go past the flag
     let prefix = scope.prefix;
     let start = if scope.relative { format!("(module_base + {prefix}recomp_starts[{number}])") } else { format!("{prefix}recomp_starts[{number}]") };
     emit!(out, "    if (LIKELY(target == {start})) goto L_{entry:08X};");
@@ -559,7 +530,7 @@ fn write_body(
     // somewhere else, the host knows where
     emit!(out, "    ctx->r[15] = target;");
     emit!(out, "    TAIL_CALL(recomp_call);");
-    // where the calls that come back anywhere else go
+    // where calls that come back anywhere else go
     emit!(out, "    RETURNED_ELSEWHERE();");
 
     let instructions = &function.instructions;
@@ -580,8 +551,7 @@ fn write_body(
         } else {
             let op = program.text.read32(address).unwrap_or(0);
             emit!(out, "    /* {address:08X} {op:08X} */");
-            // before the condition, which may skip the instruction, but not
-            // the ones after it that use the span too
+            // b4 the condition, which may skip the instr, but not the ones after it that use the span too
             take_spans(out, scope, address);
             (arm::lower(out, scope, address, op), 4)
         };
@@ -596,7 +566,7 @@ fn write_body(
     emit!(out, "    OUT_OF_BUDGET();");
 }
 
-/// the looks at the page tables to take before the instruction at address.
+/// page table looks to take b4 the instr at address
 fn take_spans(out: &mut String, scope: &Scope, address: u32) {
     for span in scope.plan.and_then(|plan| plan.before.get(&address)).into_iter().flatten() {
         emit!(out, "{}", hoist::take(span));
@@ -611,7 +581,7 @@ mod tests {
 
     const BASE: u32 = 0x0010_0000;
 
-    /// the files for ARM code at BASE, entered at its start.
+    /// files for ARM code at BASE, entered at its start
     fn files(words: &[u32], overrides: &[Override]) -> BTreeMap<String, String> {
         let program = Program {
             text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() },
@@ -623,7 +593,7 @@ mod tests {
         generate(&units, overrides).into_iter().collect()
     }
 
-    /// the files for a function that calls another, the callee replaced.
+    /// files for a func calling another, callee replaced
     fn generated(overrides: &[Override]) -> BTreeMap<String, String> {
         // bl BASE + 8, bx lr, bx lr
         files(&[0xEB00_0000, 0xE12F_FF1E, 0xE12F_FF1E], overrides)
@@ -644,8 +614,7 @@ mod tests {
         compiles("transfers", &files, &["code000.c"]);
     }
 
-    /// two loads and two stores off r4 take one look each way, before the
-    /// first of them, and go through the spans, delta bytes in.
+    /// two loads and two stores off r4 share one look each way, b4 the first of them, then go thru the spans delta bytes in
     #[test]
     fn accesses_off_one_register_share_a_look() {
         // ldr r0, [r4, #4], ldr r1, [r4, #8], str r0, [r4, #12],
@@ -663,10 +632,8 @@ mod tests {
         compiles("hoist", &files, &["code000.c"]);
     }
 
-    /// the code goes on after an svc, which the host ran, into the next
-    /// instruction, where the host comes back in when it stops instead.
-    /// GetSystemTick, WaitSynchronizationN and ReleaseMutex are ones the
-    /// code can answer itself.
+    /// after an svc (the host ran it) the code goes on into the next instr, where the host comes back in if it stops instead
+    /// GetSystemTick, WaitSynchronizationN and ReleaseMutex the code can answer itself
     #[test]
     fn an_svc_goes_on_to_the_next_instruction() {
         // svceq 0x28, svc 0x32, bx lr
@@ -678,7 +645,7 @@ mod tests {
         assert!(conditional < svc && svc < next);
         assert!(!code[svc..next].contains("goto"), "{}", &code[svc..next]);
 
-        // Thumb: svc 0x28, bx lr
+        // Thumb, svc 0x28, bx lr
         let program = Program {
             text: Segment { base: BASE, bytes: [0xDF28u16, 0x4770].iter().flat_map(|h| h.to_le_bytes()).collect() },
             seeds: vec![(BASE | 1, Source::Entry)],
@@ -710,9 +677,8 @@ mod tests {
         compiles("thumb-mutex-svc", &thumb_mutex, &["code000.c"]);
     }
 
-    /// a call checks where the callee came back to with one compare against
-    /// its link, Thumb in bit 0, and every function starts by checking the
-    /// stack, and keeps one way on for the calls that came back elsewhere.
+    /// a call checks where the callee came back to w/ one compare against its link (Thumb in bit 0)
+    /// every func checks the stack first and keeps one exit for calls that came back elsewhere
     #[test]
     fn calls_compare_where_the_callee_came_back_to() {
         // bl BASE + 8, bx lr, bx lr
@@ -724,7 +690,7 @@ mod tests {
         assert!(!code.contains("RETURNED("));
         assert!(files["functions.h"].contains("uint32_t f_00100008(Context *ctx);"));
 
-        // Thumb: bl BASE + 6 (two halves), bx lr, bx lr
+        // Thumb, bl BASE + 6 (two halves), bx lr, bx lr
         let program = Program {
             text: Segment { base: BASE, bytes: [0xF000u16, 0xF801, 0x4770, 0x4770].iter().flat_map(|h| h.to_le_bytes()).collect() },
             seeds: vec![(BASE | 1, Source::Entry)],
@@ -738,10 +704,9 @@ mod tests {
         compiles("thumb-calls", &thumb, &["code000.c"]);
     }
 
-    /// guest code run for real, through a host as small as one can be. a
-    /// callee that comes back somewhere other than its link sends the
-    /// caller on from there, and recursion deeper than the C stack the host
-    /// gives unwinds to the host, which carries on from where it stopped.
+    /// guest code run for real thru the tiniest host possible
+    /// a callee coming back anywhere but its link sends the caller on from there
+    /// recursion deeper than the host's C stack unwinds to the host, which carries on where it stopped
     #[cfg(feature = "host")]
     #[test]
     fn calls_come_back_and_unwind() {
@@ -788,14 +753,14 @@ mod tests {
         static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
 
         let words: [u32; 18] = [
-            // f: push {lr}, mov r0, #0, bl g, add r0, r0, #1, bl h,
+            // f = push {lr}, mov r0, #0, bl g, add r0, r0, #1, bl h,
             // add r0, r0, #100, pop {pc}
             0xE52D_E004, 0xE3A0_0000, 0xEB00_0003, 0xE280_0001, 0xEB00_0003, 0xE280_0064, 0xE49D_F004,
-            // g: add lr, lr, #8, bx lr, back past f's add and bl h
+            // g = add lr, lr, #8, bx lr, comes back past f's add and bl h (sneaky)
             0xE28E_E008, 0xE12F_FF1E,
-            // h: add r0, r0, #200, bx lr
+            // h = add r0, r0, #200, bx lr
             0xE280_00C8, 0xE12F_FF1E,
-            // r: cmp r0, #0, bxeq lr, push {lr}, sub r0, r0, #1, bl r,
+            // r = cmp r0, #0, bxeq lr, push {lr}, sub r0, r0, #1, bl r,
             // add r1, r1, #1, pop {pc}
             0xE350_0000, 0x012F_FF1E, 0xE52D_E004, 0xE240_0001, 0xEBFF_FFFA, 0xE281_1001, 0xE49D_F004,
         ];
@@ -806,7 +771,7 @@ mod tests {
         };
         let library = library("run", &program);
 
-        // the guest stack, which the code reaches directly
+        // guest stack, directly reachable
         const STACK_TOP: u32 = 0x0810_0000;
         let mut stack = vec![0u8; 0x8_0000];
         let mut read_pages = vec![std::ptr::null_mut::<u8>(); 1 << 20];
@@ -852,10 +817,9 @@ mod tests {
             done: 0,
             trail: [0; recomp_abi::TRAIL],
         };
-        // where the guest returns to the host, which no code is at
+        // where the guest returns to the host, no code lives there
         const DONE: u32 = 0x0020_0000;
-        // runs from r15 until the guest returns to DONE, counting how many
-        // times the host entered the code and how many of those unwound
+        // runs from r15 till the guest returns to DONE, counting host entries and how many unwound
         let run = |ctx: &mut Context| {
             let (mut entries, mut unwound) = (0, 0);
             while ctx.r[15] != DONE {
@@ -863,8 +827,7 @@ mod tests {
                 ctx.exit = EXIT_NONE;
                 ctx.budget = i32::MAX;
                 ctx.stack_limit = recomp_abi::stack_limit();
-                // SAFETY: the code came from the library, and the context
-                // has what it needs
+                // safe bc the code came from the lib and the context has what it needs
                 let back = unsafe { code(ctx) };
                 entries += 1;
                 match ctx.exit {
@@ -899,8 +862,7 @@ mod tests {
         assert!(!WRONG.load(Ordering::Relaxed), "the code asked the host for more than lookups");
     }
 
-    /// the code for program, built and loaded, in a folder named after test
-    /// while it builds.
+    /// the code for program, built and loaded, in a folder named after test while it builds
     #[cfg(feature = "host")]
     fn library(test: &str, program: &Program) -> recomp_abi::Library {
         let analysis = discover::analyze(program);
@@ -920,9 +882,7 @@ mod tests {
         library
     }
 
-    /// GetSystemTick run for real: the code answers it itself at the one
-    /// place the host lets it, while the budget is above the floor, and the
-    /// host answers the rest.
+    /// GetSystemTick for real, the code answers it at the one spot the host allows while budget > floor, host answers the rest
     #[cfg(feature = "host")]
     #[test]
     fn the_code_reads_the_clock_where_the_host_lets_it() {
@@ -1008,30 +968,27 @@ mod tests {
             ctx.exit = EXIT_NONE;
             ctx.stack_limit = recomp_abi::stack_limit();
             let code = library.lookup(BASE).expect("code for the program");
-            // SAFETY: the code came from the library, and the context has
-            // what it needs
+            // safe bc the code came from the lib and the context has what it needs
             let back = unsafe { code(ctx) };
             assert_eq!((back, ctx.exit), (0x0020_0000, EXIT_NONE));
             ASKED.load(Ordering::Relaxed)
         };
 
-        // the first is the code's, the clock less the budget, the second the
-        // host's, the address after it not the one the host named
+        // 1st is the code's (clock minus budget), 2nd the host's, w/ the addr after it not the one the host named
         assert_eq!(run(&mut ctx, 10), 1);
         assert_eq!((ctx.r[0], ctx.ticks), (7, 1));
         assert_eq!(ctx.r[2] as u64, ctx.tick_last);
         assert!((1000 - 500..=1000 - 496).contains(&ctx.tick_last), "{}", ctx.tick_last);
         assert_eq!(ctx.budget, 500 - 4 - 150, "four instructions and a tick");
 
-        // with the budget at or below the floor the host answers both
+        // budget at or below the floor, host answers both
         assert_eq!(run(&mut ctx, 500), 2);
         assert_eq!((ctx.r[0], ctx.r[2], ctx.ticks, ctx.budget), (7, 7, 0, 500 - 4));
     }
 
-    /// WaitSynchronizationN and ReleaseMutex run for real: the code takes
-    /// and lets go of the mutex the host lent it itself, at the places the
-    /// host lets it, while the budget is above the floor, leaving each in
-    /// the trail with the ticks, and the host answers the rest.
+    /// WaitSynchronizationN and ReleaseMutex for real
+    /// the code takes and drops the lent mutex itself where the host allows while budget > floor, logging each in the trail w/ the ticks
+    /// host answers the rest
     #[cfg(feature = "host")]
     #[test]
     fn the_code_takes_the_mutex_the_host_lends_it() {
@@ -1074,7 +1031,7 @@ mod tests {
             slots: None,
         };
         let library = library("mutex", &program);
-        // where the handles are, a page the code reaches, and its last word
+        // where the handles are, a reachable page and its last word
         const HANDLES: u32 = 0x0810_0000;
         const HELD: u32 = 0x0001_0012;
         let mut page = vec![0u8; 0x1000];
@@ -1121,8 +1078,7 @@ mod tests {
             done: 0,
             trail: [0; TRAIL],
         };
-        // runs the program from the top with the handles at handles, how
-        // many there are in count, the handle let go of in r5, and floor
+        // runs the program from the top w/ the handles at handles, count of them, the released handle in r5, and floor
         let run = |ctx: &mut Context, handles: u32, count: u32, floor: i32| {
             ASKED.lock().unwrap().clear();
             (ctx.r[14], ctx.r[15], ctx.budget, ctx.ticks) = (0x0020_0000, BASE, 500, 0);
@@ -1130,32 +1086,30 @@ mod tests {
             ctx.exit = EXIT_NONE;
             ctx.stack_limit = recomp_abi::stack_limit();
             let code = library.lookup(BASE).expect("code for the program");
-            // SAFETY: the code came from the library, and the context has
-            // what it needs
+            // safe bc the code came from the lib and the context has what it needs
             let back = unsafe { code(ctx) };
             assert_eq!((back, ctx.exit), (0x0020_0000, EXIT_NONE));
             std::mem::take(&mut *ASKED.lock().unwrap())
         };
 
-        // the code takes it, lets it go and reads the clock, all itself
+        // the code takes it, drops it and reads the clock, all by itself
         ctx.done = 0;
         assert_eq!(run(&mut ctx, HANDLES, 1, 10), []);
         assert_eq!((ctx.holding, ctx.done, ctx.ticks, ctx.r[0], ctx.r[1]), (0, 3, 1, ctx.tick_last as u32, 0));
         assert!((1000 - 500..=1000 - 495).contains(&ctx.tick_last), "{}", ctx.tick_last);
         assert_eq!(ctx.trail[..3], [BASE + 4, BASE + 0xC, BASE + 0x10]);
         assert_eq!(ctx.budget, 500 - 5 - 150, "five instructions and a tick");
-        // the last word of a page, held once already
+        // last word of a page, held once already
         (ctx.holding, ctx.done) = (1, 0);
         assert_eq!(run(&mut ctx, HANDLES + 0xFFC, 1, 10), []);
         assert_eq!((ctx.holding, ctx.done), (1, 3));
-        // the trail goes round
+        // the trail wraps around
         (ctx.holding, ctx.done) = (0, TRAIL as u32 - 1);
         assert_eq!(run(&mut ctx, HANDLES, 1, 10), []);
         assert_eq!((ctx.done, ctx.trail[TRAIL - 1], ctx.trail[0], ctx.trail[1]), (TRAIL as u32 + 2, BASE + 4, BASE + 0xC, BASE + 0x10));
         ctx.done = 0;
 
-        // the host answers another handle, two of them, one past the page or
-        // on none, and a release of a mutex the thread does not hold
+        // host answers another handle, two of them, one past the page or on none, and releasing a mutex the thread doesn't hold
         assert_eq!(run(&mut ctx, HANDLES + 8, 1, 10), [0x25, 0x14]);
         assert_eq!(run(&mut ctx, HANDLES, 2, 10), [0x25, 0x14]);
         assert_eq!(run(&mut ctx, HANDLES + 0xFFE, 1, 10), [0x25, 0x14]);
@@ -1163,14 +1117,13 @@ mod tests {
         // only the ticks went in the trail
         assert_eq!((ctx.holding, ctx.done, ctx.ticks), (0, 4, 1));
         assert_eq!(ctx.trail[..4], [BASE + 0x10; 4]);
-        // and the waits and releases at or below the floor, not the tick
+        // plus waits and releases at or below the floor, not the tick
         ctx.done = 0;
         assert_eq!(run(&mut ctx, HANDLES, 1, 500), [0x25, 0x14]);
         assert_eq!((ctx.holding, ctx.done, ctx.ticks), (0, 1, 1));
     }
 
-    /// compiles sources among files, in a folder of their own named after
-    /// test, panicking with the compiler's complaint when they do not.
+    /// compiles sources among files in their own folder named after test, panics w/ the compiler's whining if they don't
     fn compiles(test: &str, files: &BTreeMap<String, String>, sources: &[&str]) {
         let dir = std::env::temp_dir().join(format!("3dsrecomp-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1184,9 +1137,7 @@ mod tests {
         built.unwrap();
     }
 
-    /// every function starts by checking its stale flag, and the tables say
-    /// what it was made from, a span for each run of its instructions and
-    /// the hash of their bytes.
+    /// every func checks its stale flag first, the tables say what it came from, a span per run of instrs and their bytes' hash
     #[test]
     fn functions_say_what_they_were_made_from() {
         // bl BASE + 8, bx lr, then the callee, bx lr
@@ -1200,23 +1151,21 @@ mod tests {
         caller.add(&[0x00, 0x00, 0x00, 0xEB, 0x1E, 0xFF, 0x2F, 0xE1]);
         assert!(tables.contains(&format!("{{0x00100000u, 0x00100008u, 0x{:016X}ull}},", caller.value())), "{tables}");
         assert!(tables.contains("{0x00100008u, 0x0010000Cu, 0x"));
-        // a function each, a run of one piece each
+        // a func each, one run of one piece each
         assert!(tables.contains("static const Run origin_runs[] = {\n    {0, 1},\n    {1, 2},\n};"), "{tables}");
         assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, 2, origin_pieces, origin_functions, origin_runs, origin_owners, recomp_stale, recomp_starts},"));
 
         compiles("origins", &files, &["code000.c", "entries.c"]);
     }
 
-    /// code several functions hold is cut where any of them starts or ends,
-    /// and each function's code is whole pieces.
+    /// code several funcs hold gets cut where any of them starts or ends, each func's code is whole pieces
     #[test]
     fn overlapping_code_is_cut_into_pieces() {
         let pieces = pieces([(0x100, 0x120), (0x110, 0x118), (0x118, 0x130), (0x200, 0x204)].into_iter());
         assert_eq!(pieces, [(0x100, 0x110), (0x110, 0x118), (0x118, 0x120), (0x120, 0x130), (0x200, 0x204)]);
     }
 
-    /// a file holding functions of the executable and of a module declares
-    /// what both use.
+    /// a file w/ funcs from the exe and a module declares what both use
     #[test]
     fn units_that_share_a_file_compile() {
         let program = Program {
@@ -1296,7 +1245,7 @@ RECOMP_OVERRIDE(0x00100008) {
         assert!(header.contains("static inline uint32_t original_0x00100008(Context *ctx) {"));
         assert!(header.contains("return f_00100008(ctx);"));
 
-        // without overrides nothing changes
+        // no overrides, nothing changes
         let plain = generated(&[]);
         assert!(plain["code000.c"].contains("CALL_RETURNING(f_00100008, 0x00100004u);"));
         assert!(!plain.contains_key("overrides.h"));

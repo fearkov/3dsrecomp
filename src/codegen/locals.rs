@@ -1,29 +1,23 @@
-//! keeping the guest's registers, flags and fpscr in locals for the length
-//! of a function, with the budget and the page tables. in the context,
-//! every store to guest memory, which goes through a byte pointer, makes the
-//! compiler read them all again, while locals it can hold in host registers.
+//! keeps the guest's regs, flags and fpscr in locals for a whole func, w/ the budget and page tables
+//! in the context every store to guest memory (thru a byte ptr) makes the compiler reload them all
+//! locals can live in host regs instead
 //!
-//! the context has to be complete whenever anything else can look at it, a
-//! call, the interpreter, a short vector, a return, an svc, a jump through
-//! dispatch, the end of the budget. recomp.h's SYNC_OUT stores the locals
-//! there, and SYNC_IN takes them all again after. SYNC_OUT only stores the
-//! locals that may have changed since the context last had them, which a
-//! pass over the function's lines works out, and each line that syncs gets
-//! the SYNC_OUT it needs defined before it. that keeps a call from storing
-//! every register the function ever writes, and lets the compiler drop the
-//! loads of the registers a function writes before it reads them.
+//! the context must be complete whenever anything else can look at it
+//! a call, the interpreter, a short vector, a return, an svc, a dispatch jump, the budget running out
+//! SYNC_OUT stores the locals there and SYNC_IN takes them all back after
+//! SYNC_OUT only stores locals that may have changed since the context last had them (one pass over the lines works that out)
+//! and each syncing line gets its own SYNC_OUT defined right b4 it
+//! so a call doesn't store every reg the func ever writes, and the compiler can drop loads of regs written b4 they're read
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-/// what puts the default SYNC_OUT, SYNC_IN, BUDGET_LEFT, page tables and
-/// fpscr back after a function, for whatever follows it in the file.
+/// puts the default SYNC_OUT, SYNC_IN, BUDGET_LEFT, page tables and fpscr back after a func, for whatever comes next in the file
 pub const RESET: &str = "#undef SYNC_OUT\n#undef SYNC_IN\n#undef BUDGET_LEFT\n#undef READ_PAGES\n#undef WRITE_PAGES\n#undef FPSCR\n\
 #define SYNC_OUT() do { } while (0)\n#define SYNC_IN() do { } while (0)\n#define BUDGET_LEFT ctx->budget\n\
 #define READ_PAGES(c) ((c)->read_pages)\n#define WRITE_PAGES(c) ((c)->write_pages)\n#define FPSCR(c) (*(c)->fpscr)\n";
 
-/// the conditions recomp.h spells with the context's flags, spelled with
-/// the locals, and the flags each reads.
+/// the conditions recomp.h spells w/ the context's flags, spelled w/ the locals, plus the flags each reads
 const CONDITIONS: &[(&str, &str, &str)] = &[
     ("C_EQ", "(flag_z_)", "z"),
     ("C_NE", "(!flag_z_)", "z"),
@@ -43,28 +37,26 @@ const CONDITIONS: &[(&str, &str, &str)] = &[
 
 const ASSIGNMENTS: &[&str] = &["<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--"];
 
-/// the words that make what follows them run only sometimes.
+/// words that make what follows run only sometimes
 const GUARDS: &[&str] = &["if", "else", "switch", "case", "for", "while"];
 
-/// the locals are numbered r0 to r15, then the flags, then s0 to s31, then
-/// fpscr.
+/// locals go r0 to r15, then the flags, then s0 to s31, then fpscr
 const FLAGS: [char; 4] = ['n', 'z', 'c', 'v'];
 const FLAG: usize = 16;
 const VFP: usize = 20;
 const FPSCR: usize = 52;
 
-/// a set of locals, a bit for each.
+/// a set of locals, a bit each
 type Set = u64;
 
-/// the ways out of a function for the budget, one for each of the most
-/// common sets of locals to store, and one more for all the others.
+/// budget exits per func, one per common set of locals to store plus a catchall
 const EXITS: usize = 16;
 
 fn identifier(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// the local numbered index, its type, and where it lives in the context.
+/// local number index, its type, and where it lives in the context
 fn local(index: usize) -> (String, &'static str, String) {
     match index {
         0..FLAG => (format!("reg{index}_"), "uint32_t", format!("ctx->r[{index}]")),
@@ -77,8 +69,7 @@ fn local(index: usize) -> (String, &'static str, String) {
     }
 }
 
-/// a SYNC_OUT that stores the locals in set, and the budget when the
-/// function counts one.
+/// a SYNC_OUT storing the locals in set, plus the budget when the func counts one
 fn sync_out(set: Set, budget: bool) -> String {
     let mut stores = String::new();
     for index in (0..=FPSCR).filter(|index| set & (1 << index) != 0) {
@@ -91,18 +82,17 @@ fn sync_out(set: Set, budget: bool) -> String {
     format!("#undef SYNC_OUT\n#define SYNC_OUT() do {{ {stores}}} while (0)\n")
 }
 
-/// how a local is used where it appears.
+/// how a local gets used where it shows up
 #[derive(Clone, Copy, PartialEq)]
 enum Use {
     Read,
-    /// an assignment, which replaces the value.
+    /// an assignment, replaces the value
     Assign,
-    /// a compound assignment, an increment or its address taken, which read
-    /// the value and may change it.
+    /// a compound assignment, increment, or its addr taken, reads the value and may change it
     Modify,
 }
 
-/// how the token ending at end, and starting at start, is used.
+/// how the token from start to end gets used
 fn usage(text: &[u8], start: usize, end: usize) -> Use {
     let after = &text[end..];
     let skipped = after.iter().take_while(|b| **b == b' ').count();
@@ -119,54 +109,48 @@ fn usage(text: &[u8], start: usize, end: usize) -> Use {
     if address || before.ends_with(b"++") || before.ends_with(b"--") { Use::Modify } else { Use::Read }
 }
 
-/// the number text starts with, and how many digits it has.
+/// the number text starts with and how many digits it has
 fn number(text: &[u8]) -> Option<(u32, usize)> {
     let digits = text.iter().take_while(|b| b.is_ascii_digit()).count();
     let value = std::str::from_utf8(&text[..digits]).ok()?.parse().ok()?;
     Some((value, digits))
 }
 
-/// the register number after prefix in text, and where what follows it
-/// starts, when text is prefix, a number and then close.
+/// the reg number after prefix in text and where the rest starts, when text is prefix, number, close
 fn indexed(text: &[u8], prefix: &str, close: &str) -> Option<(u32, usize)> {
     let rest = text.strip_prefix(prefix.as_bytes())?;
     let (value, digits) = number(rest)?;
     rest[digits..].starts_with(close.as_bytes()).then_some((value, prefix.len() + digits + close.len()))
 }
 
-/// what a line does that matters to which locals the context is behind on,
-/// and to which ones the code still reads.
+/// what a line does that matters for which locals the context lags on and which ones the code still reads
 enum Event {
-    /// a local's value is used.
+    /// a local's value gets read
     Read(usize),
-    /// a local takes a new value, the whole of it when true.
+    /// a local gets a new value, all of it when true
     Write(usize, bool),
-    /// the end of a statement, the reads in it come before its writes.
+    /// end of a statement, its reads come b4 its writes
     Boundary,
-    /// the context has to be complete for a call, the interpreter, an svc
-    /// or a short vector, and the locals are taken again after it.
+    /// the context must be complete for a call, the interpreter, an svc or a short vector, locals get reloaded after
     Sync,
-    /// leaving the function by a return, with the context complete.
+    /// leaving by a return w/ the context complete
     Leave,
-    /// a jump through dispatch, which syncs first, so the labels it reaches
-    /// start with the context complete.
+    /// a dispatch jump, syncs first so the labels it reaches start w/ the context complete
     Dispatch,
-    /// a jump to one of the function's labels.
+    /// a jump to one of the func's labels
     Goto(String),
-    /// a block's budget check.
+    /// a block's budget check
     Budget,
 }
 
-/// a line of the function, its locals in place, and what it does in order,
-/// each with whether a condition guards it so that it may not happen.
+/// a line of the func w/ its locals swapped in, and what it does in order, each w/ whether a condition guards it
 struct Line {
     text: String,
     label: Option<String>,
     events: Vec<(Event, bool)>,
 }
 
-/// where the scan stands in the function's blocks, whether a condition
-/// guards each open brace, and whether one guards the current statement.
+/// where the scan is in the func's blocks, whether a condition guards each open brace and the current statement
 #[derive(Default)]
 struct Blocks {
     open: Vec<bool>,
@@ -179,8 +163,7 @@ impl Blocks {
     }
 }
 
-/// a line with the registers, flags, VFP registers and fpscr it touches as
-/// locals, adding each to used.
+/// a line w/ the regs, flags, VFP regs and fpscr it touches as locals, adding each to used
 fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
     let text = line.as_bytes();
     let trimmed = line.trim();
@@ -195,7 +178,7 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
     let mut events = Vec::new();
     let mut i = 0;
     let mut copied = 0;
-    // puts with in place of the text from i to end, and goes on after it
+    // swaps with in for the text from i to end and goes on after it
     macro_rules! swap {
         ($end:expr, $($with:tt)*) => {{
             let end = $end;
@@ -216,7 +199,7 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             events.push((Event::Write($index, true), blocks.guarded()))
         };
     }
-    // a local used as usage says
+    // a local used however usage says
     macro_rules! touch {
         ($index:expr, $usage:expr) => {
             match $usage {
@@ -231,7 +214,7 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
     }
     while i < text.len() {
         let rest = &text[i..];
-        // the comment before each instruction, its address and opcode
+        // the comment b4 each instr, its addr and opcode
         if rest.starts_with(b"/*") {
             i += rest.windows(2).position(|w| w == b"*/").map_or(rest.len(), |at| at + 2);
             continue;
@@ -307,8 +290,7 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
                 read!(VFP + 2 * d as usize + 1);
                 swap!(i + length, "vfp_from_d(vfp{}_, vfp{}_)", 2 * d, 2 * d + 1);
             }
-            // the value that follows closes what replaces the start, and
-            // the flush reads fpscr
+            // the value that follows closes what replaces the start, and the flush reads fpscr
             if let Some((n, length)) = indexed(rest, "vfp_set_s(ctx, ", ", ") {
                 *used |= 1 << (VFP + n as usize) | 1 << FPSCR;
                 read!(FPSCR);
@@ -342,8 +324,7 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
             b"BLOCK" => events.push((Event::Budget, guarded)),
             b"goto" if rest.starts_with(b"goto dispatch;") => {
                 events.push((Event::Dispatch, guarded));
-                // one statement still, should it follow a bare if, and the
-                // statement ends with it
+                // still one statement in case it follows a bare if, and the statement ends w/ it
                 blocks.statement = false;
                 swap!(i + 14, "{{ SYNC_OUT(); goto dispatch; }}");
             }
@@ -359,29 +340,27 @@ fn scan(line: &str, used: &mut Set, blocks: &mut Blocks) -> Line {
     Line { text: out, label, events }
 }
 
-/// the body with the registers, flags and fpscr it uses in locals, loaded
-/// first, SYNC_IN defined for them, and before each line that syncs the
-/// SYNC_OUT it needs.
+/// the body w/ the regs, flags and fpscr it uses in locals, loaded first
+/// SYNC_IN defined for them and the right SYNC_OUT b4 each syncing line
 pub fn keep(body: &str) -> String {
     let mut used: Set = 0;
     let mut blocks = Blocks::default();
     let lines: Vec<Line> = body.lines().map(|line| scan(line, &mut used, &mut blocks)).collect();
     let budget = lines.iter().any(|line| line.events.iter().any(|(event, _)| matches!(event, Event::Budget)));
 
-    // which locals the context may be behind on where each line starts,
-    // and what each line's syncs store. a jump to a label carries what it
-    // was behind on there, dispatch starts with nothing behind, and a sync
-    // that surely happens, nothing guarding it, leaves nothing behind.
+    // which locals the context may lag on where each line starts, and what each line's syncs store
+    // a jump to a label carries what it lagged on there, dispatch starts w/ nothing behind
+    // and a sync that surely happens (nothing guarding it) leaves nothing behind
     let labels: BTreeMap<&str, usize> =
         lines.iter().enumerate().filter_map(|(i, line)| line.label.as_deref().map(|label| (label, i))).collect();
     let mut jumped = vec![0 as Set; lines.len()];
     let mut stores: Vec<Option<Set>> = vec![None; lines.len()];
     let mut budgets: Vec<Option<Set>> = vec![None; lines.len()];
-    // whether execution can go on from the end of each line to the next
+    // can execution fall from the end of each line into the next
     let mut falls = vec![true; lines.len()];
     loop {
         let mut changed = false;
-        // the function starts with the context complete
+        // the func starts w/ the context complete
         let mut falling = Some(0);
         for (i, line) in lines.iter().enumerate() {
             let mut behind = falling.unwrap_or(0) | jumped[i];
@@ -423,11 +402,10 @@ pub fn keep(body: &str) -> String {
         }
     }
 
-    // which locals the code may still read where each line starts, going
-    // backwards. everything that syncs reads them all, a jump reads what its
-    // label does, and a write only ends a value's life when nothing guards
-    // it and it replaces the whole of it. a budget check notes what is live
-    // just after it, all its way out has to store.
+    // which locals the code may still read where each line starts, going backwards
+    // anything that syncs reads them all, a jump reads what its label does
+    // a write only kills a value when nothing guards it and it replaces all of it
+    // a budget check notes what's live right after it, its exit has to store all that
     let all = used;
     let mut live_in = vec![0 as Set; lines.len()];
     let mut live_at_budget = vec![all; lines.len()];
@@ -437,7 +415,7 @@ pub fn keep(body: &str) -> String {
             let mut live = if falls[i] { live_in.get(i + 1).copied().unwrap_or(0) } else { 0 };
             let (mut reads, mut kills): (Set, Set) = (0, 0);
             for (event, guarded) in line.events.iter().rev() {
-                // a statement's reads come before its writes
+                // a statement's reads come b4 its writes
                 if !matches!(event, Event::Read(_) | Event::Write(..)) {
                     live = (live & !kills) | reads;
                     (reads, kills) = (0, 0);
@@ -490,8 +468,7 @@ pub fn keep(body: &str) -> String {
         writeln!(prologue, "    int32_t budget_ = ctx->budget;\n#undef BUDGET_LEFT\n#define BUDGET_LEFT budget_").unwrap();
         loads.push("budget_ = ctx->budget;".to_owned());
     }
-    // the page tables only ever get read, and anything that could change
-    // which ones the code uses is something it syncs around
+    // page tables only get read, and anything that could swap them out is something it syncs around
     if body.contains("mem_") {
         writeln!(prologue, "    uint8_t *const *read_pages_ = ctx->read_pages, *const *write_pages_ = ctx->write_pages;").unwrap();
         writeln!(prologue, "#undef READ_PAGES\n#undef WRITE_PAGES\n#define READ_PAGES(c) read_pages_\n#define WRITE_PAGES(c) write_pages_").unwrap();
@@ -499,10 +476,8 @@ pub fn keep(body: &str) -> String {
     }
     writeln!(prologue, "#define SYNC_IN() do {{ {} }} while (0)", loads.join(" ")).unwrap();
 
-    // a block the budget stops stores what is behind there and still read
-    // from there on, r15 aside, which the way out sets. the blocks share a
-    // way out for each such set, the most common ones, and the rest share
-    // one that stores what any of them needs
+    // a block the budget stops stores what's behind there and still read later (r15 aside, the exit sets it)
+    // blocks share an exit per such set (the most common ones) and the rest share one storing what any of them needs
     let exits: Vec<Option<Set>> =
         (0..lines.len()).map(|i| budgets[i].map(|behind| behind & live_at_budget[i] & !(1 << 15))).collect();
     let mut counts: BTreeMap<Set, usize> = BTreeMap::new();
@@ -565,7 +540,7 @@ mod tests {
         assert!(kept.contains("uint8_t flag_v_ = ctx->v;"));
     }
 
-    /// the SYNC_OUT defined right before the first line containing what.
+    /// the SYNC_OUT defined right b4 the first line containing what
     fn sync_before<'a>(kept: &'a str, what: &str) -> &'a str {
         let at = kept.find(what).expect("the line");
         let define = kept[..at].rfind("#define SYNC_OUT() ").expect("a SYNC_OUT");
@@ -585,7 +560,7 @@ mod tests {
         );
         assert_eq!(sync_before(&kept, "CALL_RETURNING(f_00300000"), "#define SYNC_OUT() do { ctx->r[0] = reg0_; ctx->budget = budget_; } while (0)");
         assert_eq!(sync_before(&kept, "RETURN();"), "#define SYNC_OUT() do { ctx->r[15] = reg15_; ctx->budget = budget_; } while (0)");
-        // nothing changed yet where the budget is checked
+        // nothing changed yet where the budget gets checked
         assert!(kept.contains("BLOCK_TO(0x00100000u, 6, out_of_budget_0);"));
         assert_eq!(sync_before(&kept, "OUT_OF_BUDGET_AT(out_of_budget_0);"), "#define SYNC_OUT() do { ctx->budget = budget_; } while (0)");
     }

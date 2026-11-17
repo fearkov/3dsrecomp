@@ -1,6 +1,5 @@
-//! recompiling a title from end to end, writing the C, compiling it and
-//! installing the library, for the command line and for programs that run
-//! it themselves and follow it through its events.
+//! recompiles a title end to end, writes the C, compiles it, installs the lib
+//! for the cli and for programs that run it themselves and follow its events
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,49 +11,45 @@ use crate::overrides::{self, Override};
 use crate::rom::Title;
 use crate::{abi, codegen, compile, Mods};
 
-/// what happens along the way.
+/// what happens along the way
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// the C is written.
+    /// the C got written
     Generated { files: usize, bytes: usize, overrides: usize },
-    /// something worth knowing that does not stop it.
+    /// smth worth knowing that doesn't stop it
     Note(String),
     Compiled { done: usize, total: usize },
-    /// the library is linked.
+    /// the lib got linked
     Built { library: PathBuf, took: Duration },
     Installed(PathBuf),
 }
 
-/// what a build is to do.
+/// what a build should do
 #[derive(Default)]
 pub struct Options<'a> {
-    /// where to work, the cache when none, and then the library gets
-    /// installed where hosts find it.
+    /// where to work (the cache if none), then the lib gets installed where hosts find it
     pub dir: Option<&'a Path>,
-    /// C files of functions written by hand, see docs/overrides.md.
+    /// C files of handwritten funcs, see docs/overrides.md
     pub overrides: Option<&'a Path>,
-    /// set from elsewhere to stop it.
+    /// set from elsewhere to stop it
     pub cancel: Option<&'a AtomicBool>,
-    /// the code and modules a mod changes, recompiled in place of the
-    /// title's own.
+    /// code and modules a mod changes, recompiled instead of the title's own
     pub mods: Mods<'a>,
-    /// the C compiler, the one CC names or the first there is when none.
+    /// the C compiler, whatever CC names or the first one around
     pub compiler: Option<compile::Compiler>,
-    /// compile below normal priority and leave a core, for a game being
-    /// played meanwhile.
+    /// compile below normal priority and leave a core free, for when you're playing meanwhile
     pub background: bool,
 }
 
-/// the title's code written as C.
+/// the title's code as C
 pub struct Generated {
     pub title: Title,
     pub dir: PathBuf,
-    /// the files to compile, names inside dir.
+    /// files to compile, names inside dir
     pub sources: Vec<String>,
 }
 
-/// writes the title at rom as C in the dir pick chooses, the overrides with
-/// it, and what the mods change in place of the title's own code and files.
+/// writes the title at rom as C in the dir pick chooses, overrides included, plus what mods swap in for the title's own code and files
 pub fn generate(
     rom: &Path,
     pick: impl FnOnce(&Title) -> PathBuf,
@@ -71,9 +66,8 @@ pub fn generate(
     };
     let mut replaced: Vec<Override> = files.iter().flat_map(|file| file.overrides.iter().cloned()).collect();
     let by_hand = replaced.len();
-    // the C library's divisions run on the host, as overrides of their own,
-    // unless one written by hand takes the address. the modules call the
-    // executable's
+    // the C lib's divisions run on the host as their own overrides, unless a handwritten one takes the addr
+    // modules call the exe's
     let natives: Vec<natives::Native> = natives::find(&programs[0].1.text)
         .into_iter()
         .filter(|native| !replaced.iter().any(|item| item.module.is_none() && item.address == native.address))
@@ -83,7 +77,7 @@ pub fn generate(
         replaced.extend(overrides::parse(source)?);
         events(Event::Note(format!("{} of the C library's divisions run on the host", natives.len())));
     }
-    // whatever an override replaces has to be generated too, for it to call
+    // whatever an override replaces still gets generated, so it can call it
     for item in &replaced {
         let name = item.module.as_deref().unwrap_or("executable");
         let Some((_, program)) = programs.iter_mut().find(|(program, _)| program == name) else {
@@ -142,8 +136,7 @@ pub fn generate(
     Ok(Generated { title, dir, sources })
 }
 
-/// recompiles the title at rom into a library and returns where it ended
-/// up, installed when the options name no dir.
+/// recompiles the title at rom into a lib and returns where it went, installed when the options give no dir
 pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> Result<PathBuf, String> {
     let compiler = compile::check(options.compiler.as_ref())?;
     let stopped = || options.cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed));
@@ -169,13 +162,10 @@ pub fn build(rom: &Path, options: &Options, events: &(dyn Fn(Event) + Sync)) -> 
     Ok(installed)
 }
 
-/// takes in where the emulator had to interpret the title's last library,
-/// which only ever ran code. the places outside the functions found already
-/// start functions, found by analyzing the executable again, and says how
-/// many. a place inside one adds nothing, discovery already makes a label of
-/// every way the code goes in, branch targets and the returns from calls and
-/// svcs, while Zakuro used to note where it finished a block the budget did
-/// not cover, which as labels split the hot loops into single instructions.
+/// takes in where the emu had to interpret the title's last lib (it only ever ran code)
+/// spots outside the known funcs start new ones, found by analyzing the exe again, returns how many
+/// a spot inside one adds nothing, discovery already labels every way in (branch targets, returns from calls and svcs)
+/// zakuro used to log where it finished a block the budget didn't cover, which as labels split hot loops into single instrs, oops
 pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: &mut [Analysis]) -> usize {
     let Some(index) = programs.iter().position(|(name, _)| name == "executable") else { return 0 };
     let program = &mut programs[index].1;
@@ -197,8 +187,7 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     outside.len()
 }
 
-/// the hinted places none of the functions the analysis found holds, which
-/// start functions of their own, odd for Thumb.
+/// hinted spots no found func holds, they start their own funcs, odd for Thumb
 pub fn new_functions(analysis: &Analysis, hinted: &[u32]) -> Vec<u32> {
     let mut owned = std::collections::HashSet::new();
     for function in analysis.functions.values() {
@@ -208,15 +197,14 @@ pub fn new_functions(analysis: &Analysis, hinted: &[u32]) -> Vec<u32> {
     hinted.iter().copied().filter(|address| !owned.contains(address)).collect()
 }
 
-/// the addresses Zakuro wrote down next to a title's library, those it ran
-/// in its interpreter for want of code, odd for Thumb.
+/// addrs zakuro wrote next to a title's lib, ones it interpreted for lack of code, odd for Thumb
 pub fn hints(program_id: u64) -> Vec<u32> {
     let Some(dir) = abi::library_dir() else { return Vec::new() };
     let path = dir.join(abi::library_name(program_id)).with_extension("hints");
     std::fs::read_to_string(path).map(|text| read_hints(&text)).unwrap_or_default()
 }
 
-/// the addresses in a file of hints.
+/// the addrs in a hints file
 pub fn read_hints(text: &str) -> Vec<u32> {
     text.lines()
         .map(str::trim)
@@ -225,22 +213,20 @@ pub fn read_hints(text: &str) -> Vec<u32> {
         .collect()
 }
 
-/// where players' runs went into code the analysis does not find, gathered
-/// from their hints, by game and by the code they are for.
+/// where players' runs hit code the analysis misses, gathered from their hints, by game and code version
 const BUNDLED: &str = include_str!("../hints.txt");
 
-/// a hash of the code of a title's executable, FNV-1a over its bytes, so
-/// the hints of one revision or update of a game stay out of another's.
+/// hash of a title's exe code (FNV1a over its bytes) so one revision's hints stay out of another's
 pub fn code_hash(program: &Program) -> u64 {
     program.text.bytes.iter().fold(0xCBF2_9CE4_8422_2325, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x0100_0000_01B3))
 }
 
-/// the hints the list has for a title's code.
+/// the list's hints for a title's code
 pub fn bundled(program_id: u64, hash: u64) -> Vec<u32> {
     section(BUNDLED, program_id, hash)
 }
 
-/// the addresses under a list's header for a title's code.
+/// addrs under a list's header for a title's code
 fn section(list: &str, program_id: u64, hash: u64) -> Vec<u32> {
     let mut taking = false;
     let mut found = Vec::new();
@@ -255,7 +241,7 @@ fn section(list: &str, program_id: u64, hash: u64) -> Vec<u32> {
     found
 }
 
-/// where build works on a title whose library it installs.
+/// where build works on a title whose lib it installs
 pub fn cache_dir(program_id: u64) -> PathBuf {
     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
     let base = if cfg!(windows) {
@@ -268,8 +254,7 @@ pub fn cache_dir(program_id: u64) -> PathBuf {
     base.unwrap_or_else(std::env::temp_dir).join("3dsrecomp").join(format!("{program_id:016X}"))
 }
 
-/// copies the library to where hosts look for it, under another name first
-/// so that a host running the old one keeps it.
+/// copies the lib to where hosts look, under another name first so a host running the old one keeps it
 pub fn install(library: &Path, program_id: u64) -> Result<PathBuf, String> {
     let dir = abi::library_dir().ok_or("there is no place to install the library")?;
     let target = dir.join(abi::library_name(program_id));
@@ -282,10 +267,9 @@ pub fn install(library: &Path, program_id: u64) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// moves the library at target out of the way, when there is one. Windows
-/// refuses to replace a library a game being played has loaded, but lets it
-/// be renamed, and the game keeps running it until it loads the new one.
-/// those moved away earlier go when nothing holds them any more.
+/// moves the lib at target out of the way, if there is one
+/// windows refuses to replace a lib a running game loaded but lets you rename it, the game keeps using it till it loads the new one
+/// older moved ones go away once nothing holds them
 fn step_aside(target: &Path) -> std::io::Result<()> {
     if !cfg!(windows) || !target.exists() {
         return Ok(());
@@ -303,8 +287,7 @@ fn step_aside(target: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// a game's hints in the list go to the code they were gathered on, a
-    /// revision or update of it with other code gets none of them.
+    /// a game's hints in the list go to the code they were gathered on, a revision or update w/ other code gets none
     #[test]
     fn the_list_gives_hints_to_the_code_they_are_for() {
         let list = "# a note\n= 0004000000033500 00000000000000AB\n00100000\n00100011\n\n= 0004000000033500 00000000000000AC\n00200000\n";
@@ -334,15 +317,14 @@ mod tests {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
-    /// a piece of code as the tables write it, with the hash of its bytes.
+    /// a piece of code as the tables write it, w/ its bytes' hash
     fn piece(start: u32, end: u32, bytes: &[u8]) -> String {
         let mut hash = abi::CodeHash::default();
         hash.add(bytes);
         format!("{{0x{start:08X}u, 0x{end:08X}u, 0x{:016X}ull}},", hash.value())
     }
 
-    /// the code made with a mod's code and modules says it was made from
-    /// them, so a host running the mod finds none of it stale.
+    /// code made w/ a mod's code and modules says it came from them, so a host running the mod finds nothing stale
     #[test]
     fn generating_with_mods_makes_code_of_what_they_change() {
         let (own, modded) = ([0xE3A0_0000, 0xE12F_FF1E], [0xE3A0_0001, 0xE12F_FF1E]);
@@ -356,7 +338,7 @@ mod tests {
         };
 
         let tables_modded = tables(Mods { code: Some(&code), romfs: Some(&romfs), ..Mods::default() });
-        // the executable's function and the module's, a piece each
+        // the exe's func and the module's, a piece each
         assert!(tables_modded.contains(&piece(0x0010_0000, 0x0010_0008, &code)), "{tables_modded}");
         assert!(tables_modded.contains(&piece(0x200, 0x208, &code)), "{tables_modded}");
         let plain = tables(Mods::default());

@@ -1,5 +1,4 @@
-//! reading CRO modules and the CRS that describes the main executable,
-//! straight from their files.
+//! reads CRO modules and the CRS describing the main exe, straight from their files
 
 use std::collections::BTreeSet;
 
@@ -15,32 +14,29 @@ pub struct Segment {
 pub struct Module {
     pub name: String,
     pub segments: Vec<Segment>,
-    /// exported symbols by name, as segment tags.
+    /// exported symbols by name, as segment tags
     pub exports: Vec<(String, u32)>,
-    /// exported symbols by index, as segment tags.
+    /// exported symbols by index, as segment tags
     pub indexed_exports: Vec<u32>,
-    /// the addresses the module writes into itself when it is loaded.
+    /// addrs the module writes into itself when loaded
     pub relocations: Vec<Relocation>,
-    /// the places that get the addresses of what it imports, whose segment
-    /// field means nothing.
+    /// spots that get the addrs of what it imports, their segment field means nothing
     pub imports: Vec<Relocation>,
-    /// what it takes from other modules without a name, the module and the
-    /// segment tag there.
+    /// what it takes from other modules w/o a name, the module and the segment tag there
     pub anonymous_imports: Vec<(String, u32)>,
 }
 
 pub struct Relocation {
-    /// where the address goes, as a segment tag.
+    /// where the addr goes, as a segment tag
     pub target: u32,
     pub kind: u8,
-    /// the segment the address points into.
+    /// segment the addr points into
     pub segment: u32,
     pub addend: u32,
 }
 
 impl Relocation {
-    /// whether the relocation stores the address itself rather than an
-    /// offset or a branch.
+    /// does the reloc store the addr itself instead of an offset or a branch
     fn is_absolute(&self) -> bool {
         matches!(self.kind, 2 | 38)
     }
@@ -56,8 +52,7 @@ fn cstring(bytes: &[u8], offset: usize) -> String {
     String::from_utf8_lossy(&tail[..end]).into_owned()
 }
 
-/// a table of fixed size entries, from the header fields holding its offset
-/// and its count.
+/// a table of fixed size entries, from the header fields holding its offset and count
 fn table(bytes: &[u8], offset_field: usize, count_field: usize, entry_size: usize) -> Option<Vec<&[u8]>> {
     let offset = field(bytes, offset_field)? as usize;
     let count = field(bytes, count_field)? as usize;
@@ -88,8 +83,7 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
     };
     let relocations = table(bytes, 0x128, 0x12C, 12)?.into_iter().map(relocation).collect();
     let imports = table(bytes, 0xF8, 0xFC, 12)?.into_iter().map(relocation).collect();
-    // each module imported from names its anonymous symbols, a table of a
-    // segment tag and the first place it goes
+    // each module imported from names its anonymous symbols, a table of segment tag plus first spot it goes
     let mut anonymous_imports = Vec::new();
     for entry in table(bytes, 0xF0, 0xF4, 20)? {
         let module = cstring(bytes, word(entry, 0) as usize);
@@ -109,13 +103,13 @@ pub fn parse(bytes: &[u8]) -> Option<Module> {
     })
 }
 
-/// the segment types holding code and holding zeros.
+/// segment types holding code and holding zeros
 const CODE: u32 = 0;
 #[cfg(feature = "verify")]
 const BSS: u32 = 3;
 
 impl Module {
-    /// the addresses of the exported symbols that sit in code.
+    /// addrs of the exported symbols that live in code
     pub fn code_exports(&self) -> Vec<u32> {
         let named = self.exports.iter().map(|(_, tag)| *tag);
         named
@@ -125,21 +119,20 @@ impl Module {
             .collect()
     }
 
-    /// the address a segment tag points at when it is in code.
+    /// addr a segment tag points at when it's in code
     pub fn code_address(&self, tag: u32) -> Option<u32> {
         self.is_code(tag & 0xF).then(|| self.resolve(tag)).flatten()
     }
 
-    /// the address a segment tag points at, given where each segment lives.
+    /// addr a segment tag points at, given where each segment lives
     pub fn resolve(&self, tag: u32) -> Option<u32> {
         let segment = self.segments.get((tag & 0xF) as usize)?;
         let offset = tag >> 4;
         (offset < segment.size).then(|| segment.offset + offset)
     }
 
-    /// the module as it looks loaded at base, its bss after the file and
-    /// its relocations applied, for running it without a loader. everything
-    /// it imports points at stub.
+    /// the module as it looks loaded at base, bss after the file and relocs applied, for running it w/o a loader
+    /// everything it imports points at stub
     #[cfg(feature = "verify")]
     pub fn image(&self, bytes: &[u8], base: u32, stub: u32) -> Vec<u8> {
         let bss = (bytes.len() as u32).next_multiple_of(0x1000);
@@ -170,10 +163,8 @@ impl Module {
         self.segments.get(segment as usize).is_some_and(|s| s.kind == CODE)
     }
 
-    /// the module's code as discovery sees it, at its offsets in the file
-    /// with the code addresses its relocations store filled in. bytes is the
-    /// whole file, where the stored addresses are still zero, and imported
-    /// the code addresses other modules take from it.
+    /// the module's code as discovery sees it, at its file offsets w/ the code addrs its relocs store filled in
+    /// bytes is the whole file (stored addrs still zero), imported are the code addrs other modules take from it
     pub fn program(&self, bytes: &[u8], imported: &[u32]) -> Option<Program> {
         let segment = self.segments.iter().find(|s| s.kind == CODE && s.size > 0)?;
         let range = segment.offset as usize..(segment.offset + segment.size) as usize;
@@ -181,8 +172,7 @@ impl Module {
 
         let mut seeds: Vec<_> = self.code_exports().into_iter().map(|address| (address, Source::Export)).collect();
         seeds.extend(imported.iter().map(|&address| (address, Source::Import)));
-        // every word in the code that a relocation or an import fills in is
-        // data, whatever it points at
+        // every code word a reloc or import fills in is data, whatever it points at
         let (start, end) = (text.base, text.end());
         let slot = |relocation: &Relocation| {
             self.resolve(relocation.target).filter(|&t| relocation.is_absolute() && t >= start && t + 4 <= end)
@@ -205,14 +195,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::discover;
 
-    /// a module called name, its code the words at 0x200, exporting where
-    /// that starts.
+    /// a module called name, code is the words at 0x200, exporting where that starts
     pub(crate) fn named(name: &str, code: &[u32]) -> Vec<u8> {
         let mut bytes = vec![0; 0x200 + code.len() * 4];
         let mut put = |at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
         put(0x80, u32::from_le_bytes(*b"CRO0"));
         put(0xC0, 0x180);
-        // one segment, the code, and one export by index, its start
+        // one segment (the code) and one export by index, its start
         put(0xC8, 0x138);
         put(0xCC, 1);
         put(0x138, 0x200);
@@ -226,9 +215,8 @@ pub(crate) mod tests {
         bytes
     }
 
-    /// a module with a header, a code segment at 0x200 and a data segment
-    /// at 0x300, holding the code words and one relocation per pointer, each
-    /// as (segment tag of the slot, offset in code).
+    /// a module w/ a header, code at 0x200 and data at 0x300, holding the code words and one reloc per pointer
+    /// each as (segment tag of the slot, offset in code)
     fn module(code: &[u32], pointers: &[(u32, u32)]) -> Vec<u8> {
         let mut bytes = vec![0; 0x400];
         let mut put = |at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
@@ -255,14 +243,12 @@ pub(crate) mod tests {
         bytes
     }
 
-    /// a module names what it takes from another module without a name as
-    /// that module's segment tags, which lead into its code.
+    /// a module names what it takes from another w/o a name as that module's segment tags, leading into its code
     #[test]
     fn anonymous_imports_lead_into_the_other_module() {
         let mut bytes = module(&[0xE12F_FF1E; 8], &[]);
         let mut put = |at: usize, value: u32| bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-        // one module imported from, with one anonymous symbol, segment 0
-        // at offset 0x10
+        // one module imported from, w/ one anonymous symbol, segment 0 at offset 0x10
         put(0xF0, 0x380);
         put(0xF4, 1);
         put(0x380, 0x3A0);

@@ -1,6 +1,5 @@
-//! finding the code in a program. functions are found from the entry points
-//! by following calls and branches, and from words elsewhere that point into
-//! the code, which is where vtables and callbacks live.
+//! finds the code, starting at the entry points and following calls and branches
+//! plus any word pointing into code, that's where vtables and callbacks hide
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -12,23 +11,20 @@ use crate::thumb;
 pub enum Source {
     Entry,
     Call,
-    /// a code address stored in a literal pool or in the data segments.
+    /// a code addr sitting in a literal pool or in data
     Pointer,
-    /// a symbol the program exports to other modules.
+    /// exported for other modules
     Export,
-    /// a code address a module's relocations store, in its vtables, jump
-    /// tables and literal pools.
+    /// a code addr some module's relocs store (vtables, jump tables, literal pools)
     Relocation,
-    /// a code address another module takes from this one without a name.
+    /// a code addr another module grabs from us w/o a name
     Import,
-    /// the start of a gap nothing led to, or a push in one, which is how
-    /// functions reached only through tables nobody can see begin.
+    /// start of a gap nobody reached, or a push inside one
+    /// that's how funcs only reachable thru invisible tables show up
     Scan,
-    /// an address a function written by hand replaces, which its author
-    /// says is code.
+    /// an addr a handwritten func replaces, its author swears it's code
     Override,
-    /// an address Zakuro had to interpret with the title's last library,
-    /// code nothing else led to.
+    /// an addr zakuro had to interpret w/ the title's last lib, nothing else led there
     Hint,
 }
 
@@ -38,7 +34,7 @@ pub enum Mode {
     Thumb,
 }
 
-/// the bit of Discovery::modes for code in mode.
+/// bit for mode in Discovery::modes
 fn mode_bit(mode: Mode) -> u8 {
     match mode {
         Mode::Arm => 1,
@@ -59,14 +55,13 @@ impl Mode {
 pub struct Function {
     pub source: Source,
     pub mode: Mode,
-    /// the address of every instruction, in order.
+    /// every instruction addr, in order
     pub instructions: Vec<u32>,
-    /// where execution can enter the function's code, its entry, the
-    /// targets of its branches and the instructions after calls and svc.
+    /// where we can come in, the entry, branch targets and right after calls and svc
     pub labels: BTreeSet<u32>,
 }
 
-/// what each byte of the text segment turned out to be.
+/// what each text byte turned out to be
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Byte {
     Unknown,
@@ -80,7 +75,7 @@ pub struct Analysis {
     pub indirect_sites: usize,
     pub jump_tables: usize,
     pub svc_sites: usize,
-    /// paths abandoned because they ran into something that cannot be code.
+    /// paths dropped bc they hit something that can't be code
     pub dead_ends: usize,
 }
 
@@ -89,7 +84,7 @@ impl Analysis {
         self.map.iter().filter(|&&byte| byte == kind).count()
     }
 
-    /// the longest runs of text nobody reached, as (start, length).
+    /// longest unreached runs of text as (start, length)
     pub fn largest_gaps(&self, base: u32, count: usize) -> Vec<(u32, usize)> {
         let mut gaps = Vec::new();
         let mut start = None;
@@ -109,53 +104,41 @@ impl Analysis {
     }
 }
 
-/// a piece of code to analyze and what is known about it up front.
+/// a chunk of code to analyze plus what we know upfront
 pub struct Program {
     pub text: Segment,
-    /// addresses that may start functions and how each is known, odd for
-    /// Thumb.
+    /// addrs that may start funcs and how we know, odd means Thumb
     pub seeds: Vec<(u32, Source)>,
-    /// the words in the code that hold addresses, when relocations say
-    /// exactly which ones they are. without them any literal that lands in
-    /// the code is taken for a pointer.
+    /// words in the code holding addrs, when relocs say exactly which
+    /// w/o them any literal landing in code counts as a pointer
     pub slots: Option<BTreeSet<u32>>,
 }
 
-/// instructions past which a function grew by following tail calls into
-/// other functions rather than by what one function holds. compilers make
-/// few near it, Monster Hunter 3 Ultimate's tail calls led one function
-/// through 62,000 instructions of others, which a C compiler then spent
-/// most of a build on.
+/// past this many instructions a func grew by chasing tail calls, not its own code
+/// MH3U had one chain thru 62k instructions and the C compiler cried for most of a build
 const HUGE: usize = 10_000;
 
-/// how far a branch of a huge function goes before it is taken for a tail
-/// call, a function's own branches stay closer.
+/// how far a huge func's branch goes b4 we call it a tail call, real branches stay closer
 const FAR: u32 = 0x4000;
 
-/// the shortest code a guess leads to that is judged on whether it looks
-/// like code, for ARM and for Thumb. shorter is cheap to keep either way.
+/// shortest guess we judge on looks, for ARM and Thumb, shorter ones are cheap to keep anyway
 const JUDGED_ARM: usize = 16;
 const JUDGED_THUMB: usize = 9;
 
-/// how much of a guess's ARM code may be conditional, four fifths, over all
-/// of it and over its first instructions from the entry. what a compiler
-/// made stays under it in every title looked at, other bytes taken for ARM
-/// have a condition in whatever their top four bits are, and code that is
-/// really Thumb or text is nearly all of it conditional.
+/// max share of a guess's ARM code that's conditional, 4/5 overall and at the start
+/// compiler code stays under it in every title we checked, junk read as ARM has random cond bits
+/// and real Thumb or text read as ARM is basically all conditional
 const MOST_CONDITIONAL: usize = 4;
 const ARM_START: usize = 32;
 
-/// how many of a guess's first Thumb instructions are looked at for a push, a
-/// branch, a call or a return, which text taken for Thumb never has.
+/// how many first Thumb instrs we check for a push branch call or ret, text read as Thumb never has those
 const THUMB_FLOW_WITHIN: usize = 64;
 
-/// somewhere to explore, how it was found, and whether something sure led
-/// there rather than a guess.
+/// a place to explore, how we found it, and whether smth sure led there or just a guess
 type Lead = (u32, Mode, Source, bool);
 
-/// what exploring a guess did, held until it turns out to be code: the bytes
-/// it marked, with what each was before, where it leads, where it joined
-/// other code, and the tail calls split_huge noted on the way.
+/// what exploring a guess did, held till it proves to be code
+/// bytes it marked (w/ their old values), where it leads, where it joined others, tail calls split_huge noted
 #[derive(Default)]
 struct Trial {
     marked: Vec<(usize, Byte, u8)>,
@@ -168,30 +151,25 @@ struct Discovery<'a> {
     text: &'a Segment,
     slots: Option<&'a BTreeSet<u32>>,
     analysis: Analysis,
-    /// function entries a branch goes to as a tail call rather than as
-    /// more of the function, while huge ones are explored again.
+    /// func entries a branch hits as a tail call instead of more of this func, while huge ones get redone
     entries: Option<BTreeSet<u32>>,
     queue: VecDeque<Lead>,
-    /// pointers found in data, followed only once nothing surer is left.
+    /// pointers found in data, only followed once nothing surer is left
     guesses: VecDeque<Lead>,
-    /// whether the function being explored came from a guess, so that what
-    /// it leads to is only a guess too.
+    /// whether the func being explored came from a guess, then whatever it leads to is a guess too
     guessing: bool,
-    /// set while a guess is explored for the first time.
+    /// set while a guess gets its first look
     trial: Option<Trial>,
-    /// the guesses that came to nothing, by entry and mode.
+    /// guesses that went nowhere, by entry and mode
     rejected: BTreeSet<(u32, Mode)>,
-    /// the functions that came from guesses.
+    /// funcs that came from guesses
     guessed: BTreeSet<u32>,
-    /// for each byte of the text, whether some function decoded it as ARM
-    /// code, bit 0, and as Thumb code, bit 1.
+    /// per text byte, bit 0 if some func decoded it as ARM, bit 1 as Thumb
     modes: Vec<u8>,
-    /// where guesses ran into code other functions hold, or pointed into it,
-    /// which become labels of those functions, so that the host goes on there
-    /// in recompiled code, and places split_huge may cut at.
+    /// where guesses ran into (or pointed into) other funcs' code
+    /// those become labels so the host can go on there in recompiled code, and split_huge can cut there
     joins: BTreeSet<(u32, Mode)>,
-    /// where the paths of a function that came from a guess stop, because
-    /// the code there is another function's, kept for exploring it again.
+    /// where a guessed func's paths stop bc another func owns the code, kept for the next look
     cuts: BTreeMap<u32, BTreeSet<u32>>,
 }
 
@@ -218,7 +196,7 @@ pub fn analyze(program: &Program) -> Analysis {
         joins: BTreeSet::new(),
         cuts: BTreeMap::new(),
     };
-    // where relocations say the code holds data, it cannot be code
+    // relocs say data lives here, so not code
     for &slot in program.slots.iter().flatten() {
         discovery.mark(slot, 4, Byte::Literal);
     }
@@ -226,8 +204,7 @@ pub fn analyze(program: &Program) -> Analysis {
         discovery.code_pointer(address, source);
     }
     discovery.run();
-    // once nothing surer is left, the gaps get looked at for how functions
-    // begin, each round of them can lead to more
+    // once nothing surer is left, gaps get checked for func starts, each round can find more
     loop {
         let starts = discovery.gap_starts();
         if starts.is_empty() {
@@ -242,19 +219,17 @@ pub fn analyze(program: &Program) -> Analysis {
 }
 
 impl Discovery<'_> {
-    /// explores the huge functions again, now that every function is known,
-    /// their branches to other functions' entries and far away going to
-    /// functions there as tail calls instead of taking their code in, and
-    /// the functions those are explored the same way.
+    /// redoes huge funcs now that every func is known
+    /// branches to other entries or far away become tail calls, and their targets get the same treatment
     fn split_huge(&mut self) {
         let huge: Vec<(u32, Mode)> =
             self.analysis.functions.iter().filter(|(_, f)| f.instructions.len() > HUGE).map(|(&entry, f)| (entry, f.mode)).collect();
         if huge.is_empty() {
             return;
         }
-        // what exploring counts was counted the first time
+        // already counted on the first pass
         let counts = self.counts();
-        // and where guesses showed other code begins
+        // plus where guesses showed other code starts
         self.entries = Some(self.analysis.functions.keys().copied().chain(self.joins.iter().map(|&(address, _)| address)).collect());
         let mut huge = huge;
         for _ in 0..4 {
@@ -267,7 +242,7 @@ impl Discovery<'_> {
                     function.labels = labels;
                 }
             }
-            // the functions the tail calls lead to, explored the same way
+            // the funcs those tail calls hit, same deal
             self.run();
             let still: Vec<(u32, Mode)> =
                 self.analysis.functions.iter().filter(|(_, f)| f.instructions.len() > HUGE).map(|(&entry, f)| (entry, f.mode)).collect();
@@ -285,20 +260,16 @@ impl Discovery<'_> {
             if self.analysis.functions.contains_key(&entry) {
                 continue;
             }
-            // a guess is tried before it counts, but the pieces a huge
-            // function is split into, the tail calls it is cut at, are its
-            // own code, already taken
+            // a guess gets tried b4 it counts, but the pieces of a huge func (cut at its tail calls) are its own code, already taken
             let piece = self.entries.as_ref().is_some_and(|entries| entries.contains(&entry));
             let judged = !sure && !piece;
-            // a guess into a literal is data, and one into code a function
-            // holds in the same mode would only copy that code from there
-            // on. code in the other mode is left to looks_like_code, as text
-            // or a wrong guess may have been taken for it
+            // a guess into a literal is data, and one into code held in the same mode would just copy it
+            // code in the other mode goes to looks_like_code, could be text or a bad guess
             let held = self.holds(entry, mode);
             let taken = self.byte(entry) == Byte::Literal || held;
             if judged && (taken || self.rejected.contains(&(entry, mode))) {
                 if held {
-                    // in case the pointer is real, the host can go on there
+                    // in case the pointer's real, the host can go on there
                     self.joins.insert((entry, mode));
                 }
                 self.rejected.insert((entry, mode));
@@ -311,8 +282,7 @@ impl Discovery<'_> {
             self.guessing = false;
             if let Some(trial) = self.trial.take() {
                 if !self.looks_like_code(entry, mode, &instructions, !trial.joins.is_empty()) {
-                    // not code, so what exploring it marked and counted goes
-                    // back, and where it led is never looked at
+                    // not code, so undo what exploring marked and counted, and never look where it led
                     for (offset, byte, modes) in trial.marked.into_iter().rev() {
                         self.analysis.map[offset] = byte;
                         self.modes[offset] = modes;
@@ -341,17 +311,14 @@ impl Discovery<'_> {
         }
     }
 
-    /// whether what a guess led to looks like code. ARM code a compiler made
-    /// runs most of its instructions unconditionally, and Thumb code pushes,
-    /// branches, calls or returns within its first few dozen instructions,
-    /// or goes on into code another function holds, while text taken for
-    /// Thumb is all loads, stores, moves and arithmetic.
+    /// does what a guess led to look like code
+    /// compiler ARM is mostly unconditional, Thumb pushes, branches, calls or returns within a few dozen instrs (or runs into other code)
+    /// text read as Thumb is all loads, stores, moves and math
     fn looks_like_code(&self, entry: u32, mode: Mode, instructions: &[u32], joins: bool) -> bool {
         let from_entry = instructions.partition_point(|&address| address < entry);
         match mode {
             Mode::Arm => {
-                // 0xF counts too: blx to Thumb and pld have it there, but so
-                // do the halves of Thumb's bl taken for ARM, far more often
+                // 0xF counts too, blx to Thumb and pld use it, but so do Thumb bl halves read as ARM, way more often
                 let mostly_unconditional = |instructions: &[u32]| {
                     let conditional = instructions
                         .iter()
@@ -376,8 +343,7 @@ impl Discovery<'_> {
         }
     }
 
-    /// makes each place a guess joined other code a label of the functions
-    /// that hold the code there.
+    /// turns each place a guess joined other code into a label of the funcs holding it
     fn label_joins(&mut self) {
         if self.joins.is_empty() {
             return;
@@ -392,7 +358,7 @@ impl Discovery<'_> {
         }
     }
 
-    /// what exploring counts, to put back after a guess that came to nothing.
+    /// what exploring counts, to put back after a failed guess
     fn counts(&self) -> (usize, usize, usize, usize) {
         (self.analysis.indirect_sites, self.analysis.jump_tables, self.analysis.svc_sites, self.analysis.dead_ends)
     }
@@ -405,7 +371,7 @@ impl Discovery<'_> {
         for byte in address..address + size {
             if let Some(offset) = byte.checked_sub(self.text.base) {
                 if let Some(slot) = self.analysis.map.get_mut(offset as usize) {
-                    // code wins over a literal guess
+                    // code beats a literal guess
                     if *slot != Byte::Code {
                         if let Some(trial) = &mut self.trial {
                             trial.marked.push((offset as usize, *slot, self.modes[offset as usize]));
@@ -421,7 +387,6 @@ impl Discovery<'_> {
         self.analysis.map[(address - self.text.base) as usize]
     }
 
-    /// marks the bytes of an instruction as code, decoded in mode.
     fn mark_code(&mut self, address: u32, size: u32, mode: Mode) {
         self.mark(address, size, Byte::Code);
         let bit = mode_bit(mode);
@@ -437,15 +402,13 @@ impl Discovery<'_> {
         }
     }
 
-    /// whether some function holds the code at address in mode.
+    /// does some func own the code at address in mode
     fn holds(&self, address: u32, mode: Mode) -> bool {
         self.modes[(address - self.text.base) as usize] & mode_bit(mode) != 0
     }
 
-    /// likely ARM functions in the text nothing reached, the first word of
-    /// each gap when it is an unconditional instruction, and every push of
-    /// registers onto the stack. Thumb is left alone, too much data looks
-    /// like it.
+    /// likely ARM funcs in unreached text, a gap's first word if it's unconditional, plus every push
+    /// Thumb gets skipped, too much data looks like it
     fn gap_starts(&self) -> Vec<u32> {
         let mut starts = Vec::new();
         let mut in_gap = false;
@@ -467,12 +430,12 @@ impl Discovery<'_> {
         starts
     }
 
-    /// whether the word at address may hold a code address.
+    /// can the word at address hold a code addr
     fn may_point(&self, address: u32) -> bool {
         self.slots.is_none_or(|slots| slots.contains(&address))
     }
 
-    /// a value that may be the address of a function, odd for Thumb.
+    /// a value that might be a func addr, odd means Thumb
     fn code_pointer(&mut self, value: u32, source: Source) {
         let (address, mode) = if value & 1 != 0 {
             (value & !1, Mode::Thumb)
@@ -492,8 +455,7 @@ impl Discovery<'_> {
         }
     }
 
-    /// somewhere the function being explored leads. what a guess leads to is
-    /// only a guess too, and waits for the guess to turn out to be code.
+    /// somewhere the current func leads, a guess's leads are guesses too and wait for it to check out
     fn lead(&mut self, address: u32, mode: Mode, source: Source) {
         let lead = (address, mode, source, !self.guessing && source != Source::Pointer);
         match &mut self.trial {
@@ -502,7 +464,7 @@ impl Discovery<'_> {
         }
     }
 
-    /// queues a lead, pointers behind everything surer.
+    /// queues a lead, pointers go last
     fn follow(&mut self, lead: Lead) {
         match lead.2 {
             Source::Pointer => self.guesses.push_back(lead),
@@ -520,10 +482,9 @@ impl Discovery<'_> {
         }
     }
 
-    /// follows every path through one function, returning its instructions
-    /// and labels.
+    /// walks every path thru one func, gives back its instructions and labels
     fn explore(&mut self, entry: u32, mode: Mode) -> (Vec<u32>, BTreeSet<u32>) {
-        // where a guess stopped the first time, which it does again
+        // a guess stops where it stopped last time
         let cuts = self.cuts.get(&entry).cloned().unwrap_or_default();
         let mut blocks = vec![entry];
         let mut seen = BTreeSet::new();
@@ -535,7 +496,7 @@ impl Discovery<'_> {
             let mut address = start;
             while self.text.contains(address) && seen.insert(address) {
                 if self.byte(address) == Byte::Literal {
-                    // ran into a literal pool, the path is wrong or it ended
+                    // hit a literal pool, wrong path or the end
                     break;
                 }
                 if cuts.contains(&address) {
@@ -543,9 +504,7 @@ impl Discovery<'_> {
                 }
                 if self.holds(address, mode) && !code.contains(&address) {
                     if let Some(trial) = &mut self.trial {
-                        // a guess that runs into code another function holds
-                        // in the same mode joins that code, which is there
-                        // already
+                        // a guess running into code another func holds in the same mode joins it, no copies
                         trial.joins.push((address, mode));
                         break;
                     }
@@ -567,7 +526,7 @@ impl Discovery<'_> {
                         | Flow::Svc
                 );
                 if returns {
-                    // execution comes back after a call or an svc
+                    // execution comes back here after a call or svc
                     labels.insert(address + size);
                 }
                 match instruction.flow {
@@ -585,8 +544,7 @@ impl Discovery<'_> {
                                     }
                                 }
                             }
-                            // a piece stops where the function it was cut from
-                            // does
+                            // a piece stops where its parent func does
                             if !cuts.is_empty() {
                                 self.cuts.entry(target).or_default().extend(cuts.iter().copied());
                             }
@@ -631,8 +589,7 @@ impl Discovery<'_> {
                         }
                     }
                     Flow::LiteralLoad { literal, size } => {
-                        // a load from something already decoded as code is
-                        // left alone
+                        // loads from stuff already decoded as code are left alone
                         if self.text.contains(literal) && self.byte(literal) != Byte::Code {
                             self.mark(literal, size, Byte::Literal);
                             if size == 4 && self.may_point(literal) {
@@ -652,8 +609,7 @@ impl Discovery<'_> {
         (code.into_iter().collect(), labels)
     }
 
-    /// add pc, pc, rm lsl 2 jumps into a run of branches that starts with
-    /// the default case right after it.
+    /// add pc, pc, rm lsl 2 jumps into a run of branches, default case first right after it
     fn branch_table(&mut self, address: u32, blocks: &mut Vec<u32>) {
         self.analysis.jump_tables += 1;
         let mut entry = address + 4;
@@ -668,10 +624,8 @@ impl Discovery<'_> {
         }
     }
 
-    /// ldr pc, [pc, rm lsl 2] loads its target from the table of addresses
-    /// right after the default branch. its size comes from the cmp just
-    /// before it, or failing that from how far the entries keep pointing
-    /// into the code.
+    /// ldr pc, [pc, rm lsl 2] loads its target from the addr table right after the default branch
+    /// size comes from the cmp just b4 it, else from how far entries keep pointing into code
     fn address_table(&mut self, address: u32, index: u32, blocks: &mut Vec<u32>) {
         self.analysis.jump_tables += 1;
         let entries = address
@@ -720,7 +674,7 @@ mod tests {
         let analysis = analyze_words(&[
             0xEB00_0002, // bl 0x100010
             0xEF00_0000, // svc 0
-            0xEAFF_FFFE, // b .
+            0xEAFF_FFFE, // b . (spins forever lol)
             0xDEAD_BEEF, // never reached
             0xE59F_0000, // ldr r0, [pc] (literal at 0x100018)
             0xE12F_FF1E, // bx lr
@@ -735,10 +689,8 @@ mod tests {
         assert_eq!(analysis.svc_sites, 1);
     }
 
-    /// code reached only through branches far apart, the way tail calls
-    /// reach other functions, is one function while it is small, as it
-    /// always was. past what a function holds, each piece of it becomes a
-    /// function of its own, its branch a tail call.
+    /// far apart branches (like tail calls) make one func while it's small, as always
+    /// past the limit each piece becomes its own func, the branch a tail call
     #[test]
     fn a_huge_chain_of_tail_calls_is_split_into_functions() {
         const SPACING: u32 = 2 * FAR;
@@ -833,13 +785,11 @@ mod tests {
         assert_eq!(analyze_words(&words).functions[&(BASE + 0xC)].source, Source::Pointer);
         let mut program = program(&words);
         program.slots = Some(BTreeSet::new());
-        // the code is still there for the scan to find, only not through
-        // the literal
+        // the code's still there for the scan, just not via the literal
         assert_eq!(analyze(&program).functions[&(BASE + 0xC)].source, Source::Scan);
     }
 
-    /// code nothing leads to still becomes functions where a gap begins
-    /// with an instruction or a push saves registers, data does not.
+    /// unreached code still becomes funcs where a gap starts w/ an instruction or a push saves regs, data doesn't
     #[test]
     fn gaps_are_scanned_for_functions() {
         let analysis = analyze_words(&[
@@ -855,9 +805,7 @@ mod tests {
         assert!(!analysis.functions.contains_key(&(BASE + 12)));
     }
 
-    /// a guess whose code is mostly conditional is not ARM a compiler made,
-    /// so it is no function, the bytes it decoded are not code, and a call
-    /// in it leads nowhere.
+    /// a mostly conditional guess isn't compiler ARM, so no func, its bytes aren't code and its call goes nowhere
     #[test]
     fn a_guess_that_is_not_code_leads_nowhere() {
         let mut words = vec![0xE12F_FF1E]; // bx lr, the entry
@@ -877,8 +825,7 @@ mod tests {
         assert_eq!(analysis.count(Byte::Code), 4);
     }
 
-    /// text taken for Thumb has no push, branch, call or return, so it is no
-    /// function.
+    /// text read as Thumb has no push, branch, call or ret, so no func
     #[test]
     fn text_taken_for_thumb_is_no_function() {
         let text = b"abcdefghijklmnopqrstuvwxyzabcdefghijklmn";
@@ -890,9 +837,7 @@ mod tests {
         assert_eq!(analysis.functions.keys().copied().collect::<Vec<_>>(), [BASE]);
     }
 
-    /// a guess that runs into code a function holds stops there, the place
-    /// becoming a label of that function, and a guess into the middle of
-    /// such code is no function, rather than each copying the code.
+    /// a guess hitting held code stops there (it becomes a label of that func), and a guess into the middle of it is no func, no copying
     #[test]
     fn guesses_join_code_instead_of_copying_it() {
         let mut program = program(&[
@@ -911,9 +856,7 @@ mod tests {
         assert!(analysis.functions[&(BASE + 0x10)].labels.contains(&(BASE + 0x14)));
     }
 
-    /// a pointer into the middle of code a function holds, where it falls
-    /// through, becomes a label of that function, so that the host can go on
-    /// there in recompiled code if the pointer is real.
+    /// a pointer into the middle of held code (where it falls thru) becomes a label of that func, so the host can go on there if it's real
     #[test]
     fn a_pointer_into_held_code_becomes_a_label() {
         let mut program = program(&[
@@ -929,8 +872,7 @@ mod tests {
         assert!(analysis.functions[&(BASE + 8)].labels.contains(&(BASE + 0xC)));
     }
 
-    /// a huge chain of near tail calls whose links vtables point at splits at
-    /// the links, as it did when each pointer made a function of its own.
+    /// a huge chain of near tail calls w/ vtables pointing at the links splits at the links, like when each pointer made its own func
     #[test]
     fn a_huge_near_chain_splits_where_pointers_point() {
         let (links, length, spacing) = (30u32, 400u32, 0x1000u32);
@@ -950,8 +892,7 @@ mod tests {
         assert!(analysis.functions.values().all(|f| f.instructions.len() == length as usize + 1));
     }
 
-    /// a huge function a guess led to splits into pieces that keep all of
-    /// its code, as one the entry leads to does.
+    /// a huge guessed func splits into pieces w/o losing code, same as one the entry leads to
     #[test]
     fn a_huge_guess_splits_without_losing_code() {
         const SPACING: u32 = 2 * FAR;

@@ -1,5 +1,5 @@
-//! just enough Thumb decoding to follow control flow. the ARM11 is ARMv6K,
-//! so this is Thumb-1, where only the bl and blx pairs take 32 bits.
+//! just enough Thumb decoding to follow control flow
+//! the ARM11 is ARMv6K so this is Thumb 1, only the bl and blx pairs take 32 bits
 
 use crate::arm::{Flow, Instruction, ALWAYS};
 
@@ -9,15 +9,14 @@ fn sign_extend(value: u32, bits: u32) -> i32 {
     ((value << (32 - bits)) as i32) >> (32 - bits)
 }
 
-/// decodes the instruction at address, returning it and its size in bytes.
-/// next is the following halfword, which only the bl and blx pairs read.
+/// decodes the instr at address, returns it and its size in bytes, next is the following halfword (only bl and blx pairs read it)
 pub fn decode(halfword: u16, next: Option<u16>, address: u32) -> (Instruction, u32) {
     let pc = address.wrapping_add(4);
     let always = |flow| Instruction { condition: ALWAYS, flow };
     let word = halfword as u32;
 
     match halfword >> 11 {
-        // conditional branch, with svc and undefined in the last two conditions
+        // conditional branch, w/ svc and undefined in the last two conds
         0b11010 | 0b11011 => {
             let condition = (word >> 8) & 0xF;
             let flow = match condition {
@@ -31,7 +30,7 @@ pub fn decode(halfword: u16, next: Option<u16>, address: u32) -> (Instruction, u
             let target = pc.wrapping_add((sign_extend(word & 0x7FF, 11) << 1) as u32);
             (always(Flow::Branch { target, link: false }), 2)
         }
-        // the first half of bl or blx carries the upper offset
+        // first half of bl or blx carries the upper offset
         0b11110 => {
             let high = sign_extend(word & 0x7FF, 11) << 12;
             let Some(second) = next else { return (always(Flow::Undefined), 2) };
@@ -43,7 +42,7 @@ pub fn decode(halfword: u16, next: Option<u16>, address: u32) -> (Instruction, u
                 _ => (always(Flow::Undefined), 2),
             }
         }
-        // a lone second half means the decoding lost track
+        // a lone second half means decoding lost the plot
         0b11111 | 0b11101 => (always(Flow::Undefined), 2),
         // ldr rd, [pc, imm]
         0b01001 => {
@@ -55,11 +54,11 @@ pub fn decode(halfword: u16, next: Option<u16>, address: u32) -> (Instruction, u
 }
 
 fn other(halfword: u16) -> Flow {
-    // pop with pc
+    // pop w/ pc
     if halfword & 0xFF00 == 0xBD00 {
         return Flow::Return;
     }
-    // bx and blx through a register
+    // bx and blx thru a reg
     if halfword & 0xFF07 == 0x4700 {
         let register = ((halfword >> 3) & 0xF) as u32;
         let link = halfword & 0x80 != 0;
@@ -69,7 +68,7 @@ fn other(halfword: u16) -> Flow {
             Flow::BranchRegister { register, link }
         };
     }
-    // mov and add on high registers with pc as the destination
+    // mov and add on high regs w/ pc as dest
     if halfword & 0xFC87 == 0x4487 {
         let source = (halfword >> 3) & 0xF;
         let mov = halfword & 0x0300 == 0x0200;
@@ -90,7 +89,7 @@ mod tests {
 
     #[test]
     fn branches() {
-        assert_eq!(flow(0xE7FE), Flow::Branch { target: BASE, link: false }); // b .
+        assert_eq!(flow(0xE7FE), Flow::Branch { target: BASE, link: false }); // b . (to itself)
         assert_eq!(flow(0xD001), Flow::Branch { target: BASE + 6, link: false }); // beq
         assert_eq!(decode(0xD001, None, BASE).0.condition, 0);
         assert_eq!(flow(0xDF01), Flow::Svc);

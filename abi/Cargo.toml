@@ -8,7 +8,7 @@ description = "The interface between the code 3dsrecomp generates and the progra
 
 [features]
 default = ["load"]
-# opening libraries of recompiled code while running
+# opening libs of recompiled code at runtime
 load = ["dep:libloading"]
 
 [dependencies]

@@ -53,6 +53,10 @@ pub struct Mods<'a> {
     /// and spelled the way the title has them, like static.crs or
     /// cro/Battle.cro.
     pub romfs: Option<Files<'a>>,
+    /// modules the title loads that its RomFS does not have as .cro files
+    /// (packed in an archive of its own, unpacked when it runs): their
+    /// bytes as loaded, translated with the RomFS's.
+    pub modules: Option<&'a [Vec<u8>]>,
 }
 
 /// the bytes that replace the RomFS file at a path, None to keep the
@@ -125,6 +129,7 @@ pub fn module_files(title: &Title, mods: Mods) -> Vec<(cro::Module, Vec<u8>)> {
             let bytes = mods.read(title, &path, &file)?;
             Some((cro::parse(&bytes)?, bytes))
         })
+        .chain(mods.modules.unwrap_or_default().iter().filter_map(|bytes| Some((cro::parse(bytes)?, bytes.clone()))))
         .collect()
 }
 

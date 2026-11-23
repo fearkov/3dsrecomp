@@ -38,6 +38,8 @@ struct Options {
     name: Option<String>,
     /// a Zakuro checkout for port to build against.
     zakuro: Option<PathBuf>,
+    /// a folder of .cro modules the title loads that its RomFS has not as files.
+    modules: Option<PathBuf>,
 }
 
 fn main() {
@@ -64,6 +66,7 @@ fn main() {
             "--overrides" => options.overrides = Some(value().into()),
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
+            "--modules" => options.modules = Some(value().into()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -74,7 +77,21 @@ fn main() {
     match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["analyze", rom] => analyze(rom),
         ["generate", rom, dir] => {
-            if let Err(error) = build::generate(Path::new(rom), |_| PathBuf::from(dir), options.overrides.as_deref(), Mods::default(), &print_event) {
+            // modules given apart (unpacked by the title when it ran), every .cro in the folder
+            let mut extra = Vec::new();
+            if let Some(folder) = &options.modules {
+                let mut paths: Vec<_> = std::fs::read_dir(folder).map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect()).unwrap_or_default();
+                paths.sort();
+                for path in paths {
+                    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("cro")) {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            extra.push(bytes);
+                        }
+                    }
+                }
+            }
+            let mods = Mods { modules: Some(&extra), ..Mods::default() };
+            if let Err(error) = build::generate(Path::new(rom), |_| PathBuf::from(dir), options.overrides.as_deref(), mods, &print_event) {
                 eprintln!("{error}");
                 exit(1);
             }

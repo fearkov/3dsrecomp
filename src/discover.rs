@@ -222,7 +222,12 @@ pub fn analyze(program: &Program) -> Analysis {
     for &slot in program.slots.iter().flatten() {
         discovery.mark(slot, 4, Byte::Literal);
     }
-    for &(address, source) in &program.seeds {
+    // hints first: a run reached them, in their mode, which a word of data that
+    // only looks like a pointer (odd, so Thumb) must not take first (Pokémon
+    // Alpha Sapphire's constructor at 0x500000, ARM, lost to a Thumb guess)
+    let hinted = program.seeds.iter().filter(|(_, source)| *source == Source::Hint);
+    let rest = program.seeds.iter().filter(|(_, source)| *source != Source::Hint);
+    for &(address, source) in hinted.chain(rest) {
         discovery.code_pointer(address, source);
     }
     discovery.run();
@@ -713,6 +718,17 @@ mod tests {
             seeds: vec![(BASE, Source::Entry)],
             slots: None,
         }
+    }
+
+    /// a hint, from a run, wins over a word of data that only looks like a
+    /// pointer to the same place in the other mode
+    #[test]
+    fn a_hint_takes_its_place_before_a_pointer_of_the_other_mode() {
+        let mut program = program(&[0xE12F_FF1E, 0xE12F_FF1E, 0xE3A0_0000, 0xE12F_FF1E]); // ..., mov r0, #0; bx lr
+        program.seeds.extend([(BASE + 8 + 1, Source::Pointer), (BASE + 8, Source::Hint)]);
+        let analysis = analyze(&program);
+        assert_eq!(analysis.functions[&(BASE + 8)].mode, Mode::Arm);
+        assert_eq!(analysis.functions[&(BASE + 8)].source, Source::Hint);
     }
 
     #[test]

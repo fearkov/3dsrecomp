@@ -189,7 +189,18 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     if hinted.is_empty() {
         return 0;
     }
-    let outside = new_functions(&analyses[index], &hinted);
+    // a hints file given (--hints) holds function starts by construction, the C++ constructors a
+    // table calls and the places a run reached: each one not an entry yet becomes one, even inside
+    // a function (data taken for code can run into a constructor)
+    let outside: Vec<u32> = if std::env::var_os("RECOMP_HINTS").is_some() {
+        // in the hinted mode: a guess may have taken the place for code of the other mode
+        hinted.iter().copied().filter(|&address| {
+            let thumb = address & 1 != 0;
+            !analyses[index].functions.get(&(address & !1)).is_some_and(|f| (f.mode == Mode::Thumb) == thumb)
+        }).collect()
+    } else {
+        new_functions(&analyses[index], &hinted)
+    };
     if !outside.is_empty() {
         program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
@@ -211,6 +222,9 @@ pub fn new_functions(analysis: &Analysis, hinted: &[u32]) -> Vec<u32> {
 /// the addresses Zakuro wrote down next to a title's library, those it ran
 /// in its interpreter for want of code, odd for Thumb.
 pub fn hints(program_id: u64) -> Vec<u32> {
+    if let Some(path) = std::env::var_os("RECOMP_HINTS") {
+        return std::fs::read_to_string(path).map(|text| read_hints(&text)).unwrap_or_default();
+    }
     let Some(dir) = abi::library_dir() else { return Vec::new() };
     let path = dir.join(abi::library_name(program_id)).with_extension("hints");
     std::fs::read_to_string(path).map(|text| read_hints(&text)).unwrap_or_default()

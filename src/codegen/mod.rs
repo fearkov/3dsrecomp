@@ -132,6 +132,14 @@ fn jump(out: &mut String, scope: &Scope, target: u32, thumb: bool) -> bool {
 /// keeps a whole file in memory, and files of 20,000 took it up to 7.8 GB.
 const FILE_SIZE: usize = 5_000;
 
+/// whether a file may end after the function at entry once it holds
+/// FILE_SIZE / 2 instructions. the cut depends on the address alone, not on
+/// what came before, so that a function found or lost (a hint) changes its
+/// own file and leaves the others, and their objects, as they were.
+fn cuts_after(entry: u32) -> bool {
+    entry.wrapping_mul(0x9E37_79B1) >> 29 == 0
+}
+
 /// the instructions up to which a function another one holds is still
 /// written as a function of its own.
 const OWN_FUNCTION: usize = 128;
@@ -201,8 +209,10 @@ pub struct Unit<'a> {
 /// which overrides.h lets them still call.
 pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)> {
     let mut files = vec![("recomp.h".to_owned(), HEADER.to_owned())];
-    let mut sources: Vec<String> = Vec::new();
+    // each file named after its first function, so that names stay put
+    let mut sources: Vec<(String, String)> = Vec::new();
     let mut source = String::new();
+    let mut first = String::new();
     // the headers the file being written includes
     let mut included = BTreeSet::new();
     let mut size = 0;
@@ -267,9 +277,10 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         let include = format!("#include \"{header}\"\n\n");
         // each function's labels with those after what it interprets
         let mut resumed: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
-        for (number, (&entry, function)) in functions.iter().enumerate() {
+        for (&entry, function) in &functions {
             if source.is_empty() {
                 source.push_str("#include \"recomp.h\"\n");
+                first = format!("code_{prefix}{entry:08X}.c");
             }
             if included.insert(index) {
                 source.push_str(&include);
@@ -280,7 +291,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
             let interpreted = std::cell::RefCell::new(Vec::new());
             let relative = unit.module.is_some();
             let scope = Scope { labels: &function.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut String::new(), unit.program, &scope, entry, function, number);
+            write_function(&mut String::new(), unit.program, &scope, entry, function);
             let mut resumable = (*function).clone();
             for address in interpreted.take() {
                 let at = function.instructions.iter().position(|&a| a == address);
@@ -289,11 +300,12 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
                 }
             }
             let scope = Scope { labels: &resumable.labels, functions: &names, prefix: &prefix, relative, interpreted: &interpreted };
-            write_function(&mut source, unit.program, &scope, entry, &resumable, number);
+            write_function(&mut source, unit.program, &scope, entry, &resumable);
             resumed.insert(entry, resumable.labels);
             size += function.instructions.len();
-            if size >= FILE_SIZE {
-                sources.push(std::mem::take(&mut source));
+            // shortcut: the 2 * FILE_SIZE cap still cuts by size, which only a run of 4,000+ cut-less functions reaches
+            if size >= FILE_SIZE / 2 && cuts_after(entry) || size >= 2 * FILE_SIZE {
+                sources.push((std::mem::take(&mut first), std::mem::take(&mut source)));
                 included.clear();
                 size = 0;
             }
@@ -339,7 +351,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         write_origins(&mut tables, &mut origins, &prefix, unit.program, &functions, &entries);
     }
     if !source.is_empty() {
-        sources.push(source);
+        sources.push((first, source));
     }
 
     emit!(tables, "RECOMP_EXPORT const uint32_t recomp_abi = RECOMP_ABI;");
@@ -356,7 +368,7 @@ pub fn generate(units: &[Unit], overrides: &[Override]) -> Vec<(String, String)>
         emit!(header, "\n/* the generated functions the overrides replace. */\n\n{originals}");
         files.push(("overrides.h".to_owned(), header));
     }
-    files.extend(sources.into_iter().enumerate().map(|(i, source)| (format!("code{i:03}.c"), source)));
+    files.extend(sources);
     files
 }
 
@@ -392,9 +404,20 @@ fn write_origins(
     entries: &BTreeMap<u32, (String, u32)>,
 ) {
     let count = functions.len();
-    emit!(tables, "RECOMP_HIDDEN uint8_t {prefix}recomp_stale[{}];", count.max(1));
+    // defined, not common, so that the names below can sit inside them
+    emit!(tables, "RECOMP_HIDDEN uint8_t {prefix}recomp_stale[{}] = {{0}};", count.max(1));
     let starts: Vec<String> = functions.keys().map(|entry| format!("0x{entry:08X}u")).collect();
     emit!(tables, "RECOMP_HIDDEN uint32_t {prefix}recomp_starts[{}] = {{{}}};", count.max(1), starts.join(", "));
+    // each function's own names for its flag and its start (write_function)
+    // shortcut: no symbol prefix, as on x86-64/arm64 Windows, Linux and Android; Mach-O and x86 Windows add "_"
+    for (number, entry) in functions.keys().enumerate() {
+        emit!(
+            tables,
+            "__asm__(\".globl {prefix}recomp_stale_{entry:08X}\\n.set {prefix}recomp_stale_{entry:08X}, {prefix}recomp_stale+{number}\\n\
+             .globl {prefix}recomp_start_{entry:08X}\\n.set {prefix}recomp_start_{entry:08X}, {prefix}recomp_starts+{}\");",
+            number * 4
+        );
+    }
     let spans: Vec<Vec<(u32, u32)>> = functions.values().map(|function| spans(program, function)).collect();
     let pieces = pieces(spans.iter().flatten().copied());
     if pieces.is_empty() {
@@ -471,12 +494,18 @@ fn pieces(spans: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
     pieces
 }
 
-/// a function, the number-th of its unit.
-fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
+/// a function, one of its unit.
+fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
     let thumb = function.mode == Mode::Thumb;
+    // its flag and its start, which entries.c places on recomp_stale[number]
+    // and recomp_starts[number]: a name, not the number, so that a function
+    // added before it leaves this file as it is
+    let prefix = scope.prefix;
+    emit!(out, "extern RECOMP_HIDDEN uint8_t {prefix}recomp_stale_{entry:08X};");
+    emit!(out, "extern RECOMP_HIDDEN uint32_t {prefix}recomp_start_{entry:08X};");
     emit!(out, "void {}(Context *ctx) {{", name(scope.prefix, entry, thumb));
     let mut body = String::new();
-    write_body(&mut body, program, scope, entry, function, number);
+    write_body(&mut body, program, scope, entry, function);
     out.push_str(&locals::keep(&body));
     emit!(out, "}}");
     out.push_str(locals::RESET);
@@ -484,7 +513,7 @@ fn write_function(out: &mut String, program: &Program, scope: &Scope, entry: u32
 }
 
 /// what a function does, between its braces.
-fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function, number: usize) {
+fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, function: &Function) {
     let thumb = function.mode == Mode::Thumb;
     let state = if thumb { "ctx->thumb" } else { "!ctx->thumb" };
     if scope.relative {
@@ -498,9 +527,9 @@ fn write_body(out: &mut String, program: &Program, scope: &Scope, entry: u32, fu
     // with nothing more than the compare they make anyway, and whatever
     // misses goes past the flag
     let prefix = scope.prefix;
-    let start = if scope.relative { format!("(module_base + {prefix}recomp_starts[{number}])") } else { format!("{prefix}recomp_starts[{number}]") };
+    let start = if scope.relative { format!("(module_base + {prefix}recomp_start_{entry:08X})") } else { format!("{prefix}recomp_start_{entry:08X}") };
     emit!(out, "    if (LIKELY(target == {start})) goto L_{entry:08X};");
-    emit!(out, "    STALE_CHECK({prefix}recomp_stale[{number}])");
+    emit!(out, "    STALE_CHECK({prefix}recomp_stale_{entry:08X})");
     emit!(out, "dispatch:");
     let offset = if scope.relative { "target - module_base" } else { "target" };
     emit!(out, "    if ({state}) switch ({offset}) {{");
@@ -569,7 +598,7 @@ mod tests {
     fn multiple_transfers_check_one_page_for_all_their_words() {
         // push {r4, r5, lr}, vpush {d8}, vpop {d8}, pop {r4, r5, pc}
         let files = files(&[0xE92D_4030, 0xED2D_8B02, 0xECBD_8B02, 0xE8BD_8030], &[]);
-        let code = &files["code000.c"];
+        let code = &files["code_00100000.c"];
         assert!(code.contains("mem_write_span(ctx, p, 12u)"));
         assert!(code.contains("store32(span + 8, reg14_);"));
         assert!(code.contains("mem_write_span(ctx, p, 8u)"));
@@ -577,7 +606,7 @@ mod tests {
         assert!(code.contains("next = load32(span + 8);"));
         assert!(code.contains("RETURN_TO_A(next);"));
 
-        compiles("transfers", &files, &["code000.c"]);
+        compiles("transfers", &files, &["code_00100000.c"]);
     }
 
     /// the code goes on after an svc, which the host ran, into the next
@@ -586,14 +615,14 @@ mod tests {
     fn an_svc_goes_on_to_the_next_instruction() {
         // svceq 0x28, svc 0x28, bx lr
         let files = files(&[0x0F00_0028, 0xEF00_0028, 0xE12F_FF1E], &[]);
-        let code = &files["code000.c"];
+        let code = &files["code_00100000.c"];
         let conditional = code.find("SVC(0x00100004u, 0x28u);").expect("the first svc");
         let svc = code.find("SVC(0x00100008u, 0x28u);").expect("the second svc");
         let next = code.find("L_00100008:").expect("a label after it");
         assert!(conditional < svc && svc < next);
         assert!(!code[svc..next].contains("goto"), "{}", &code[svc..next]);
 
-        compiles("svc", &files, &["code000.c"]);
+        compiles("svc", &files, &["code_00100000.c"]);
     }
 
     /// compiles sources among files, in a folder of their own named after
@@ -618,10 +647,13 @@ mod tests {
     fn functions_say_what_they_were_made_from() {
         // bl BASE + 8, bx lr, then the callee, bx lr
         let files = generated(&[]);
-        let code = &files["code000.c"];
-        assert!(code.contains("if (LIKELY(target == recomp_starts[0])) goto L_00100000;\n    STALE_CHECK(recomp_stale[0])"));
-        assert!(code.contains("STALE_CHECK(recomp_stale[1])"));
+        let code = &files["code_00100000.c"];
+        assert!(code.contains("if (LIKELY(target == recomp_start_00100000)) goto L_00100000;\n    STALE_CHECK(recomp_stale_00100000)"));
+        assert!(code.contains("STALE_CHECK(recomp_stale_00100008)"));
         assert!(files["entries.c"].contains("uint32_t recomp_starts[2] = {0x00100000u, 0x00100008u};"));
+        // the names sit on the function's own slot of each table
+        assert!(files["entries.c"].contains(".set recomp_stale_00100008, recomp_stale+1\\n"));
+        assert!(files["entries.c"].contains(".set recomp_start_00100008, recomp_starts+4\");"));
         let tables = &files["entries.c"];
         let mut caller = recomp_abi::CodeHash::default();
         caller.add(&[0x00, 0x00, 0x00, 0xEB, 0x1E, 0xFF, 0x2F, 0xE1]);
@@ -631,7 +663,29 @@ mod tests {
         assert!(tables.contains("static const Run origin_runs[] = {\n    {0, 1},\n    {1, 2},\n};"), "{tables}");
         assert!(tables.contains("RECOMP_EXPORT const Origins recomp_origins[] = {\n    {2, 2, origin_pieces, origin_functions, origin_runs, origin_owners, recomp_stale, recomp_starts},"));
 
-        compiles("origins", &files, &["code000.c", "entries.c"]);
+        compiles("origins", &files, &["code_00100000.c", "entries.c"]);
+    }
+
+    /// a function found later (a hint) changes its own file only: the other
+    /// files keep their names and their text, so their objects stay built.
+    #[test]
+    fn a_new_function_leaves_the_other_files_alone() {
+        // 3,000 functions of "mov r0, r0; bx lr": then the same with a seed on one's bx lr, as a hint is
+        let words: Vec<u32> = (0..3_000).flat_map(|_| [0xE1A0_0000u32, 0xE12F_FF1E]).collect();
+        let build = |extra: Option<u32>| {
+            let mut seeds: Vec<(u32, Source)> = (0..6_000u32).filter(|i| i % 2 == 0).map(|i| (BASE + i * 4, Source::Entry)).collect();
+            seeds.extend(extra.map(|address| (address, Source::Entry)));
+            let program = Program { text: Segment { base: BASE, bytes: words.iter().flat_map(|w| w.to_le_bytes()).collect() }, seeds, slots: None };
+            let analysis = discover::analyze(&program);
+            let units = [Unit { module: None, program: &program, analysis: &analysis }];
+            generate(&units, &[]).into_iter().filter(|(name, _)| name.starts_with("code_")).collect::<BTreeMap<_, _>>()
+        };
+        let before = build(None);
+        let after = build(Some(BASE + 4 * 3001));
+        let count = |files: &BTreeMap<String, String>| files.values().map(|t| t.matches("Context *ctx) {").count()).sum::<usize>();
+        assert!(before.len() > 2 && count(&after) == count(&before) + 1, "{} files, {} then {} functions", before.len(), count(&before), count(&after));
+        let changed = after.iter().filter(|(name, text)| before.get(*name) != Some(text)).count();
+        assert_eq!(changed, 1, "{} of {} files changed", changed, after.len());
     }
 
     /// code several functions hold is cut where any of them starts or ends,
@@ -658,13 +712,13 @@ mod tests {
             Unit { module: Some("Second"), program: &program, analysis: &analysis },
         ];
         let files: BTreeMap<String, String> = generate(&units, &[]).into_iter().collect();
-        let code = &files["code000.c"];
+        let code = &files["code_00100000.c"];
         assert!(code.contains("#include \"m001_functions.h\"") && code.contains("#include \"m002_functions.h\""));
-        assert!(code.contains("STALE_CHECK(m002_recomp_stale[1])"));
-        assert!(code.contains("if (LIKELY(target == (module_base + m002_recomp_starts[1])))"));
+        assert!(code.contains("STALE_CHECK(m002_recomp_stale_00100008)"));
+        assert!(code.contains("if (LIKELY(target == (module_base + m002_recomp_start_00100008)))"));
         assert!(files["entries.c"].contains("{2, 2, m002_origin_pieces, m002_origin_functions, m002_origin_runs, m002_origin_owners, m002_recomp_stale, m002_recomp_starts},"));
 
-        compiles("units", &files, &["code000.c", "entries.c"]);
+        compiles("units", &files, &["code_00100000.c", "entries.c"]);
     }
 
     #[test]
@@ -699,7 +753,7 @@ RECOMP_OVERRIDE(0x00100008) {
 "#
             .to_owned(),
         );
-        compiles("overrides", &files, &["code000.c", "override.c"]);
+        compiles("overrides", &files, &["code_00100000.c", "override.c"]);
     }
 
     #[test]
@@ -711,7 +765,7 @@ RECOMP_OVERRIDE(0x00100008) {
             original: "original_0x00100008".to_owned(),
         };
         let files = generated(std::slice::from_ref(&replaced));
-        let code = &files["code000.c"];
+        let code = &files["code_00100000.c"];
         assert!(code.contains("CALL(override_0x00100008);"));
         assert!(files["functions.h"].contains("void override_0x00100008(Context *ctx);"));
         assert!(files["entries.c"].contains("{0x00100008u, override_0x00100008},"));
@@ -722,7 +776,7 @@ RECOMP_OVERRIDE(0x00100008) {
 
         // without overrides nothing changes
         let plain = generated(&[]);
-        assert!(plain["code000.c"].contains("CALL(f_00100008);"));
+        assert!(plain["code_00100000.c"].contains("CALL(f_00100008);"));
         assert!(!plain.contains_key("overrides.h"));
     }
 }

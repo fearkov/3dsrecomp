@@ -19,6 +19,7 @@ use recomp3ds::{abi, codegen, image, imported, module_files, static_module, veri
 
 const USAGE: &str = "\
 usage, 3dsrecomp analyze <rom>
+       3dsrecomp generate <rom> <dir> [--hints <file>]
        3dsrecomp build <rom> [<dir>] [--overrides <file or dir>]
        3dsrecomp port <rom> <dir> [--overrides <file or dir>] [--name <name>] [--zakuro <checkout>]
        3dsrecomp verify <rom> <library> [count]
@@ -51,6 +52,15 @@ fn main() {
             })
         };
         match arg.as_str() {
+            "--hints" => {
+                let path = value();
+                if !Path::new(&path).is_file() {
+                    eprintln!("hints file does not exist: {path}");
+                    exit(2);
+                }
+                // CLI startup precedes analysis/compiler worker threads.
+                std::env::set_var("RECOMP_HINTS", path);
+            }
             "--overrides" => options.overrides = Some(value().into()),
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
@@ -63,6 +73,12 @@ fn main() {
     }
     match words.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["analyze", rom] => analyze(rom),
+        ["generate", rom, dir] => {
+            if let Err(error) = build::generate(Path::new(rom), |_| PathBuf::from(dir), options.overrides.as_deref(), Mods::default(), &print_event) {
+                eprintln!("{error}");
+                exit(1);
+            }
+        }
         ["build", rom] => build(rom, None, &options),
         ["build", rom, dir] => build(rom, Some(Path::new(dir)), &options),
         ["port", rom, dir] => port(rom, Path::new(dir), &options),

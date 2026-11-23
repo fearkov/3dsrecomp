@@ -1,5 +1,5 @@
 //! keeping the guest's registers, flags and fpscr in locals for the length
-//! of a function, with the budget and the page tables. in the context,
+//! of a function, with the budget and the address space. in the context,
 //! every store to guest memory, which goes through a byte pointer, makes the
 //! compiler read them all again, while locals it can hold in host registers.
 //!
@@ -16,11 +16,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-/// what puts the default SYNC_OUT, SYNC_IN, BUDGET_LEFT, page tables and
+/// what puts the default SYNC_OUT, SYNC_IN, BUDGET_LEFT, address space and
 /// fpscr back after a function, for whatever follows it in the file.
-pub const RESET: &str = "#undef SYNC_OUT\n#undef SYNC_IN\n#undef BUDGET_LEFT\n#undef READ_PAGES\n#undef WRITE_PAGES\n#undef FPSCR\n\
+pub const RESET: &str = "#undef SYNC_OUT\n#undef SYNC_IN\n#undef BUDGET_LEFT\n#undef FASTMEM\n#undef FPSCR\n\
 #define SYNC_OUT() do { } while (0)\n#define SYNC_IN() do { } while (0)\n#define BUDGET_LEFT ctx->budget\n\
-#define READ_PAGES(c) ((c)->read_pages)\n#define WRITE_PAGES(c) ((c)->write_pages)\n#define FPSCR(c) (*(c)->fpscr)\n";
+#define FASTMEM(c) ((c)->fastmem)\n#define FPSCR(c) (*(c)->fpscr)\n";
 
 /// the conditions recomp.h spells with the context's flags, spelled with
 /// the locals, and the flags each reads.
@@ -488,12 +488,11 @@ pub fn keep(body: &str) -> String {
         writeln!(prologue, "    int32_t budget_ = ctx->budget;\n#undef BUDGET_LEFT\n#define BUDGET_LEFT budget_").unwrap();
         loads.push("budget_ = ctx->budget;".to_owned());
     }
-    // the page tables only ever get read, and anything that could change
-    // which ones the code uses is something it syncs around
+    // the address space only ever gets read, and anything that could move
+    // it is something the code syncs around
     if body.contains("mem_") {
-        writeln!(prologue, "    uint8_t *const *read_pages_ = ctx->read_pages, *const *write_pages_ = ctx->write_pages;").unwrap();
-        writeln!(prologue, "#undef READ_PAGES\n#undef WRITE_PAGES\n#define READ_PAGES(c) read_pages_\n#define WRITE_PAGES(c) write_pages_").unwrap();
-        loads.push("read_pages_ = ctx->read_pages; write_pages_ = ctx->write_pages;".to_owned());
+        writeln!(prologue, "    uint8_t *fastmem_ = ctx->fastmem;\n#undef FASTMEM\n#define FASTMEM(c) fastmem_").unwrap();
+        loads.push("fastmem_ = ctx->fastmem;".to_owned());
     }
     writeln!(prologue, "#define SYNC_IN() do {{ {} }} while (0)", loads.join(" ")).unwrap();
 

@@ -32,71 +32,315 @@ pub struct Region {
     pub writable: bool,
 }
 
+/// the guest's 4 GiB in the host's, plus the 64 KiB past them recomp.h
+/// asks for, which the recompiled code reaches at base plus the address.
+/// what the title has is committed and the rest only reserved. an access
+/// there faults, and the handler commits the page, zeroed and writable,
+/// counts the fault and lets the code go on, the way the interpreter reads
+/// 0 and counts one. copy_from puts the pages back.
+struct Space {
+    base: *mut u8,
+    touched: Vec<usize>,
+    faults: u64,
+}
+
+const SPACE_SIZE: usize = (1 << 32) + 0x1_0000;
+
+/// the spaces the fault handler looks in, as addresses of their boxes.
+static SPACES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// whether a fault at host address is in a space, whose page it then makes
+/// accessible. called by the handler, on the thread that faulted.
+fn fault_at(address: usize) -> bool {
+    let Ok(spaces) = SPACES.lock() else { return false };
+    for &space in spaces.iter() {
+        // SAFETY: a registered space lives until its Memory drops, which
+        // unregisters it first
+        let space = unsafe { &mut *(space as *mut Space) };
+        let offset = address.wrapping_sub(space.base as usize);
+        if offset < SPACE_SIZE {
+            let page = offset & !(PAGE_SIZE - 1);
+            // SAFETY: a page of the reservation
+            unsafe { os::open(space.base.add(page), PAGE_SIZE) };
+            space.touched.push(page);
+            space.faults += 1;
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+mod os {
+    use std::ffi::c_void;
+
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_DECOMMIT: u32 = 0x4000;
+    const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_NOACCESS: u32 = 1;
+    const PAGE_READONLY: u32 = 2;
+    const PAGE_READWRITE: u32 = 4;
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut c_void,
+        parameters: u32,
+        information: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut c_void,
+    }
+
+    extern "system" {
+        fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+        fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+        fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32,
+        ) -> *mut c_void;
+    }
+
+    unsafe extern "system" fn handler(pointers: *mut ExceptionPointers) -> i32 {
+        // SAFETY: the system hands over a valid record
+        let record = unsafe { &*(*pointers).record };
+        // an access violation, its address the second parameter
+        if record.code == 0xC000_0005 && record.parameters >= 2 && super::fault_at(record.information[1]) {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    pub fn reserve(size: usize) -> *mut u8 {
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: plain system calls
+        HANDLER.call_once(|| unsafe {
+            AddVectoredExceptionHandler(1, handler);
+        });
+        let base = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null(), "cannot reserve the guest's address space");
+        base
+    }
+
+    /// # Safety
+    /// the pages have to be the reservation's
+    pub unsafe fn open(at: *mut u8, size: usize) {
+        unsafe {
+            VirtualAlloc(at.cast(), size, MEM_COMMIT, PAGE_READWRITE);
+            VirtualProtect(at.cast(), size, PAGE_READWRITE, &mut 0);
+        }
+    }
+
+    /// # Safety
+    /// as open, and committed
+    pub unsafe fn read_only(at: *mut u8, size: usize) {
+        unsafe { VirtualProtect(at.cast(), size, PAGE_READONLY, &mut 0) };
+    }
+
+    /// # Safety
+    /// as open
+    pub unsafe fn close(at: *mut u8, size: usize) {
+        unsafe { VirtualFree(at.cast(), size, MEM_DECOMMIT) };
+    }
+
+    /// # Safety
+    /// a reservation nothing uses any more
+    pub unsafe fn release(base: *mut u8, _size: usize) {
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(unix)]
+mod os {
+    unsafe extern "C" fn handler(_signal: i32, info: *mut libc::siginfo_t, _context: *mut libc::c_void) {
+        // SAFETY: the system hands over a valid siginfo
+        let address = unsafe { (*info).si_addr() } as usize;
+        if !super::fault_at(address) {
+            // not ours: the default action, once the access runs again
+            unsafe {
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::signal(libc::SIGBUS, libc::SIG_DFL);
+            }
+        }
+    }
+
+    pub fn reserve(size: usize) -> *mut u8 {
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        // SAFETY: plain system calls
+        HANDLER.call_once(|| unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = handler as usize;
+            action.sa_flags = libc::SA_SIGINFO;
+            libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
+        });
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+        let base = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_NONE, flags, -1, 0) };
+        assert!(base != libc::MAP_FAILED, "cannot reserve the guest's address space");
+        base as *mut u8
+    }
+
+    /// # Safety
+    /// the pages have to be the reservation's
+    pub unsafe fn open(at: *mut u8, size: usize) {
+        unsafe { libc::mprotect(at.cast(), size, libc::PROT_READ | libc::PROT_WRITE) };
+    }
+
+    /// # Safety
+    /// as open
+    pub unsafe fn read_only(at: *mut u8, size: usize) {
+        unsafe { libc::mprotect(at.cast(), size, libc::PROT_READ) };
+    }
+
+    /// # Safety
+    /// as open
+    pub unsafe fn close(at: *mut u8, size: usize) {
+        unsafe {
+            libc::madvise(at.cast(), size, libc::MADV_DONTNEED);
+            libc::mprotect(at.cast(), size, libc::PROT_NONE);
+        }
+    }
+
+    /// # Safety
+    /// a reservation nothing uses any more
+    pub unsafe fn release(base: *mut u8, size: usize) {
+        unsafe { libc::munmap(base.cast(), size) };
+    }
+}
+
+/// a region's place in the space.
+struct Area {
+    base: u32,
+    size: usize,
+    writable: bool,
+}
+
 pub struct Memory {
-    regions: Vec<Region>,
+    areas: Vec<Area>,
+    space: Box<Space>,
     read_pages: Vec<*mut u8>,
     write_pages: Vec<*mut u8>,
     faults: u64,
 }
 
 impl Memory {
-    pub fn new(mut regions: Vec<Region>) -> Memory {
+    pub fn new(regions: Vec<Region>) -> Memory {
+        let base = os::reserve(SPACE_SIZE);
+        let mut space = Box::new(Space { base, touched: Vec::new(), faults: 0 });
+        SPACES.lock().unwrap().push(&mut *space as *mut Space as usize);
         let mut read_pages = vec![null_mut(); 1 << 20];
         let mut write_pages = vec![null_mut(); 1 << 20];
-        for region in &mut regions {
-            region.bytes.resize(region.bytes.len().next_multiple_of(PAGE_SIZE), 0);
-            for (i, page) in region.bytes.chunks_mut(PAGE_SIZE).enumerate() {
-                let index = (region.base as usize >> 12) + i;
-                read_pages[index] = page.as_mut_ptr();
-                if region.writable {
-                    write_pages[index] = page.as_mut_ptr();
+        let mut areas = Vec::new();
+        for region in regions {
+            let size = region.bytes.len().next_multiple_of(PAGE_SIZE);
+            // SAFETY: the region's pages, in the reservation
+            unsafe {
+                let at = base.add(region.base as usize);
+                os::open(at, size);
+                std::ptr::copy_nonoverlapping(region.bytes.as_ptr(), at, region.bytes.len());
+                if !region.writable {
+                    os::read_only(at, size);
+                }
+                for offset in (0..size).step_by(PAGE_SIZE) {
+                    let index = (region.base as usize + offset) >> 12;
+                    read_pages[index] = at.add(offset);
+                    if region.writable {
+                        write_pages[index] = at.add(offset);
+                    }
                 }
             }
+            areas.push(Area { base: region.base, size, writable: region.writable });
         }
-        Memory { regions, read_pages, write_pages, faults: 0 }
+        Memory { areas, space, read_pages, write_pages, faults: 0 }
+    }
+
+    fn bytes(&self, area: &Area) -> &[u8] {
+        // SAFETY: an area is committed, at least readable, for as long as
+        // the space
+        unsafe { std::slice::from_raw_parts(self.space.base.add(area.base as usize), area.size) }
     }
 
     fn duplicate(&self) -> Memory {
         let regions = self
-            .regions
+            .areas
             .iter()
-            .map(|r| Region { base: r.base, bytes: r.bytes.clone(), writable: r.writable })
+            .map(|a| Region { base: a.base, bytes: self.bytes(a).to_vec(), writable: a.writable })
             .collect();
         Memory::new(regions)
     }
 
-    fn copy_from(&mut self, other: &Memory) {
-        for (region, source) in self.regions.iter_mut().zip(&other.regions) {
-            if region.writable {
-                region.bytes.copy_from_slice(&source.bytes);
-            }
-        }
-        self.faults = 0;
+    /// the faults of both ways the run went, the interpreter's and the
+    /// recompiled code's.
+    fn faults(&self) -> u64 {
+        self.faults + self.space.faults
     }
 
-    /// the first address whose byte differs between two copies.
+    fn copy_from(&mut self, other: &Memory) {
+        let base = self.space.base;
+        // the pages the code faulted on, back as they were
+        for page in std::mem::take(&mut self.space.touched) {
+            let area = self.areas.iter().find(|a| (a.base as usize..a.base as usize + a.size).contains(&page));
+            // SAFETY: pages of the reservation
+            unsafe {
+                match area {
+                    // a read-only page the code wrote, with the title's bytes again
+                    Some(area) if !area.writable => {
+                        std::ptr::copy_nonoverlapping(other.space.base.add(page), base.add(page), PAGE_SIZE);
+                        os::read_only(base.add(page), PAGE_SIZE);
+                    }
+                    Some(_) => {}
+                    None => os::close(base.add(page), PAGE_SIZE),
+                }
+            }
+        }
+        for area in self.areas.iter().filter(|a| a.writable) {
+            let at = area.base as usize;
+            // SAFETY: the same area, writable, in both spaces
+            unsafe { std::ptr::copy_nonoverlapping(other.space.base.add(at), base.add(at), area.size) };
+        }
+        self.faults = 0;
+        self.space.faults = 0;
+    }
+
     /// the first address whose byte differs between two copies, where two
     /// NaNs count as the same whatever their bits.
     fn first_difference(&self, other: &Memory) -> Option<u32> {
-        self.regions.iter().zip(&other.regions).filter(|(region, _)| region.writable).find_map(|(a, b)| {
+        self.areas.iter().zip(&other.areas).filter(|(area, _)| area.writable).find_map(|(area, other_area)| {
+            let (a, b) = (self.bytes(area), other.bytes(other_area));
             let mut i = 0;
-            while i < a.bytes.len() {
-                if a.bytes[i] == b.bytes[i] {
+            while i < a.len() {
+                if a[i] == b[i] {
                     i += 1;
                     continue;
                 }
                 let word = i & !3;
                 let double = i & !7;
-                if nans(&a.bytes, &b.bytes, double, 8) {
+                if nans(a, b, double, 8) {
                     i = double + 8;
-                } else if nans(&a.bytes, &b.bytes, word, 4) {
+                } else if nans(a, b, word, 4) {
                     i = word + 4;
                 } else {
-                    return Some(a.base + i as u32);
+                    return Some(area.base + i as u32);
                 }
             }
             None
         })
+    }
+}
+
+impl Drop for Memory {
+    fn drop(&mut self) {
+        let space = &mut *self.space as *mut Space as usize;
+        SPACES.lock().unwrap().retain(|&s| s != space);
+        // SAFETY: nothing reaches the space any more
+        unsafe { os::release(self.space.base, SPACE_SIZE) };
     }
 }
 
@@ -214,30 +458,6 @@ unsafe fn run_of<'a>(ctx: *mut Context) -> &'a mut Run {
     unsafe { &mut *((*ctx).user as *mut Run) }
 }
 
-unsafe extern "C" fn read8(ctx: *mut Context, address: u32) -> u8 {
-    unsafe { run_of(ctx).memory.read8(address) }
-}
-
-unsafe extern "C" fn read16(ctx: *mut Context, address: u32) -> u16 {
-    unsafe { run_of(ctx).memory.read16(address) }
-}
-
-unsafe extern "C" fn read32(ctx: *mut Context, address: u32) -> u32 {
-    unsafe { run_of(ctx).memory.read32(address) }
-}
-
-unsafe extern "C" fn write8(ctx: *mut Context, address: u32, value: u8) {
-    unsafe { run_of(ctx).memory.write8(address, value) }
-}
-
-unsafe extern "C" fn write16(ctx: *mut Context, address: u32, value: u16) {
-    unsafe { run_of(ctx).memory.write16(address, value) }
-}
-
-unsafe extern "C" fn write32(ctx: *mut Context, address: u32, value: u32) {
-    unsafe { run_of(ctx).memory.write32(address, value) }
-}
-
 unsafe extern "C" fn interpret(ctx: *mut Context, address: u32, _opcode: u32) {
     unsafe {
         let run = run_of(ctx);
@@ -273,7 +493,7 @@ unsafe extern "C" fn svc(ctx: *mut Context, number: u32) {
     }
 }
 
-static HOST: Host = Host { read8, read16, read32, write8, write16, write32, interpret, lookup, svc };
+static HOST: Host = Host { interpret, lookup, svc };
 
 fn load(ctx: &Context, cpu: &mut Cpu) {
     cpu.regs = ctx.r;
@@ -423,8 +643,10 @@ fn differences(a: &Run, b: &Run, ctx: &Context) -> Vec<String> {
     if let Some(address) = a.memory.first_difference(&b.memory) {
         found.push(format!("memory at {address:08X}"));
     }
-    if a.memory.faults != b.memory.faults {
-        found.push(format!("{} faults against {}", a.memory.faults, b.memory.faults));
+    // the interpreter counts each access, the recompiled code each page it
+    // first touches, so only whether either faulted can compare
+    if (a.memory.faults() > 0) != (b.memory.faults() > 0) {
+        found.push(format!("{} faults against {}", a.memory.faults(), b.memory.faults()));
     }
     found
 }
@@ -503,8 +725,7 @@ fn context(run: &mut Run) -> Context {
         depth: 0,
         exclusive_address: 0,
         tls: 0,
-        read_pages: run.memory.read_pages.as_ptr(),
-        write_pages: run.memory.write_pages.as_ptr(),
+        fastmem: run.memory.space.base,
         vfp: run.cpu.vfp.regs.as_mut_ptr(),
         fpscr: &mut run.cpu.vfp.fpscr,
         host: &HOST,

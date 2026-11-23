@@ -11,18 +11,20 @@ use std::path::PathBuf;
 pub const HEADER: &str = include_str!("../recomp.h");
 
 /// the interface version, which code has to match to be run.
-pub const ABI: u32 = 5;
+pub const ABI: u32 = 6;
 
-/// the oldest version code can be made for and still run: version 4 left
-/// every svc to the host's loop, and never calls Host::svc.
-pub const OLDEST_ABI: u32 = 4;
+/// the oldest version code can be made for and still run: version 6 reaches
+/// guest memory at fastmem plus the address, where 5 and before went through
+/// page tables and the host's memory callbacks.
+pub const OLDEST_ABI: u32 = 6;
 
 /// the code generator's version, raised when the code it makes runs much
 /// better or does more than before, which checking itself against memory did
 /// at 2, doing that much faster at 3, running svcs without leaving the code
-/// at 4, and dividing on the host at 5. code of an older one still runs, and
+/// at 4, dividing on the host at 5, and reaching memory without page tables
+/// at 6. code of an older one still runs, and
 /// building it again brings the improvements, which a host can suggest.
-pub const GENERATION: u32 = 5;
+pub const GENERATION: u32 = 6;
 
 /// why the code gave control back.
 pub const EXIT_NONE: u32 = 0;
@@ -60,12 +62,6 @@ pub fn installed(program_id: u64) -> Option<PathBuf> {
 
 #[repr(C)]
 pub struct Host {
-    pub read8: unsafe extern "C" fn(*mut Context, u32) -> u8,
-    pub read16: unsafe extern "C" fn(*mut Context, u32) -> u16,
-    pub read32: unsafe extern "C" fn(*mut Context, u32) -> u32,
-    pub write8: unsafe extern "C" fn(*mut Context, u32, u8),
-    pub write16: unsafe extern "C" fn(*mut Context, u32, u16),
-    pub write32: unsafe extern "C" fn(*mut Context, u32, u32),
     pub interpret: unsafe extern "C" fn(*mut Context, u32, u32),
     pub lookup: unsafe extern "C" fn(*mut Context, u32) -> Option<Code>,
     pub svc: unsafe extern "C" fn(*mut Context, u32),
@@ -88,8 +84,8 @@ pub struct Context {
     pub depth: u32,
     pub exclusive_address: u32,
     pub tls: u32,
-    pub read_pages: *const *mut u8,
-    pub write_pages: *const *mut u8,
+    /// the guest's 4 GiB of address space, see recomp.h.
+    pub fastmem: *mut u8,
     pub vfp: *mut u32,
     pub fpscr: *mut u32,
     pub host: *const Host,
@@ -377,7 +373,7 @@ impl Library {
     }
 
     /// the version of the interface the code was made for, from OLDEST_ABI
-    /// to ABI. code made for 4 never calls Host::svc.
+    /// to ABI.
     pub fn abi(&self) -> u32 {
         self.abi
     }
@@ -560,12 +556,11 @@ int main(void) {
     AT(Context, r); AT(Context, n); AT(Context, z); AT(Context, c); AT(Context, v);
     AT(Context, q); AT(Context, thumb); AT(Context, ge); AT(Context, exclusive);
     AT(Context, budget); AT(Context, exit); AT(Context, svc); AT(Context, depth);
-    AT(Context, exclusive_address); AT(Context, tls); AT(Context, read_pages);
-    AT(Context, write_pages); AT(Context, vfp); AT(Context, fpscr); AT(Context, host);
+    AT(Context, exclusive_address); AT(Context, tls); AT(Context, fastmem);
+    AT(Context, vfp); AT(Context, fpscr); AT(Context, host);
     AT(Context, user);
     SIZE(Host);
-    AT(Host, read8); AT(Host, read16); AT(Host, read32); AT(Host, write8);
-    AT(Host, write16); AT(Host, write32); AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
+    AT(Host, interpret); AT(Host, lookup); AT(Host, svc);
     SIZE(Entry);
     AT(Entry, address); AT(Entry, code);
     SIZE(Module);
@@ -767,7 +762,7 @@ int main(void) {
         let math: &[&str] = if cfg!(unix) { &["-lm"] } else { &[] };
         let built = compilers.iter().any(|compiler| {
             Command::new(compiler)
-                .args(["-w", "-o", "layout", "layout.c"])
+                .args(["-w", "-o", &format!("layout{}", std::env::consts::EXE_SUFFIX), "layout.c"])
                 .args(math)
                 .current_dir(&dir)
                 .status()
@@ -777,14 +772,14 @@ int main(void) {
             eprintln!("no C compiler to build the header with, its layout went unchecked");
             return;
         }
-        let output = Command::new(dir.join("layout")).output().unwrap();
+        let output = Command::new(dir.join(format!("layout{}", std::env::consts::EXE_SUFFIX))).output().unwrap();
         std::fs::remove_dir_all(&dir).ok();
         let header: Vec<String> = String::from_utf8(output.stdout).unwrap().lines().map(str::to_owned).collect();
 
         let mut lines = Vec::new();
         at!(lines, Context, r, n, z, c, v, q, thumb, ge, exclusive, budget, exit, svc, depth, exclusive_address, tls,
-            read_pages, write_pages, vfp, fpscr, host, user);
-        at!(lines, Host, read8, read16, read32, write8, write16, write32, interpret, lookup, svc);
+            fastmem, vfp, fpscr, host, user);
+        at!(lines, Host, interpret, lookup, svc);
         at!(lines, Entry, address, code);
         at!(lines, Module, name, base, size, count, entries);
         at!(lines, Piece, start, end, hash);

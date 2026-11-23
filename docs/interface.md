@@ -5,10 +5,10 @@ depends on a particular emulator. It runs against a small interface, declared
 in [`recomp.h`](../abi/recomp.h). Any program that implements that
 interface can run the code. This document calls that program the host.
 
-This page describes version 5 of the interface. Version 4 differed only in
-the `svc` callback, which it did not have: its code left every `svc` to the
-host's loop with `EXIT_SVC`. Code made for version 4 still runs on a host
-written for 5, which `recomp_abi` accepts.
+This page describes version 6 of the interface. Version 5 and before reached
+guest memory through two page tables and the host's memory callbacks, which
+version 6 replaces with one pointer, `fastmem`. Code made for an older version
+does not run on a host written for 6, which `recomp_abi` refuses.
 
 ## What build writes
 
@@ -207,7 +207,7 @@ context. The context does not need to live between two runs.
 | `svc` | The svc number, when `exit` is `EXIT_SVC`. |
 | `depth` | How many guest calls deep the C stack is. The host sets it to 0 before each call. |
 | `tls` | The read-only thread ID register, which `mrc p15, 0, rX, c13, c0, 3` reads. On the 3DS it holds the thread's TLS address. |
-| `read_pages`, `write_pages` | The page tables. See [Memory](#memory). |
+| `fastmem` | The guest's address space. See [Memory](#memory). |
 | `vfp` | 32 words, `s0` to `s31`. `dN` is `s2N` (low word) followed by `s2N+1`. |
 | `fpscr` | A pointer to FPSCR. |
 | `host` | The host's callbacks. |
@@ -221,49 +221,39 @@ budget in locals while it runs, and puts them back in the context wherever
 something else can look at them: when it returns, and before it calls
 `lookup`, `interpret`, `svc` or another function. After `interpret` and `svc`
 it takes them all back, so whatever the host changed there is what the code
-goes on with. Inside the memory callbacks they are not current, only the
-arguments, `host`, `user` and the page tables are. `r[15]` is set when the
+goes on with. `r[15]` is set when the
 code returns and before it calls `lookup` or `svc`. The `interpret` callback
 receives the address it needs as an argument.
 
 ## Memory
 
-`read_pages` and `write_pages` each hold 2^20 pointers, one for every 4 KiB
-page of the 32-bit address space.
+`fastmem` points at 4 GiB of the host's address space that stand for the
+guest's: the byte at guest address `a` is at `fastmem + a`, in guest
+(little-endian) order. Every load and store is that one access, unaligned or
+across pages alike, with no check.
 
-- A non-null entry points to the page's bytes, in guest (little-endian)
-  order. The code reads or writes that page directly.
-- A null entry sends every access to that page through the host's
-  `read8`/`read16`/`read32` or `write8`/`write16`/`write32` callbacks.
+The host maps there what the guest has mapped, the same physical memory
+wherever the guest sees it twice, and leaves the rest unmapped, read-only
+where the guest may not write. An access the guest should not make then
+faults on the host, which can catch the fault and say which guest address it
+was: the fault's address minus `fastmem`. Keep 64 KiB unmapped past the
+4 GiB too, for the loads and stores of several words that start near the
+end.
 
-An access that crosses a page boundary also goes to the host.
-
-The two tables are separate so that one page can have a direct read path and
-still send its writes to the host. Leave a page's entry null in any table
-where the host has to see the access:
-
-- I/O;
-- memory the host watches for changes, such as textures or command lists;
-- memory that is not mapped.
+Nothing goes through the host on the way, so memory the host has to see
+written, such as I/O or command lists, is something the guest tells it about
+itself, with an svc or a request.
 
 ## Host callbacks
 
 ```c
 typedef struct Host {
-    uint8_t (*read8)(Context *, uint32_t);
-    uint16_t (*read16)(Context *, uint32_t);
-    uint32_t (*read32)(Context *, uint32_t);
-    void (*write8)(Context *, uint32_t, uint8_t);
-    void (*write16)(Context *, uint32_t, uint16_t);
-    void (*write32)(Context *, uint32_t, uint32_t);
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
     Code (*lookup)(Context *, uint32_t address);
     void (*svc)(Context *, uint32_t number);
 } Host;
 ```
 
-- **Memory callbacks.** These handle every access the page tables do not.
-  The address may be unaligned.
 - **`interpret`.** It runs one instruction that the recompiler left alone,
   such as an unusual coprocessor access. `address` is the instruction's
   address. `opcode` is the instruction as the recompiler saw it. The host:
@@ -425,8 +415,8 @@ int run(Context *ctx, int32_t budget) {
 }
 ```
 
-A working host also fills in the page tables, `vfp`, `fpscr`, `tls` and
-`host`, and implements the memory callbacks and `interpret`. A host that runs
+A working host also fills in `fastmem`, `vfp`, `fpscr`, `tls` and `host`,
+and implements `interpret`. A host that runs
 svcs in place does in its `svc` callback what its loop would do with an
 `EXIT_SVC`, and lets the code go on whenever the guest would simply carry on.
 Zakuro's does that for every svc that only touches the kernel.

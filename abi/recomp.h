@@ -7,18 +7,12 @@
 #include <stdint.h>
 #include <string.h>
 
-#define RECOMP_ABI 5
+#define RECOMP_ABI 6
 
 typedef struct Context Context;
 typedef void (*Code)(Context *);
 
 typedef struct Host {
-    uint8_t (*read8)(Context *, uint32_t);
-    uint16_t (*read16)(Context *, uint32_t);
-    uint32_t (*read32)(Context *, uint32_t);
-    void (*write8)(Context *, uint32_t, uint8_t);
-    void (*write16)(Context *, uint32_t, uint16_t);
-    void (*write32)(Context *, uint32_t, uint32_t);
     /* runs one instruction the recompiler left to the interpreter. when it
        branches or fails the host sets exit and r15. */
     void (*interpret)(Context *, uint32_t address, uint32_t opcode);
@@ -56,10 +50,11 @@ struct Context {
     /* the read-only thread id register, which holds the thread's TLS
        address. */
     uint32_t tls;
-    /* a host pointer for each 4 KiB page, or null when the host has to
-       handle the access. */
-    uint8_t *const *read_pages;
-    uint8_t *const *write_pages;
+    /* the guest's 4 GiB of address space in the host's, guest address a at
+       fastmem + a. the host maps what the guest has there and leaves the
+       rest unmapped, and read-only what the guest cannot write, so a bad
+       access faults on the host and the host names it. */
+    uint8_t *fastmem;
     /* the VFP registers, s0 to s31 with dN in s2N and s2N+1, and fpscr,
        which the interpreter works on too. */
     uint32_t *vfp;
@@ -149,80 +144,49 @@ typedef struct Origins {
    inlining, a call per access costs as much as the access itself */
 #define ALWAYS_INLINE inline __attribute__((always_inline))
 
-/* the page tables loads and stores go through. a generated function keeps
-   them in locals, which a store to guest memory, through a byte pointer
+/* the address space loads and stores go through. a generated function
+   keeps it in a local, which a store to guest memory, through a byte pointer
    that could point anywhere, does not make the compiler read again. */
-#define READ_PAGES(c) ((c)->read_pages)
-#define WRITE_PAGES(c) ((c)->write_pages)
+#define FASTMEM(c) ((c)->fastmem)
 
-static ALWAYS_INLINE uint8_t mem_read8_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
-    uint8_t *page = pages[address >> 12];
-    if (LIKELY(page)) return page[address & 0xFFF];
-    return ctx->host->read8(ctx, address);
+static ALWAYS_INLINE uint8_t mem_read8_in(uint8_t *base, uint32_t address) {
+    return base[address];
 }
 
-static ALWAYS_INLINE uint16_t mem_read16_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
-    uint8_t *page = pages[address >> 12];
-    uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFE)) {
-        uint16_t value;
-        memcpy(&value, page + offset, 2);
-        return value;
-    }
-    return ctx->host->read16(ctx, address);
+static ALWAYS_INLINE uint16_t mem_read16_in(uint8_t *base, uint32_t address) {
+    uint16_t value;
+    memcpy(&value, base + address, 2);
+    return value;
 }
 
-static ALWAYS_INLINE uint32_t mem_read32_in(Context *ctx, uint8_t *const *pages, uint32_t address) {
-    uint8_t *page = pages[address >> 12];
-    uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFC)) {
-        uint32_t value;
-        memcpy(&value, page + offset, 4);
-        return value;
-    }
-    return ctx->host->read32(ctx, address);
+static ALWAYS_INLINE uint32_t mem_read32_in(uint8_t *base, uint32_t address) {
+    uint32_t value;
+    memcpy(&value, base + address, 4);
+    return value;
 }
 
-static ALWAYS_INLINE void mem_write8_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint8_t value) {
-    uint8_t *page = pages[address >> 12];
-    if (LIKELY(page)) page[address & 0xFFF] = value;
-    else ctx->host->write8(ctx, address, value);
+static ALWAYS_INLINE void mem_write8_in(uint8_t *base, uint32_t address, uint8_t value) {
+    base[address] = value;
 }
 
-static ALWAYS_INLINE void mem_write16_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint16_t value) {
-    uint8_t *page = pages[address >> 12];
-    uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFE)) memcpy(page + offset, &value, 2);
-    else ctx->host->write16(ctx, address, value);
+static ALWAYS_INLINE void mem_write16_in(uint8_t *base, uint32_t address, uint16_t value) {
+    memcpy(base + address, &value, 2);
 }
 
-static ALWAYS_INLINE void mem_write32_in(Context *ctx, uint8_t *const *pages, uint32_t address, uint32_t value) {
-    uint8_t *page = pages[address >> 12];
-    uint32_t offset = address & 0xFFF;
-    if (LIKELY(page && offset <= 0xFFC)) memcpy(page + offset, &value, 4);
-    else ctx->host->write32(ctx, address, value);
+static ALWAYS_INLINE void mem_write32_in(uint8_t *base, uint32_t address, uint32_t value) {
+    memcpy(base + address, &value, 4);
 }
 
-/* where the bytes from address are, when they all lie on one page the code
-   reaches directly, or null, for loads and stores of several words. */
-static ALWAYS_INLINE uint8_t *mem_span_in(uint8_t *const *pages, uint32_t address, uint32_t bytes) {
-    uint8_t *page = pages[address >> 12];
-    uint32_t offset = address & 0xFFF;
-    /* two tests rather than one with &&, which gcc and clang turn into a
-       setcc and a test in big functions */
-    if (UNLIKELY(offset > 0x1000 - bytes)) return 0;
-    if (UNLIKELY(!page)) return 0;
-    return page + offset;
-}
-
-#define mem_read8(c, address) mem_read8_in((c), READ_PAGES(c), (address))
-#define mem_read16(c, address) mem_read16_in((c), READ_PAGES(c), (address))
-#define mem_read32(c, address) mem_read32_in((c), READ_PAGES(c), (address))
-#define mem_write8(c, address, value) mem_write8_in((c), WRITE_PAGES(c), (address), (value))
-#define mem_write16(c, address, value) mem_write16_in((c), WRITE_PAGES(c), (address), (value))
-#define mem_write32(c, address, value) mem_write32_in((c), WRITE_PAGES(c), (address), (value))
-#define mem_read_span(c, address, bytes) ((const uint8_t *)mem_span_in(READ_PAGES(c), (address), (bytes)))
-#define mem_write_span(c, address, bytes) mem_span_in(WRITE_PAGES(c), (address), (bytes))
+#define mem_read8(c, address) mem_read8_in(FASTMEM(c), (address))
+#define mem_read16(c, address) mem_read16_in(FASTMEM(c), (address))
+#define mem_read32(c, address) mem_read32_in(FASTMEM(c), (address))
+#define mem_write8(c, address, value) mem_write8_in(FASTMEM(c), (address), (value))
+#define mem_write16(c, address, value) mem_write16_in(FASTMEM(c), (address), (value))
+#define mem_write32(c, address, value) mem_write32_in(FASTMEM(c), (address), (value))
+/* where the bytes from address are, for loads and stores of several words,
+   which may cross pages like any access. */
+#define mem_read_span(c, address, bytes) ((const uint8_t *)FASTMEM(c) + (uint32_t)(address))
+#define mem_write_span(c, address, bytes) (FASTMEM(c) + (uint32_t)(address))
 
 static ALWAYS_INLINE uint32_t load32(const uint8_t *at) {
     uint32_t value;

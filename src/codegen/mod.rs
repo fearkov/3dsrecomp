@@ -77,9 +77,8 @@ fn call(out: &mut String, scope: &Scope, link: u32, target: u32, thumb: bool) ->
 }
 
 /// the words a load or store multiple moves, from p up, a destination for
-/// each when loading and a value for each when storing, both as C. they
-/// nearly always lie on one page the code reaches directly, which one
-/// check covers, and otherwise go through the usual path one at a time.
+/// each when loading and a value for each when storing, both as C, through
+/// one pointer to where they lie.
 fn words(out: &mut String, load: bool, words: &[String]) {
     let bytes = words.len() * 4;
     if let [word] = words {
@@ -93,26 +92,16 @@ fn words(out: &mut String, load: bool, words: &[String]) {
     }
     if load {
         emit!(out, "    {{ const uint8_t *span = mem_read_span(ctx, p, {bytes}u);");
-        emit!(out, "    if (LIKELY(span)) {{");
         for (i, destination) in words.iter().enumerate() {
             emit!(out, "    {destination} = load32(span + {});", i * 4);
         }
-        emit!(out, "    }} else {{");
-        for (i, destination) in words.iter().enumerate() {
-            emit!(out, "    {destination} = mem_read32(ctx, p + {}u);", i * 4);
-        }
     } else {
         emit!(out, "    {{ uint8_t *span = mem_write_span(ctx, p, {bytes}u);");
-        emit!(out, "    if (LIKELY(span)) {{");
         for (i, value) in words.iter().enumerate() {
             emit!(out, "    store32(span + {}, {value});", i * 4);
         }
-        emit!(out, "    }} else {{");
-        for (i, value) in words.iter().enumerate() {
-            emit!(out, "    mem_write32(ctx, p + {}u, {value});", i * 4);
-        }
     }
-    emit!(out, "    }} }}");
+    emit!(out, "    }}");
 }
 
 /// a branch without link, to a label of this function if it is one.
@@ -595,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_transfers_check_one_page_for_all_their_words() {
+    fn multiple_transfers_share_one_pointer_for_all_their_words() {
         // push {r4, r5, lr}, vpush {d8}, vpop {d8}, pop {r4, r5, pc}
         let files = files(&[0xE92D_4030, 0xED2D_8B02, 0xECBD_8B02, 0xE8BD_8030], &[]);
         let code = &files["code_00100000.c"];

@@ -202,7 +202,9 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
         new_functions(&analyses[index], &hinted)
     };
     if !outside.is_empty() {
-        program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
+        // all of them, not only the new ones: the analysis made again goes another way, and a hint the first
+        // one happened to agree with must still hold its place (Pokémon Alpha Sapphire's 0x500000 went Thumb)
+        program.seeds.extend(hinted.iter().map(|&address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
     }
     outside.len()

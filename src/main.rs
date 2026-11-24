@@ -40,6 +40,10 @@ struct Options {
     zakuro: Option<PathBuf>,
     /// a folder of .cro modules the title loads that its RomFS has not as files.
     modules: Option<PathBuf>,
+    /// a mod's code, decompressed (code.ips already applied), in place of the title's.
+    code: Option<PathBuf>,
+    /// a mod's RomFS folder (Luma's luma/titles/<id>/romfs): its files in place of the title's.
+    romfs_dir: Option<PathBuf>,
 }
 
 fn main() {
@@ -67,6 +71,8 @@ fn main() {
             "--name" => options.name = Some(value()),
             "--zakuro" => options.zakuro = Some(value().into()),
             "--modules" => options.modules = Some(value().into()),
+            "--code" => options.code = Some(value().into()),
+            "--romfs-dir" => options.romfs_dir = Some(value().into()),
             other if other.starts_with("--") => {
                 eprintln!("unknown option {other}\n{USAGE}");
                 exit(2);
@@ -90,7 +96,17 @@ fn main() {
                     }
                 }
             }
-            let mods = Mods { modules: Some(&extra), ..Mods::default() };
+            // a mod's code and RomFS files, given apart
+            let code = options.code.as_ref().map(|p| std::fs::read(p).unwrap_or_else(|e| { eprintln!("{}: {e}", p.display()); exit(1) }));
+            let romfs_dir = options.romfs_dir.clone();
+            let romfs = move |path: &str| -> Option<Vec<u8>> { std::fs::read(romfs_dir.as_ref()?.join(path)).ok() };
+            let romfs_ref: &(dyn Fn(&str) -> Option<Vec<u8>> + Sync) = &romfs;
+            let mods = Mods {
+                modules: Some(&extra),
+                code: code.as_deref(),
+                romfs: options.romfs_dir.as_ref().map(|_| romfs_ref),
+                ..Mods::default()
+            };
             if let Err(error) = build::generate(Path::new(rom), |_| PathBuf::from(dir), options.overrides.as_deref(), mods, &print_event) {
                 eprintln!("{error}");
                 exit(1);

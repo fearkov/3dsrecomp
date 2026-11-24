@@ -181,7 +181,14 @@ pub fn apply_hints(title: &Title, programs: &mut [(String, Program)], analyses: 
     }
     let outside = new_functions(&analyses[index], &hinted);
     if !outside.is_empty() {
-        program.seeds.extend(outside.iter().map(|&address| (address, Source::Hint)));
+        // plus the hints the first pass already starts a func at in their mode, the second pass goes its own way
+        // and a guess could grab their spot (alpha sapphire's 0x500000 flipped from arm to a thumb pointer)
+        let analysis = &analyses[index];
+        let starts = hinted.iter().copied().filter(|&address| {
+            analysis.functions.get(&(address & !1)).is_some_and(|f| (f.mode == Mode::Thumb) == (address & 1 != 0))
+        });
+        let seeds: Vec<u32> = outside.iter().copied().chain(starts).collect();
+        program.seeds.extend(seeds.into_iter().map(|address| (address, Source::Hint)));
         analyses[index] = discover::analyze(program);
     }
     outside.len()

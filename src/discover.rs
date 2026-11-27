@@ -599,6 +599,16 @@ impl Discovery<'_> {
                             }
                         }
                     }
+                    Flow::ReturnAddress { target } => {
+                        if self.text.contains(target) && target & 3 == 0 {
+                            labels.insert(target);
+                            if let Some(trial) = &mut self.trial {
+                                trial.joins.push((target, mode));
+                            } else {
+                                self.joins.insert((target, mode));
+                            }
+                        }
+                    }
                     Flow::Svc => self.analysis.svc_sites += 1,
                     Flow::Undefined | Flow::Other => {}
                 }
@@ -913,5 +923,34 @@ mod tests {
         let analysis = analyze(&program);
         assert_eq!(analysis.functions.len(), 1 + links as usize);
         assert!(analysis.functions.values().skip(1).all(|f| f.instructions.len() == length as usize + 1));
+    }
+
+    /// add/sub lr, pc, #imm before a manual branch/jump labels its return site, both in this func and in another func
+    #[test]
+    fn adr_lr_labels_return_site() {
+        // func at BASE:
+        //   +0x00: add lr, pc, #4   -> target BASE + 0x0C (same func)
+        //   +0x04: beq +0x10        -> target BASE + 0x1C (helper)
+        //   +0x08: nop              (falls through to BASE + 0x0C)
+        //   +0x0C: add lr, pc, #4   -> target BASE + 0x18 (inside second func at BASE + 0x14)
+        //   +0x10: bx lr
+        // func at BASE + 0x14 (seeded):
+        //   +0x14: mov r0, #1
+        //   +0x18: mov r0, #2       (cross-function return site)
+        //   +0x1C: bx lr
+        let mut program = program(&[
+            0xE28F_E004, // +0x00: add lr, pc, #4 (BASE + 0x0C)
+            0x0A00_0004, // +0x04: beq BASE + 0x1C
+            0xE1A0_0000, // +0x08: nop
+            0xE28F_E004, // +0x0C: add lr, pc, #4 (BASE + 0x18)
+            0xE12F_FF1E, // +0x10: bx lr
+            0xE3A0_0001, // +0x14: mov r0, #1
+            0xE3A0_0002, // +0x18: mov r0, #2
+            0xE12F_FF1E, // +0x1C: bx lr
+        ]);
+        program.seeds.push((BASE + 0x14, Source::Pointer));
+        let analysis = analyze(&program);
+        assert!(analysis.functions[&BASE].labels.contains(&(BASE + 0x0C)));
+        assert!(analysis.functions[&(BASE + 0x14)].labels.contains(&(BASE + 0x18)));
     }
 }

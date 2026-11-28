@@ -27,6 +27,8 @@ pub enum Flow {
     LoadPcLiteral { literal: u32 },
     /// a load from a literal pool inside the code
     LiteralLoad { literal: u32, size: u32 },
+    /// add/sub lr, pc, #imm (ADR lr, label) setting a manual return site before a branch/jump
+    ReturnAddress { target: u32 },
     Svc,
     /// an encoding that can't be code, so whatever path got here is wrong
     Undefined,
@@ -103,7 +105,7 @@ pub fn decode(word: u32, address: u32) -> Instruction {
         let size = if word & (1 << 8) != 0 { 8 } else { 4 };
         Flow::LiteralLoad { literal, size }
     } else if word & 0x0C00_0000 == 0 {
-        data_processing(word, rd, rn)
+        data_processing(word, pc, rd, rn)
     } else {
         Flow::Other
     };
@@ -139,7 +141,7 @@ fn single_transfer(word: u32, pc: u32, rd: u32, rn: u32) -> Flow {
     }
 }
 
-fn data_processing(word: u32, rd: u32, rn: u32) -> Flow {
+fn data_processing(word: u32, pc: u32, rd: u32, rn: u32) -> Flow {
     let immediate = word & (1 << 25) != 0;
     // multiplies and the extra loads and stores share this space
     if !immediate && word & 0x90 == 0x90 {
@@ -147,6 +149,13 @@ fn data_processing(word: u32, rd: u32, rn: u32) -> Flow {
     }
     let opcode = (word >> 21) & 0xF;
     let sets_flags = word & (1 << 20) != 0;
+    // add/sub lr, pc, #imm (ADR lr, label) sets a return address before a manual call/jump
+    if immediate && !sets_flags && rd == LR && rn == PC && (opcode == 0x4 || opcode == 0x2) {
+        let rotate = ((word >> 8) & 0xF) * 2;
+        let imm = (word & 0xFF).rotate_right(rotate);
+        let target = if opcode == 0x4 { pc.wrapping_add(imm) } else { pc.wrapping_sub(imm) };
+        return Flow::ReturnAddress { target };
+    }
     // tst teq cmp cmn write no reg, w/o s they're misc instrs
     if (8..=11).contains(&opcode) || rd != PC {
         return Flow::Other;
@@ -201,6 +210,15 @@ mod tests {
         assert_eq!(flow(0xE59F_0004), Flow::LiteralLoad { literal: BASE + 12, size: 4 });
         assert_eq!(flow(0xE59F_F000), Flow::LoadPcLiteral { literal: BASE + 8 });
         assert_eq!(flow(0xED9F_0A01), Flow::LiteralLoad { literal: BASE + 12, size: 4 }); // vldr s0
+    }
+
+    #[test]
+    fn return_addresses() {
+        assert_eq!(flow(0xE28F_E004), Flow::ReturnAddress { target: BASE + 12 }); // add lr, pc, #4
+        assert_eq!(flow(0xE28F_EC01), Flow::ReturnAddress { target: BASE + 0x108 }); // add lr, pc, #0x100
+        assert_eq!(flow(0xE24F_E004), Flow::ReturnAddress { target: BASE + 4 }); // sub lr, pc, #4
+        assert_eq!(flow(0xE29F_E004), Flow::Other); // adds lr, pc, #4 (sets flags)
+        assert_eq!(flow(0xE28F_0004), Flow::Other); // add r0, pc, #4 (not lr)
     }
 
     #[test]
